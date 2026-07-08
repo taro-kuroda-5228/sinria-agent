@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""
+Sinria CLI launcher.
+
+This wrapper behaves like the installed `sinria` command, including
+subcommands such as `gateway`, `cron`, and `doctor`.
+"""
+
+import os
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("SINRIA_CLI_NAME", "sinria")
+    os.environ.setdefault("HERMES_CLI_NAME", "sinria")
+    # A Sinria launcher must not inherit another product session's home by
+    # accident. Keep HERMES_HOME as a legacy compatibility alias only after
+    # pinning the Sinria-native home first.
+    os.environ.setdefault("SINRIA_HOME", os.path.expanduser("~/.sinria"))
+    from sinria_cli.main import main
+
+    main()

@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: sinria-local-default-deny
+      namespace: sinria-local
+    spec:
+      podSelector: {}
+      policyTypes: ["Ingress", "Egress"]
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: sinria-bridge-outbound-cloud-only
+      namespace: sinria-local
+    spec:
+      podSelector:
+        matchLabels:
+          sinria.ai/component: bridge
+      policyTypes: ["Egress"]
+      egress:
+        # Replace with cloud DB/API CIDRs or use a CNI that supports FQDN policies.
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+          ports:
+            - protocol: TCP
+              port: 443
+  - apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: sinria-tool-executor-restricted
+      namespace: sinria-local
+    spec:
+      podSelector:
+        matchLabels:
+          sinria.ai/component: tool-executor
+      policyTypes: ["Egress"]
+      egress: []

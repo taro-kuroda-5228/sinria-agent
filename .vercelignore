@@ -1,0 +1,16 @@
+*
+!apps
+!apps/chatops-crm
+!apps/chatops-crm/**
+apps/chatops-crm/node_modules
+apps/chatops-crm/node_modules/**
+apps/chatops-crm/.next
+apps/chatops-crm/.next/**
+apps/chatops-crm/.turbo
+apps/chatops-crm/.turbo/**
+apps/chatops-crm/.sinria
+apps/chatops-crm/.sinria/**
+apps/chatops-crm/.env*
+apps/chatops-crm/*.local
+apps/chatops-crm/openclaw-migration
+apps/chatops-crm/openclaw-migration/**

@@ -1,0 +1,34 @@
+image:
+  repository: ghcr.io/taro-kuroda-5228/sinria-agent
+  tag: latest
+  pullPolicy: IfNotPresent
+
+bridge:
+  appId: chatops_crm
+  tenantId: medical_horizon
+  transport: polling
+  pollIntervalSeconds: 5
+  dryRun: true
+  tokenSecretName: sinria-bridge-secrets
+  tokenSecretKey: SINRIA_BRIDGE_TOKEN
+
+resources:
+  bridge:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  worker:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+networkPolicy:
+  enabled: true
+  bridgeHttpsEgress: true
+  toolExecutorNoEgress: true

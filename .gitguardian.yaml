@@ -1,0 +1,31 @@
+# GitGuardian / ggshield configuration
+# https://docs.gitguardian.com/ggshield-docs/reference/configuration
+#
+# Why this file exists
+# --------------------
+# apps/sinria-desktop/electron/hardening.cjs implements a *secret detector*:
+# it refuses to preview local files whose contents look like credentials.
+# Its unit test (hardening.test.mjs) necessarily feeds the detector
+# secret-SHAPED strings and asserts they are caught. Those strings are
+# intentional, non-functional fixtures — not real credentials:
+#
+#   - JWT  : eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NSJ9.abcDEF_signature01
+#            (header {"alg":"HS256"}, payload {"sub":"12345"}, fake text "signature")
+#   - PG   : postgres://user:s3cret@db.host:5432/app  (non-routable placeholder host)
+#
+# GitGuardian platform incidents flagging these (commit 73e9991) were reviewed
+# and resolved as false positives / test credentials:
+#   - #33627885  JSON Web Token
+#   - #33627886  PostgreSQL Credentials
+#
+# This config keeps ggshield (pre-commit / CI, if adopted) from re-flagging the
+# detector's own test fixtures. NOTE: it does NOT auto-resolve existing platform
+# (dashboard) incidents — those are handled in the GitGuardian UI.
+
+version: 2
+
+secret:
+  ignored-paths:
+    # Detection-fixture file: holds secret-shaped strings BY DESIGN to test the
+    # local content scanner in electron/hardening.cjs.
+    - "apps/sinria-desktop/tests/hardening.test.mjs"

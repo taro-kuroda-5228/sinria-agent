@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sinria-bridge
+  namespace: "{{ .Release.Namespace }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sinria-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sinria-bridge
+        sinria.ai/component: bridge
+    spec:
+      serviceAccountName: sinria-bridge
+      containers:
+        - name: bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: "{{ .Values.image.pullPolicy }}"
+          command: ["python", "scripts/sinria-hybrid-bridge-worker.py"]
+          args: ['{{ ternary "--dry-run" "--once" .Values.bridge.dryRun }}']
+          envFrom:
+            - configMapRef:
+                name: sinria-bridge-config
+          env:
+            - name: SINRIA_BRIDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: "{{ .Values.bridge.tokenSecretName }}"
+                  key: "{{ .Values.bridge.tokenSecretKey }}"
+          resources:
+            requests:
+              cpu: "{{ .Values.resources.bridge.requests.cpu }}"
+              memory: "{{ .Values.resources.bridge.requests.memory }}"
+            limits:
+              cpu: "{{ .Values.resources.bridge.limits.cpu }}"
+              memory: "{{ .Values.resources.bridge.limits.memory }}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

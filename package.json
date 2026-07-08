@@ -1,0 +1,27 @@
+{
+  "name": "sinria-agent",
+  "version": "1.0.0",
+  "description": "Sinria, Medical Horizon's independent AI agent platform for healthcare institutions.",
+  "private": true,
+  "scripts": {
+    "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taro-kuroda-5228/sinria-agent.git"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/taro-kuroda-5228/sinria-agent/issues"
+  },
+  "homepage": "https://github.com/taro-kuroda-5228/sinria-agent#readme",
+  "dependencies": {
+    "agent-browser": "^0.26.0"
+  },
+  "overrides": {
+    "lodash": "4.18.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

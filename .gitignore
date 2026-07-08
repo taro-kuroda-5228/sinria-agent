@@ -1,0 +1,108 @@
+.DS_Store
+/venv/
+/_pycache/
+*.pyc*
+__pycache__/
+.venv
+.vscode/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.test
+export*
+__pycache__/model_tools.cpython-310.pyc
+__pycache__/web_tools.cpython-310.pyc
+logs/
+data/
+.pytest_cache/
+tmp/
+temp_vision_images/
+hermes-*/*
+examples/
+tests/quick_test_dataset.jsonl
+tests/sample_dataset.jsonl
+run_datagen_kimik2-thinking.sh
+run_datagen_megascience_glm4-6.sh
+run_datagen_sonnet.sh
+source-data/*
+run_datagen_megascience_glm4-6.sh
+data/*
+node_modules/
+browser-use/
+agent-browser/
+# Private keys
+*.ppk
+*.pem
+privvy*
+images/
+__pycache__/
+hermes_agent.egg-info/
+wandb/
+testlogs
+
+# CLI config (may contain sensitive SSH paths)
+cli-config.yaml
+
+# Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
+skills/.hub/
+ignored/
+.worktrees/
+environments/benchmarks/evals/
+
+# Web UI build output
+hermes_cli/web_dist/
+
+# Generated build/package outputs
+build/
+dist/
+*.egg-info/
+apps/**/.next/
+apps/**/tsconfig.tsbuildinfo
+
+# Web UI assets — synced from @nous-research/ui at build time via
+# `npm run sync-assets` (see web/package.json).
+web/public/fonts/
+web/public/ds-assets/
+
+# Release script temp files
+.release_notes.md
+mini-swe-agent/
+
+# Nix
+.direnv/
+.nix-stamps/
+/result
+website/static/api/skills-index.json
+models-dev-upstream/
+hermes_cli/tui_dist/*
+hermes_cli/scripts/
+docs/superpowers/*
+
+# Local runtime/deploy state; may contain project links, OAuth/token files, or private operator scratch data
+.vercel/
+.sinria/
+.sinria-runtime/
+apps/**/.sinria/
+apps/**/supabase/.temp/
+
+# Sinria Android Ambient Capture sensitive/generated artifacts
+apps/android-ambient-capture/**/*.wav
+apps/android-ambient-capture/**/*.m4a
+apps/android-ambient-capture/**/*.aac
+apps/android-ambient-capture/**/*.flac
+apps/android-ambient-capture/**/speaker-profiles/
+apps/android-ambient-capture/**/transcripts/
+apps/android-ambient-capture/**/captures/
+apps/android-ambient-capture/**/exports/
+apps/android-ambient-capture/**/build/
+apps/android-ambient-capture/.gradle/
+
+# Local medical-model training outputs (large/generated; keep reports + scripts tracked)
+ml/medical-local-agent/outputs/
+
+# Claude Code local worktrees (linked git worktrees live outside main index)
+.claude/worktrees/
+.vercel

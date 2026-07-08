@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: List
+items:
+  - apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: sinria-local
+      labels:
+        app.kubernetes.io/name: sinria
+        sinria.ai/runtime: on-prem
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: sinria-bridge
+      namespace: sinria-local
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: sinria-worker
+      namespace: sinria-local
+  - apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: sinria-tool-executor
+      namespace: sinria-local
+  - apiVersion: v1
+    kind: Secret
+    metadata:
+      name: sinria-bridge-secrets
+      namespace: sinria-local
+    type: Opaque
+    stringData:
+      # Replace through kubectl/external-secrets. Never commit production tokens.
+      SINRIA_BRIDGE_TOKEN: change-me
+  - apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: sinria-bridge-config
+      namespace: sinria-local
+    data:
+      SINRIA_BRIDGE_APP_ID: chatops_crm
+      SINRIA_BRIDGE_TENANT_ID: medical_horizon
+      SINRIA_BRIDGE_TRANSPORT: polling
+      SINRIA_BRIDGE_POLL_INTERVAL_SECONDS: "5"
