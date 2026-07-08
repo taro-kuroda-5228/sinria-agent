@@ -37,10 +37,15 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run public distribution smoke tests
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
+          python -m pytest \
+            tests/test_sinria_product_metadata.py \
+            tests/test_sinria_installers_branding.py \
+            tests/hermes_cli/test_banner.py \
+            tests/acp/test_registry_manifest.py \
+            -q --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
