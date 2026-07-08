@@ -34,10 +34,20 @@ def test_install_sh_uses_sinria_runtime_defaults_and_commands():
 
 
 
-def test_install_ps1_uses_sinria_operator_commands():
+def test_install_ps1_is_single_line_iex_safe_bootstrap():
     text = (ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
 
-    assert '[string]$HermesHome = "$env:LOCALAPPDATA\\sinria"' in text
+    assert text.count("\n") == 1
+    assert "[scriptblock]::Create" in text
+    assert "install.full.ps1" in text
+    assert "param(" not in text
+    assert "HermesHome" not in text
+
+
+def test_install_full_ps1_uses_sinria_operator_commands():
+    text = (ROOT / "scripts" / "install.full.ps1").read_text(encoding="utf-8")
+
+    assert '[string]$SinriaHome = "$env:LOCALAPPDATA\\sinria"' in text
     assert '[string]$InstallDir = "$env:LOCALAPPDATA\\sinria\\sinria-agent"' in text
     assert "Cloning Sinria repository" in text
     assert "Adding Sinria to PATH" in text
@@ -53,20 +63,19 @@ def test_install_ps1_uses_sinria_operator_commands():
     assert "Start the gateway later with: sinria gateway" in text
     assert "Run manually: sinria gateway" in text
     assert "Setting up sinria command..." in text
-    assert "Set SINRIA_HOME=$HermesHome" in text
-    assert "Set legacy HERMES_HOME=$HermesHome for compatibility" in text
+    assert "Set SINRIA_HOME=$SinriaHome" in text
+    assert "Set legacy HERMES_HOME=$SinriaHome for compatibility" in text
     assert "sinria command ready" in text
     assert "Created $envPath from template" in text
     assert "Created $configPath from template" in text
-    assert "Configuration directory ready: $HermesHome/" in text
-    assert "Syncing bundled skills to $HermesHome\\skills\\ ..." in text
+    assert "Configuration directory ready: $SinriaHome/" in text
+    assert "Syncing bundled skills to $SinriaHome\\skills\\ ..." in text
     assert "Open a new PowerShell window and re-run 'sinria setup tools' later." in text
     assert 'Write-Host "   sinria setup        "' in text
     assert 'Write-Host "   sinria gateway      "' in text
 
     assert "Configure via the GUI or 'hermes setup'." not in text
     assert "Run manually: hermes gateway" not in text
-    assert "raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.ps1" in text
     assert "github.com/taro-kuroda-5228/sinria-agent.git" in text
     assert "archive/refs/heads/$Branch.zip" in text
     assert "NousResearch/sinria-agent" not in text
