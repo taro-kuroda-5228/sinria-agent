@@ -27,6 +27,21 @@ Sinria’s initial focus is Medical Horizon and healthcare workflows, but the sa
 
 ---
 
+## Open-core positioning
+
+This repository is the **Sinria OSS core**: the local-first runtime, CLI, tool/skill framework, gateway foundations, safety primitives, and developer documentation that make Sinria inspectable and self-hostable.
+
+Commercial deployments are built around the parts that regulated organizations usually need beyond the public core:
+
+- enterprise policy, audit, SSO/RBAC, and managed deployment support;
+- regulated workflow modules for healthcare, government, finance, legal, and similar environments;
+- institution-specific connectors, runbooks, approval flows, and operational automations;
+- customer-specific configuration, infrastructure, support, and compliance evidence.
+
+Do not commit customer data, PHI/PII, secrets, private deployment topology, proprietary evaluation sets, or institution-specific workflows to this public repository. Keep those in private enterprise/customer repositories or approved local Sinria runtime locations.
+
+---
+
 ## Current status
 
 Sinria is actively being shaped into a standalone, installable agent product. The repository currently includes:
