@@ -49,7 +49,7 @@ Some internals still retain Hermes-derived module names for compatibility while 
 > Recommended first path on macOS or Linux: clone the repo, run setup, then start Sinria locally.
 
 ```bash
-git clone https://github.com/taro-kuroda-5228/sinria-agent.git
+git clone https://github.com/taro-kuroda-5228/sinria-agent.git sinria
 cd sinria
 ./setup-sinria.sh
 ./sinria
