@@ -86,6 +86,8 @@ def test_distribution_sources_use_the_canonical_public_repository():
     assert "Medical-Horizon/sinria-agent" not in combined
     assert "NousResearch/hermes-agent" not in combined
     assert "NousResearch/sinria-agent" not in combined
+    assert '"gh", "release", "create"' not in combined
+    assert '"uv", "lock"' in combined
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "rolling `main` channel" in readme

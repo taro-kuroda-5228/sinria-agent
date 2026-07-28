@@ -1681,8 +1681,20 @@ def main():
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
+            # Keep the lockfile in the same version-bump commit. A stale lockfile
+            # makes the push CI fail even when the release artifacts are valid.
+            lock_result = subprocess.run(
+                ["uv", "lock"],
+                capture_output=True,
+                text=True,
+                cwd=str(REPO_ROOT),
+            )
+            if lock_result.returncode != 0:
+                print(f"  ✗ Failed to update uv.lock: {lock_result.stderr.strip()}")
+                raise SystemExit(1)
+
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE), str(REPO_ROOT / "uv.lock")]
             if ACP_REGISTRY_MANIFEST.exists():
                 add_files.append(str(ACP_REGISTRY_MANIFEST))
             if HELM_CHART_FILE.exists():
@@ -1727,43 +1739,12 @@ def main():
             for artifact in artifacts:
                 print(f"    - {artifact.relative_to(REPO_ROOT)}")
 
-        # Create GitHub release
-        changelog_file = REPO_ROOT / ".release_notes.md"
-        changelog_file.write_text(changelog, encoding="utf-8")
-
-        gh_cmd = [
-            "gh", "release", "create", tag_name,
-            "--title", f"Sinria v{new_version} ({calver_date})",
-            "--notes-file", str(changelog_file),
-        ]
-        gh_cmd.extend(str(path) for path in artifacts)
-
-        gh_bin = shutil.which("gh")
-        if gh_bin:
-            result = subprocess.run(
-                gh_cmd,
-                capture_output=True, text=True,
-                cwd=str(REPO_ROOT),
-            )
-        else:
-            result = None
-
-        if result and result.returncode == 0:
-            changelog_file.unlink(missing_ok=True)
-            print(f"  ✓ GitHub release created: {result.stdout.strip()}")
-            print(f"\n  🎉 Release v{new_version} ({tag_name}) published!")
-        else:
-            if result is None:
-                print("  ✗ GitHub release skipped: `gh` CLI not found.")
-            else:
-                print(f"  ✗ GitHub release failed: {result.stderr.strip()}")
-            print(f"    Release notes kept at: {changelog_file}")
-            print(f"    Tag was created locally. Create the release manually:")
-            print(
-                f"    gh release create {tag_name} --title 'Sinria v{new_version} ({calver_date})' "
-                f"--notes-file .release_notes.md {' '.join(str(path) for path in artifacts)}"
-            )
-            print(f"\n  ✓ Release artifacts prepared for manual publish: v{new_version} ({tag_name})")
+        # Publishing ownership belongs exclusively to the tag-triggered GitHub
+        # Actions workflow. Creating the same release locally races the workflow:
+        # one publisher can delete or overwrite the other's release after an
+        # asset-upload failure.
+        print(f"  ✓ Tag {tag_name} pushed; GitHub Actions will publish immutable assets")
+        print(f"\n  Release requested: v{new_version} ({tag_name})")
     else:
         print(f"\n{'='*60}")
         print(f"  Dry run complete. To publish, add --publish")
