@@ -12,8 +12,8 @@ runtime via ``SINRIA_CLI_NAME`` / ``HERMES_CLI_NAME``.
 import os
 import sys
 
-__version__ = "0.14.2"
-__release_date__ = "2026.7.28"
+__version__ = "0.14.3"
+__release_date__ = "2026.7.29"
 
 
 def _ensure_utf8():

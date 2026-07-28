@@ -1,7 +1,7 @@
 {
   "id": "sinria-agent",
   "name": "Sinria",
-  "version": "0.14.2",
+  "version": "0.14.3",
   "description": "Sinria is Medical Horizon's independent AI agent platform for healthcare institutions, with ACP editor integration, persistent memory, skills, and rich tool support.",
   "repository": "https://github.com/taro-kuroda-5228/sinria-agent",
   "website": "https://taro-kuroda-5228.github.io/sinria-agent/docs",
@@ -11,7 +11,7 @@
   "license": "MIT",
   "distribution": {
     "uvx": {
-      "package": "sinria-agent[acp]==0.14.2",
+      "package": "sinria-agent[acp]==0.14.3",
       "args": [
         "sinria-acp"
       ]
