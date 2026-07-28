@@ -251,7 +251,6 @@ class IntentResolver:
         artifact discovery instead of acting from whichever durable project
         memory is most salient.
         """
-        project_l = (project or "").lower()
         action_markers = (
             "実装", "作成", "追加", "更新", "改善", "直して", "修正", "完成", "本番化", "ローンチ",
             "原因", "特定", "汎用", "その場限り", "間違え", "ドキュメント", "資料",
@@ -263,18 +262,6 @@ class IntentResolver:
         if not any(marker in text_l for marker in action_markers):
             return []
 
-        known_project = None
-        if "medspot" in text_l or project_l == "medspot":
-            known_project = "medspot"
-        elif "medevidence" in text_l or "メドエビデンス" in text_l or project_l == "medevidence":
-            known_project = "medevidence"
-        elif "sales agent os" in text_l or "sales os" in text_l or project_l in {"sales-agent-os", "sales_agent_os"}:
-            known_project = "sales_agent_os"
-        elif "company os" in text_l or project_l in {"company-os", "company_os"}:
-            known_project = "company_os"
-        elif "sinria" in text_l or project_l == "sinria":
-            known_project = "sinria"
-
         lines = [
             "Resolve the active project from the current message/session lane before editing files or delegating coding work.",
             "Search for existing canonical docs/specs/plans/dashboards/artifacts before creating or replacing anything.",
@@ -283,27 +270,9 @@ class IntentResolver:
             "For repeated user corrections, perform a root-cause fix in shared resolver/tests/skills instead of a one-off workflow note.",
             "Read the repo guide (AGENTS.md/CLAUDE.md) plus current spec/plan; for UI work, read the mockup/source artifact before coding.",
             "Extract non-negotiable constraints and use them as acceptance criteria; do not substitute a nearby project when exact artifacts are missing.",
+            "If the current project is ambiguous, inspect the current repository and run targeted session_search before acting.",
+            "If ambiguity remains after source lookup, ask for the repo/path instead of continuing with an older durable project context.",
         ]
-        if known_project == "medspot":
-            lines.extend([
-                "MedSpot source repo: /Users/tarokuroda/projects/medspot.",
-                "MedSpot primary spec: /Users/tarokuroda/projects/medspot/docs/specs/medspot-mvp-spec-v0.md.",
-                "MedSpot primary plan: /Users/tarokuroda/projects/medspot/docs/plans/2026-06-23-medspot-complete-mvp-claude-code-implementation-plan.md.",
-                "MedSpot is a doctor/hospital spot-work workflow app, not Company OS, Sales Agent OS, MedEvidence, or a landing page; production deploy/auth/data/billing/external sends remain approval-gated.",
-            ])
-        elif known_project == "medevidence":
-            lines.extend([
-                "MedEvidence GCP implementation lane: /Users/tarokuroda/medevidence-gcp.",
-                "MedEvidence Vercel/LTS baseline: /Users/tarokuroda/med_evi-2; inspect/copy/adapt from it only when needed, but do not import, dispatch, route through, or mutate it for GCP work unless explicitly requested.",
-                "MedEvidence mode1 is toC/HCP and mode2 is toB/org AgentOS; GCP/Cloud Run is the default target unless the user says otherwise.",
-                "Do not substitute MedSpot, Company OS, Sales Agent OS, or Sinria core when the current message explicitly says MedEvidence/メドエビデンス.",
-                "For worker/API/model work, preserve the existing UI unless UI changes are explicitly requested; verify end-to-end with non-PHI smoke before claiming completion.",
-            ])
-        elif known_project is None:
-            lines.extend([
-                "If the current project is ambiguous, read /Users/tarokuroda/exbrain-vault/workspaces/sinria/handoff.md and run targeted session_search before acting.",
-                "If ambiguity remains after source lookup, ask for the repo/path instead of continuing with an older durable project context.",
-            ])
         return lines
 
     @staticmethod

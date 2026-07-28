@@ -94,7 +94,7 @@ def test_project_action_adds_source_lock_gate_for_ambiguous_work():
     assert result.project_source_lock
     prompt = result.format_for_prompt()
     assert "Project Source-Lock Gate" in prompt
-    assert "/Users/tarokuroda/exbrain-vault/workspaces/sinria/handoff.md" in prompt
+    assert "inspect the current repository" in prompt
     assert "session_search" in prompt
     assert "older durable project context" in prompt
 
@@ -126,47 +126,44 @@ def test_ux_complaint_about_wrong_deploy_targets_gets_generic_root_cause_gate():
     assert "systematic-debugging" in result.recommended_skills
 
 
-def test_medspot_source_lock_includes_exact_artifacts_and_boundaries():
+def test_named_project_source_lock_is_repository_neutral():
     resolver = IntentResolver(include_durable=False)
 
-    result = resolver.resolve("MedSpotのUIをmockupに合わせて実装して", platform="discord")
+    result = resolver.resolve("ExampleAppのUIをmockupに合わせて実装して", platform="discord")
 
     prompt = result.format_for_prompt()
     assert "Project Source-Lock Gate" in prompt
-    assert "/Users/tarokuroda/projects/medspot" in prompt
-    assert "medspot-mvp-spec-v0.md" in prompt
-    assert "2026-06-23-medspot-complete-mvp-claude-code-implementation-plan.md" in prompt
-    assert "not Company OS, Sales Agent OS, MedEvidence, or a landing page" in prompt
-    assert "approval-gated" in prompt
+    assert "current repository" in prompt
+    assert "mockup/source artifact" in prompt
+    assert "/Users/" not in prompt
 
 
-def test_discord_reply_quote_does_not_override_explicit_medevidence_project():
+def test_discord_reply_quote_does_not_override_current_project_source_lock():
     resolver = IntentResolver(include_durable=False)
     message = (
-        '[Replying to: "確認しました。Cloud Run proxy は既に終了しています。"]\n\n'
-        "[Taro Kuroda] メドエビデンスレポジトリのconflictを解消してmainにマージして"
+        '[Replying to: "確認しました。古いデプロイ先は終了しています。"]\n\n'
+        "[User] ExampleAppレポジトリのconflictを解消してmainにマージして"
     )
 
     result = resolver.resolve(message, platform="discord")
     prompt = result.format_for_prompt()
 
     assert "Project Source-Lock Gate" in prompt
-    assert "MedEvidence GCP implementation lane: /Users/tarokuroda/medevidence-gcp." in prompt
-    assert "MedEvidence Vercel/LTS baseline: /Users/tarokuroda/med_evi-2" in prompt
-    assert "Do not substitute MedSpot, Company OS, Sales Agent OS, or Sinria core" in prompt
-    assert "Cloud Run proxy は既に終了" not in prompt
+    assert "current repository" in prompt
+    assert "古いデプロイ先は終了" not in prompt
+    assert "/Users/" not in prompt
 
 
-def test_medevidence_source_lock_includes_gcp_ui_freeze_constraints():
+def test_project_source_lock_requires_runtime_target_and_real_workflow_verification():
     resolver = IntentResolver(include_durable=False)
 
-    result = resolver.resolve("メドエビデンスGCP版の検索品質を改善して", platform="discord")
+    result = resolver.resolve("ExampleAppの検索品質を改善して", platform="discord")
     prompt = result.format_for_prompt()
 
-    assert "MedEvidence GCP implementation lane: /Users/tarokuroda/medevidence-gcp." in prompt
-    assert "MedEvidence Vercel/LTS baseline: /Users/tarokuroda/med_evi-2" in prompt
-    assert "GCP/Cloud Run is the default target" in prompt
-    assert "preserve the existing UI unless UI changes are explicitly requested" in prompt
+    assert "deployment/runtime target" in prompt
+    assert "acceptance criteria" in prompt
+    assert "older durable project context" in prompt
+    assert "/Users/" not in prompt
 
 
 def test_improvement_requests_derive_implementation_keys_for_recall():

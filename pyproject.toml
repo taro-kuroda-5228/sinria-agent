@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Medical Horizon" }]
 license = { text = "MIT" }
+
 dependencies = [
   # Core — every direct dep is exact-pinned to ==X.Y.Z (no ranges).
   # Rationale: ranges allow PyPI to ship a fresh version of a transitive
@@ -201,6 +202,12 @@ all = [
   "sinria-agent[youtube]",
 ]
 
+[project.urls]
+Homepage = "https://github.com/taro-kuroda-5228/sinria-agent"
+Repository = "https://github.com/taro-kuroda-5228/sinria-agent"
+Issues = "https://github.com/taro-kuroda-5228/sinria-agent/issues"
+Releases = "https://github.com/taro-kuroda-5228/sinria-agent/releases"
+
 [project.scripts]
 sinria = "sinria_cli.main:main"
 sinria-agent = "run_agent:main"
@@ -215,6 +222,10 @@ gateway = ["assets/**/*"]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "sinria_cli", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py", "pytest.ini"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

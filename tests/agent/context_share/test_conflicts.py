@@ -96,14 +96,14 @@ def test_newer_decision_overrides_old_deploy_target_lane_without_explicit_supers
     """
     old = _evidence(
         "old-vercel-parity",
-        "MedEvidence GCP work may use Vercel-equivalent route dispatch through /Users/tarokuroda/med_evi-2 as temporary parity.",
+        "MedEvidence GCP work may use Vercel-equivalent route dispatch through /srv/sinria-user/med_evi-2 as temporary parity.",
         confidence=0.95,
         valid_from="2026-06-15T00:00:00Z",
         applies_to=["medevidence", "gcp", "vercel_boundary"],
     )
     new = _evidence(
         "new-independent-gcp",
-        "MedEvidence GCP work must use /Users/tarokuroda/medevidence-gcp as the independent implementation lane instead of importing, routing through, or modifying /Users/tarokuroda/med_evi-2 or the Vercel stable runtime.",
+        "MedEvidence GCP work must use /srv/sinria-user/medevidence-gcp as the independent implementation lane instead of importing, routing through, or modifying /srv/sinria-user/med_evi-2 or the Vercel stable runtime.",
         confidence=0.88,
         valid_from="2026-07-05T00:00:00Z",
         applies_to=["medevidence", "gcp", "vercel_boundary"],
@@ -171,7 +171,7 @@ def test_resolver_prompt_surfaces_decision_override_conflict_for_current_task():
     )
     new = _evidence(
         "new-gcp-independent",
-        "MedEvidence GCP work now uses the independent /Users/tarokuroda/medevidence-gcp repo; do not route to Vercel stable or /Users/tarokuroda/med_evi-2.",
+        "MedEvidence GCP work now uses the independent /srv/sinria-user/medevidence-gcp repo; do not route to Vercel stable or /srv/sinria-user/med_evi-2.",
         confidence=0.88,
         valid_from="2026-07-05T00:00:00Z",
         applies_to=["medevidence", "gcp", "vercel_boundary"],
@@ -181,14 +181,14 @@ def test_resolver_prompt_surfaces_decision_override_conflict_for_current_task():
     prompt = resolver.resolve("メドエビデンスGCP版の検索品質を改善して", platform="discord").format_for_prompt()
 
     assert "new-gcp-independent wins over old-gcp-primary" in prompt
-    assert "independent /Users/tarokuroda/medevidence-gcp" in prompt
+    assert "independent /srv/sinria-user/medevidence-gcp" in prompt
     assert "dispatch through the Vercel stable search route" not in prompt
 
 
 def test_current_user_override_suppresses_stale_durable_guidance_before_it_is_saved():
     old = _evidence(
         "old-gcp-primary",
-        "MedEvidence GCP primary smoke can dispatch through the Vercel stable search route and /Users/tarokuroda/med_evi-2.",
+        "MedEvidence GCP primary smoke can dispatch through the Vercel stable search route and /srv/sinria-user/med_evi-2.",
         confidence=0.99,
         valid_from="2026-06-15T00:00:00Z",
         applies_to=["medevidence", "gcp", "vercel_boundary"],

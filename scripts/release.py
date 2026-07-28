@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+OFFICIAL_REPOSITORY_URL = "https://github.com/taro-kuroda-5228/sinria-agent"
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 
@@ -38,6 +39,7 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # tests/acp/test_registry_manifest.py enforces this lockstep so the release
 # bump touches both files atomically.
 ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+HELM_CHART_FILE = REPO_ROOT / "deploy" / "helm" / "sinria-local" / "Chart.yaml"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -1177,11 +1179,19 @@ def git_result(*args, cwd=None):
     )
 
 
+def release_tag_for_version(semver: str) -> str:
+    """Return the canonical Git tag for a Sinria product version."""
+    if not re.fullmatch(r"\d+\.\d+\.\d+", semver):
+        raise ValueError(f"Invalid semantic version: {semver}")
+    return f"v{semver}"
+
+
 def get_last_tag():
-    """Get the most recent CalVer tag."""
-    tags = git("tag", "--list", "v20*", "--sort=-v:refname")
-    if tags:
-        return tags.split("\n")[0]
+    """Get the most recent semantic-version release tag."""
+    tags = git("tag", "--list", "v*", "--sort=-v:refname")
+    for tag in tags.splitlines():
+        if re.fullmatch(r"v\d+\.\d+\.\d+", tag):
+            return tag
     return None
 
 
@@ -1255,6 +1265,18 @@ def update_version_files(semver: str, calver_date: str):
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
     _update_acp_registry_versions(semver)
+
+    # Keep the deployable runtime aligned with the Python/CLI package.
+    # Chart.version describes the Helm chart and remains independent.
+    if HELM_CHART_FILE.exists():
+        chart = HELM_CHART_FILE.read_text(encoding="utf-8")
+        chart = re.sub(
+            r'^appVersion:\s*"[^"]+"',
+            f'appVersion: "{semver}"',
+            chart,
+            flags=re.MULTILINE,
+        )
+        HELM_CHART_FILE.write_text(chart, encoding="utf-8")
 
 
 def _update_acp_registry_versions(semver: str) -> None:
@@ -1466,8 +1488,14 @@ def get_pr_number(subject: str) -> str | None:
     return None
 
 
-def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/sinria-agent",
-                       prev_tag=None, first_release=False):
+def generate_changelog(
+    commits,
+    tag_name,
+    semver,
+    repo_url=OFFICIAL_REPOSITORY_URL,
+    prev_tag=None,
+    first_release=False,
+):
     """Generate markdown changelog from categorized commits."""
     lines = []
 
@@ -1584,24 +1612,23 @@ def main():
                         help="Write changelog to file instead of stdout")
     args = parser.parse_args()
 
-    # Determine CalVer date
+    # Release date metadata
     if args.date:
         calver_date = args.date
     else:
         now = datetime.now()
         calver_date = f"{now.year}.{now.month}.{now.day}"
 
-    base_tag = f"v{calver_date}"
-    tag_name, calver_date = next_available_tag(base_tag)
-    if tag_name != base_tag:
-        print(f"Note: Tag {base_tag} already exists, using {tag_name}")
-
-    # Determine semver
+    # Determine product SemVer and its canonical immutable tag.
     current_version = get_current_version()
     if args.bump:
         new_version = bump_version(current_version, args.bump)
     else:
         new_version = current_version
+    tag_name = release_tag_for_version(new_version)
+    if git("tag", "--list", tag_name):
+        print(f"Release tag already exists: {tag_name}")
+        return
 
     # Get previous tag
     prev_tag = get_last_tag()
@@ -1621,8 +1648,9 @@ def main():
     print(f"{'='*60}")
     print(f"  Sinria Release Preview")
     print(f"{'='*60}")
-    print(f"  CalVer tag:      {tag_name}")
-    print(f"  SemVer:          v{current_version} → v{new_version}")
+    print(f"  Release tag:     {tag_name}")
+    print(f"  Product version: v{current_version} → v{new_version}")
+    print(f"  Release date:    {calver_date}")
     print(f"  Previous tag:    {prev_tag or '(none — first release)'}")
     print(f"  Commits:         {len(commits)}")
     print(f"  Unique authors:  {len({c['github_author'] for c in commits})}")
@@ -1657,6 +1685,8 @@ def main():
             add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
             if ACP_REGISTRY_MANIFEST.exists():
                 add_files.append(str(ACP_REGISTRY_MANIFEST))
+            if HELM_CHART_FILE.exists():
+                add_files.append(str(HELM_CHART_FILE))
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")

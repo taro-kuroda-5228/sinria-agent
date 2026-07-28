@@ -79,7 +79,7 @@ def _discord_request(
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
-            "User-Agent": "Hermes-Agent (https://github.com/NousResearch/sinria-agent)",
+            "User-Agent": "Sinria-Agent (https://github.com/taro-kuroda-5228/sinria-agent)",
         },
     )
 

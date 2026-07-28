@@ -59,9 +59,9 @@ Some internals still retain Hermes-derived module names for compatibility while 
 
 ---
 
-## Quick start for Kikuchi / collaborators
+## Quick start for employees and collaborators
 
-> Recommended first path on macOS or Linux: clone the repo, run setup, then start Sinria locally.
+> The installer uses the rolling `main` channel. It is the recommended path for internal users who should receive the latest reviewed Sinria core updates.
 
 ```bash
 git clone https://github.com/taro-kuroda-5228/sinria-agent.git sinria
@@ -130,6 +130,26 @@ To install natively on Windows instead, run the PowerShell installer
 ```powershell
 irm https://raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.ps1 | iex
 ```
+
+### Updates and immutable releases
+
+Git-based installs can check and apply reviewed updates without replacing local
+`~/.sinria/` configuration, memory, or credentials:
+
+```bash
+sinria update --check
+sinria update --yes
+```
+
+Tagged versions and immutable wheel/source archives are published through
+[GitHub Releases](https://github.com/taro-kuroda-5228/sinria-agent/releases).
+Each release includes `install.sh`, `install.ps1`, and `SHA256SUMS`. Verify the
+checksum before using a downloaded artifact in a regulated environment. Release
+publishing is separate from local configuration and never includes files from
+`~/.sinria/`.
+
+The release process and approval gate are documented in
+[`docs/releasing.md`](docs/releasing.md).
 
 ---
 

@@ -150,9 +150,9 @@ def test_system_prompt_injects_source_lock_from_current_user_message(monkeypatch
     )
 
     assert "Project Source-Lock Gate" in parts["volatile"]
-    assert "/Users/tarokuroda/projects/medspot" in parts["volatile"]
-    assert "medspot-mvp-spec-v0.md" in parts["volatile"]
-
+    assert "current repository" in parts["volatile"]
+    assert "mockup/source artifact" in parts["volatile"]
+    assert "/Users/" not in parts["volatile"]
 
 def test_system_prompt_reply_header_does_not_reseed_stale_proxy_context_for_medevidence(monkeypatch):
     import run_agent
@@ -181,7 +181,7 @@ def test_system_prompt_reply_header_does_not_reseed_stale_proxy_context_for_mede
 
     current_user_message = (
         '[Replying to: "Cloud Run proxy は既に終了しており、port 18082 は使っていません。"]\n\n'
-        "[Taro Kuroda] メドエビデンスレポジトリのconflictを解消してmainにマージして"
+        "[Test User] メドエビデンスレポジトリのconflictを解消してmainにマージして"
     )
 
     parts = build_system_prompt_parts(
@@ -190,6 +190,8 @@ def test_system_prompt_reply_header_does_not_reseed_stale_proxy_context_for_mede
         current_user_message=current_user_message,
     )
 
-    assert "MedEvidence GCP implementation lane: /Users/tarokuroda/medevidence-gcp." in parts["volatile"]
-    assert "MedEvidence Vercel/LTS baseline: /Users/tarokuroda/med_evi-2" in parts["volatile"]
+    assert "Project Source-Lock Gate" in parts["volatile"]
+    assert "current repository" in parts["volatile"]
+    assert "older durable project context" in parts["volatile"]
     assert "Cloud Run proxy は既に終了" not in parts["volatile"]
+    assert "/Users/" not in parts["volatile"]

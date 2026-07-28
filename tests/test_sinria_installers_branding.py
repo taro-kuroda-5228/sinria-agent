@@ -31,6 +31,18 @@ def test_install_sh_uses_sinria_runtime_defaults_and_commands():
     assert "Reload your shell to use 'sinria' command:" in text
     assert "sinria setup" in text
     assert "sinria gateway install" in text
+    assert '${GREEN}hermes${NC}' not in text
+    assert '${GREEN}hermes config' not in text
+    assert '${GREEN}hermes update' not in text
+    assert "Nous Research" not in text
+    assert "Medical-Horizon/sinria-agent" not in text
+
+
+def test_skill_sync_reports_the_active_sinria_home():
+    text = (ROOT / "tools" / "skills_sync.py").read_text(encoding="utf-8")
+
+    assert 'print(f"Syncing bundled skills into {SKILLS_DIR} ...")' in text
+    assert "~/.hermes/skills/" not in text
 
 
 

@@ -39,20 +39,18 @@ jobs:
 
       - name: Run public distribution smoke tests
         run: |
-          source .venv/bin/activate
-          python -m pytest \
+          scripts/run_tests.sh \
             tests/test_sinria_product_metadata.py \
             tests/test_sinria_installers_branding.py \
+            tests/test_distribution_release_contract.py \
+            tests/scripts/test_release_acp_registry.py \
+            tests/scripts/test_audit_release_artifacts.py \
             tests/hermes_cli/test_banner.py \
+            tests/hermes_cli/test_doctor_command_install.py \
             tests/acp/test_registry_manifest.py \
-            -q --tb=short -n auto
-        env:
-          # Ensure tests don't accidentally call real APIs
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+            -q
 
-  e2e:
+  distribution:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -74,10 +72,18 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run e2e tests
+      - name: Build and validate distribution artifacts
         run: |
-          source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
+          uv build --sdist --wheel
+          uvx twine check dist/*
+          uv run python scripts/audit_release_artifacts.py dist/*.whl dist/*.tar.gz
+          uv venv --python 3.11 /tmp/sinria-release-smoke
+          uv pip install --python /tmp/sinria-release-smoke/bin/python dist/*.whl
+          tmp_home="$(mktemp -d)"
+          HOME="$tmp_home" SINRIA_HOME="$tmp_home/.sinria" /tmp/sinria-release-smoke/bin/sinria --help >/dev/null
+          HOME="$tmp_home" SINRIA_HOME="$tmp_home/.sinria" /tmp/sinria-release-smoke/bin/sinria doctor >/tmp/sinria-doctor.txt
+          ! grep -q "Reinstall entry point" /tmp/sinria-doctor.txt
+
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
