@@ -194,34 +194,47 @@ def start_memory_monitoring(interval_seconds: float = 300.0) -> bool:
 
 
 def stop_memory_monitoring(timeout: float = 2.0) -> None:
-    """Stop the monitor thread and log a final snapshot.
+    """Stop and join the monitor thread before logging teardown continues.
 
-    Safe to call even if ``start_memory_monitoring()`` was never called.
+    Safe, idempotent, and serialized. A join timeout leaves the live thread
+    registered so callers cannot mistake a leak for a successful stop.
     """
     global _monitor_thread, _stop_event
 
+    # Serialize stop with concurrent stop/start calls. The monitor loop never
+    # acquires this lock, so joining while holding it cannot deadlock the worker.
     with _lock:
         if _stop_event is None or _monitor_thread is None:
             return
+        stop_event = _stop_event
+        thread = _monitor_thread
+        stop_event.set()
 
-        # Final snapshot before teardown so "last RSS" is always in the log.
+        try:
+            thread.join(timeout=timeout)
+        except Exception as exc:
+            logger.warning("Memory monitor join failed for %s: %s", thread.name, exc)
+            return
+
+        if thread.is_alive():
+            logger.warning(
+                "Memory monitor thread %s did not stop within %.1f seconds",
+                thread.name,
+                timeout,
+            )
+            return
+
+        if _monitor_thread is thread:
+            _monitor_thread = None
+            _stop_event = None
+
+        # Keep start/stop serialized through the final snapshot so a newer
+        # monitor cannot be mislabeled as the one that just shut down.
         try:
             log_memory_usage(prefix="shutdown")
         except Exception:
-            pass
-
-        _stop_event.set()
-        thread = _monitor_thread
-        _monitor_thread = None
-        _stop_event = None
-
-    # Join outside the lock so a stuck log call can't deadlock shutdown.
-    try:
-        thread.join(timeout=timeout)
-    except Exception:
-        pass
-
-    logger.info("[MEMORY] Periodic memory monitoring stopped")
+            logger.debug("Final memory monitor snapshot failed", exc_info=True)
+        logger.info("[MEMORY] Periodic memory monitoring stopped")
 
 
 def is_running() -> bool:

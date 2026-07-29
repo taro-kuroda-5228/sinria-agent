@@ -16955,33 +16955,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from hermes_logging import setup_logging
     setup_logging(hermes_home=_hermes_home, mode="gateway")
 
-    # Periodic process memory usage logging (gateway only) — emits a
-    # grep-friendly "[MEMORY] rss=...MB ..." line every N minutes so
-    # slow leaks in the long-lived gateway process show up as a time
-    # series in agent.log / gateway.log.  Ported from cline/cline#10343.
-    # Controlled by the logging.memory_monitor section in config.yaml.
-    try:
-        from gateway import memory_monitor as _memory_monitor
-
-        _mm_cfg = {}
-        try:
-            # config is loaded a few lines up; re-read the logging section
-            # here so we pick up user overrides without coupling to local
-            # variable names inside the start_gateway body.
-            from hermes_cli.config import load_config as _load_cli_config
-
-            _mm_cfg = (_load_cli_config() or {}).get("logging", {}).get("memory_monitor", {}) or {}
-        except Exception:
-            _mm_cfg = {}
-        if _mm_cfg.get("enabled", True):
-            try:
-                _mm_interval = float(_mm_cfg.get("interval_seconds", 300))
-            except (TypeError, ValueError):
-                _mm_interval = 300.0
-            _memory_monitor.start_memory_monitoring(interval_seconds=_mm_interval)
-    except Exception as _mm_exc:
-        logger.debug("Failed to start memory monitor: %s", _mm_exc)
-
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
     # verbosity=0    (default):    WARNING and above
@@ -17167,47 +17140,66 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
+
+    # Start periodic memory monitoring only after the runner has actually
+    # started. Startup failures and intentional clean exits must not create
+    # process-global threads that outlive their logging capture.
+    try:
+        from gateway import memory_monitor as _memory_monitor
+
+        try:
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _mm_cfg = (_load_cli_config() or {}).get("logging", {}).get("memory_monitor", {}) or {}
+        except Exception:
+            _mm_cfg = {}
+        if _mm_cfg.get("enabled", True):
+            try:
+                _mm_interval = float(_mm_cfg.get("interval_seconds", 300))
+            except (TypeError, ValueError):
+                _mm_interval = 300.0
+            _memory_monitor.start_memory_monitoring(interval_seconds=_mm_interval)
+    except Exception as _mm_exc:
+        logger.debug("Failed to start memory monitor: %s", _mm_exc)
     
     # Start background cron ticker so scheduled jobs fire automatically.
-    # Pass the event loop so cron delivery can use live adapters (E2EE support).
+    # Process-global background services are owned by this scope and must be
+    # stopped before logging capture or interpreter teardown on every exit.
     cron_stop = threading.Event()
-    cron_thread = threading.Thread(
-        target=_start_cron_ticker,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-ticker",
-    )
-    cron_thread.start()
-    
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    cron_thread = None
+    try:
+        cron_thread = threading.Thread(
+            target=_start_cron_ticker,
+            args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+            daemon=True,
+            name="cron-ticker",
+        )
+        cron_thread.start()
+        await runner.wait_for_shutdown()
+    finally:
+        cron_stop.set()
+        if cron_thread is not None and cron_thread.is_alive():
+            cron_thread.join(timeout=5)
+            if cron_thread.is_alive():
+                logger.warning("Cron ticker did not stop within 5 seconds")
+
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+            shutdown_mcp_servers()
+        except Exception:
+            pass
+
+        try:
+            from gateway import memory_monitor as _memory_monitor
+            _memory_monitor.stop_memory_monitoring(timeout=2.0)
+        except Exception:
+            logger.exception("Failed to stop gateway memory monitor")
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
-
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
-
-    # Stop the periodic memory monitor (if it was started above).
-    # This also emits one final "[MEMORY] shutdown rss=..." line so the
-    # last RSS reading before gateway exit is always in the log.
-    try:
-        from gateway import memory_monitor as _memory_monitor
-
-        _memory_monitor.stop_memory_monitoring(timeout=2.0)
-    except Exception:
-        pass
 
     if runner.exit_code is not None:
         raise SystemExit(runner.exit_code)
