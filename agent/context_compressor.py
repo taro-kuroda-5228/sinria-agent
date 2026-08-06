@@ -21,7 +21,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.auxiliary_client import call_llm, _is_connection_error
 from agent.context_engine import ContextEngine
@@ -31,6 +31,11 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.sinria_egress import (
+    BOUNDARY_PROVIDER_NOT_REGISTERED_REASON,
+    SinriaEgressBlocked,
+    SinriaEgressGuardFailure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,56 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+
+def _resolve_boundary_local_model_route() -> Optional[Dict[str, str]]:
+    """Return the operator-bound local fallback for boundary-required routing.
+
+    Reject remote endpoints before a payload-bearing retry. ``call_llm`` also
+    reapplies Boundary Control, providing a second fail-closed check.
+    """
+
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        return None
+    sinria = config.get("sinria") if isinstance(config, dict) else None
+    boundary = sinria.get("boundary_control") if isinstance(sinria, dict) else None
+    route = boundary.get("local_model_route") if isinstance(boundary, dict) else None
+    if not isinstance(route, dict):
+        return None
+    provider = str(route.get("provider") or "").strip()
+    model = str(route.get("model") or "").strip()
+    if not provider or not model:
+        return None
+    resolved = {"provider": provider, "model": model}
+    base_url = str(route.get("base_url") or "").strip()
+    if base_url:
+        try:
+            from agent.model_metadata import is_local_endpoint
+
+            if not is_local_endpoint(base_url):
+                return None
+        except Exception:
+            return None
+        resolved["base_url"] = base_url
+    elif provider.lower() not in {
+        "local", "ollama", "lmstudio", "lm-studio", "llama.cpp", "llamacpp"
+    }:
+        # Custom and cloud-style providers need an explicit verifiably-local
+        # endpoint. Known local providers may use their built-in loopback URL.
+        return None
+    return resolved
+
+
+def _boundary_required_model_route(error: BaseException) -> str:
+    metadata = getattr(error, "metadata", None)
+    boundary_decision = metadata.get("boundary_decision") if isinstance(metadata, dict) else None
+    if not isinstance(boundary_decision, dict):
+        return ""
+    return str(boundary_decision.get("required_model_route") or "").strip()
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -473,6 +528,8 @@ class ContextCompressor(ContextEngine):
         self._context_probe_persistable = False
         self._previous_summary = None
         self._last_summary_error = None
+        self._last_summary_boundary_stop = False
+        self._boundary_retry_suppression_recorded = False
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
@@ -496,6 +553,11 @@ class ContextCompressor(ContextEngine):
         self.api_key = api_key
         self.provider = provider
         self.api_mode = api_mode
+        # A provider/model switch changes the egress decision boundary. A stop
+        # cached for the previous route must not suppress compression on the new
+        # (potentially local/internal) runtime.
+        self._last_summary_boundary_stop = False
+        self._boundary_retry_suppression_recorded = False
         self.context_length = context_length
         self.threshold_tokens = max(
             int(context_length * self.threshold_percent),
@@ -581,6 +643,22 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count: int = 0
         self._summary_failure_cooldown_until: float = 0.0
         self._last_summary_error: Optional[str] = None
+        # Summary-route recovery state.  ``_force_main_runtime_for_summary``
+        # pins the first retry to the main runtime; ``_forced_summary_route``
+        # pins the second to the configured fallback chain.  Both reset on the
+        # next successful summary.
+        self._summary_model_fallen_back: bool = False
+        self._force_main_runtime_for_summary: bool = False
+        self._forced_summary_route: Optional[Tuple[str, str]] = None
+        self._summary_fallback_provider_tried: bool = False
+        # True only when summary generation was stopped at Sinria's external
+        # model-provider boundary. The caller must preserve the full local
+        # history instead of replacing it with a lossy fallback marker.
+        self._last_summary_boundary_stop: bool = False
+        # The stop remains latched until session reset or a runtime route
+        # change. Record its anti-thrashing signal once per latch so the
+        # review-gated self-repair loop can detect recurrence without chat spam.
+        self._boundary_retry_suppression_recorded: bool = False
         # When summary generation fails and a static fallback is inserted,
         # record how many turns were unrecoverably dropped so callers
         # (gateway hygiene, /compress) can surface a visible warning.
@@ -607,6 +685,41 @@ class ContextCompressor(ContextEngine):
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
+            # Dropping below the threshold means the payload that triggered a
+            # boundary stop has changed. Do not let that stale decision suppress
+            # compression if the revised transcript grows past the threshold.
+            self._last_summary_boundary_stop = False
+            self._boundary_retry_suppression_recorded = False
+            return False
+        # A confidentiality boundary stop preserved the full local transcript,
+        # so an immediate retry with the same route and history can only make
+        # the same blocked request again. Latch the decision for this session
+        # instead of retrying after every tool call.
+        if self._last_summary_boundary_stop:
+            if not self._boundary_retry_suppression_recorded:
+                self._boundary_retry_suppression_recorded = True
+                try:
+                    from agent.defect_capture import (
+                        record_external_defect,
+                        repair_telemetry_enabled,
+                    )
+
+                    if repair_telemetry_enabled():
+                        record_external_defect(
+                            repo="sinria",
+                            exc_class="CompressionBoundaryRetrySuppressed",
+                            message=(
+                                "automatic context compression retry suppressed "
+                                "after confidentiality boundary stop"
+                            ),
+                            code_location="agent/context_compressor.py:should_compress",
+                            func_name="should_compress",
+                            severity="low",
+                            session_kind="agent_runtime",
+                        )
+                except Exception:
+                    # Telemetry must never interfere with the conversation.
+                    pass
             return False
         # Anti-thrashing: back off if recent compressions were ineffective
         if self._ineffective_compression_count >= 2:
@@ -871,6 +984,123 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
+    def _reset_summary_recovery_state(self) -> None:
+        """Forget which recovery route the last summary ended up on.
+
+        Recovery pins are scoped to a single compaction.  Left in place they
+        would permanently reroute later summaries away from
+        ``auxiliary.compression``, so the configured route would never be
+        retried once its credential came back.
+        """
+        self._summary_model_fallen_back = False
+        self._force_main_runtime_for_summary = False
+        self._forced_summary_route = None
+        self._summary_fallback_provider_tried = False
+
+    def _main_runtime_is_addressable(self) -> bool:
+        """Whether the main runtime can be named explicitly on a retry.
+
+        Both halves are required.  ``_resolve_task_provider_model`` fills a
+        missing model from ``auxiliary.compression`` config, so naming only
+        the provider would send the main provider the *aux* model, and naming
+        only the model would send the aux provider the main model.
+        """
+        return bool(self.provider) and bool(self.model)
+
+    def _configured_summary_fallback_route(self) -> Optional[Tuple[str, str]]:
+        """First ``fallback_providers`` route that differs from the main runtime.
+
+        ``auxiliary.compression`` and ``model`` routinely name the same
+        provider, so one exhausted credential can take out both the aux route
+        and the main-runtime retry.  The fallback chain the operator already
+        approved for the main loop is the remaining option; reuse it rather
+        than introducing a provider nobody signed off on.
+        """
+        try:
+            from hermes_cli.config import load_config
+            config = load_config() or {}
+        except Exception:
+            return None
+        entries = config.get("fallback_providers")
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list):
+            legacy = config.get("fallback_model")
+            entries = [legacy] if isinstance(legacy, dict) else []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or "").strip()
+            model = str(entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            if provider == self.provider and model == self.model:
+                continue
+            return provider, model
+        return None
+
+    def _advance_summary_recovery(self, e: Exception, reason: str) -> bool:
+        """Move to the next recovery route, or report that none is left.
+
+        Two hops, in this order: the main runtime (already authenticated, and
+        after a main-loop failover it *is* the surviving provider), then the
+        configured fallback chain.  Bounded at two so a total outage costs a
+        fixed number of calls before the summary-less compaction.
+        """
+        if self._can_retry_summary_on_main_runtime():
+            self._fallback_to_main_for_compression(e, reason)
+            return True
+        if getattr(self, "_summary_model_fallen_back", False) and not getattr(
+            self, "_summary_fallback_provider_tried", False
+        ):
+            route = self._configured_summary_fallback_route()
+            if route is not None:
+                self._summary_fallback_provider_tried = True
+                self._forced_summary_route = route
+                self._force_main_runtime_for_summary = False
+                self._summary_failure_cooldown_until = 0.0
+                logging.warning(
+                    "Main runtime '%s' also %s for compression (%s). "
+                    "Trying configured fallback provider '%s/%s'.",
+                    self.model, reason, e, route[0], route[1],
+                )
+                return True
+        return False
+
+    def _failed_aux_route_label(self) -> str:
+        """Name the auxiliary route for the "it failed, we recovered" notice.
+
+        Both notification sites gate on this being non-empty, so returning
+        the empty ``summary_model`` would make a provider outage recover
+        invisibly.  Prefer the configured ``auxiliary.compression`` route and
+        fall back to naming the config key itself.
+        """
+        if self.summary_model:
+            return self.summary_model
+        try:
+            from agent.auxiliary_client import _resolve_task_provider_model
+            provider, model, _, _, _ = _resolve_task_provider_model("compression")
+        except Exception:
+            return "auxiliary.compression"
+        if model and provider and provider != "auto":
+            return f"{provider}/{model}"
+        return model or provider or "auxiliary.compression"
+
+    def _can_retry_summary_on_main_runtime(self) -> bool:
+        """Whether one retry on the main runtime is still worth attempting.
+
+        ``summary_model`` is only populated by an explicit
+        ``summary_model_override``; production wiring leaves it empty and
+        routes through ``auxiliary.compression`` config instead.  Gating the
+        retry on it alone therefore disabled the fallback exactly where it
+        matters most — a live session whose aux credential ran out.
+        """
+        if getattr(self, "_summary_model_fallen_back", False):
+            return False
+        if self.summary_model:
+            return self.summary_model != self.model
+        return self._main_runtime_is_addressable()
+
     def _fallback_to_main_for_compression(self, e: Exception, reason: str) -> None:
         """Switch from a separate ``summary_model`` back to the main model.
 
@@ -885,16 +1115,22 @@ class ContextCompressor(ContextEngine):
         into the warning log.
         """
         self._summary_model_fallen_back = True
+        # Clearing ``summary_model`` is not enough on its own: with no model
+        # kwarg, ``call_llm(task="compression")`` re-reads the same aux
+        # provider/model out of config and repeats the call that just failed.
+        # Pin the retry to the main runtime instead.
+        self._force_main_runtime_for_summary = self._main_runtime_is_addressable()
+        failed_route = self._failed_aux_route_label()
         logging.warning(
             "Summary model '%s' %s (%s). "
             "Falling back to main model '%s' for compression.",
-            self.summary_model, reason, e, self.model,
+            failed_route, reason, e, self.model,
         )
         _err_text = str(e).strip() or e.__class__.__name__
         if len(_err_text) > 220:
             _err_text = _err_text[:217].rstrip() + "..."
         self._last_aux_model_failure_error = _err_text
-        self._last_aux_model_failure_model = self.summary_model
+        self._last_aux_model_failure_model = failed_route
         self.summary_model = ""  # empty = use main model
         self._summary_failure_cooldown_until = 0.0  # no cooldown — retry immediately
 
@@ -912,10 +1148,11 @@ class ContextCompressor(ContextEngine):
                 related to this topic and is more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
 
-        Returns None if all attempts fail — the caller should drop
-        the middle turns without a summary rather than inject a useless
-        placeholder.
+        Returns None if all attempts fail. The caller may use a fallback marker
+        for ordinary provider failures, but a Sinria boundary stop is flagged so
+        the full local message history can be preserved without lossy compaction.
         """
+        self._last_summary_boundary_stop = False
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
             logger.debug(
@@ -1054,9 +1291,67 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 "max_tokens": int(summary_budget * 1.3),
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
-            if self.summary_model:
+            _forced_route = getattr(self, "_forced_summary_route", None)
+            if _forced_route:
+                call_kwargs.update(provider=_forced_route[0], model=_forced_route[1])
+            elif getattr(self, "_force_main_runtime_for_summary", False):
+                # Name the main runtime outright so task config cannot route
+                # this retry back to the auxiliary provider that just failed.
+                call_kwargs.update(
+                    provider=self.provider,
+                    model=self.model,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                )
+            elif self.summary_model:
                 call_kwargs["model"] = self.summary_model
-            response = call_llm(**call_kwargs)
+            try:
+                response = call_llm(**call_kwargs)
+            except SinriaEgressBlocked as boundary_error:
+                def _retry_configured_local(error: SinriaEgressBlocked):
+                    if _boundary_required_model_route(error) != "local_only":
+                        raise error
+                    local_route = _resolve_boundary_local_model_route()
+                    if local_route is None:
+                        raise error
+                    logger.warning(
+                        "Compression boundary requires local-only routing; "
+                        "retrying once on the configured local model route"
+                    )
+                    local_call_kwargs = dict(call_kwargs)
+                    local_call_kwargs.pop("api_key", None)
+                    local_call_kwargs.update(local_route)
+                    return call_llm(**local_call_kwargs)
+
+                if _boundary_required_model_route(boundary_error) == "local_only":
+                    response = _retry_configured_local(boundary_error)
+                else:
+                    # A stale/unapproved auxiliary provider must not strand a long
+                    # session when the active main runtime already has an
+                    # independently governed route. Re-evaluate the exact payload
+                    # on that route only; all content/policy denials still fail
+                    # closed in the outer boundary handler below.
+                    decision = getattr(boundary_error, "decision", None)
+                    reason = str(getattr(decision, "reason", "") or "").lower()
+                    can_recheck_main = bool(self.provider and self.model) and (
+                        BOUNDARY_PROVIDER_NOT_REGISTERED_REASON.lower() in reason
+                    )
+                    if not can_recheck_main:
+                        raise
+                    logger.warning(
+                        "Auxiliary compression route is not registered; "
+                        "rechecking the payload on the active main runtime provider=%s",
+                        self.provider,
+                    )
+                    main_call_kwargs = dict(call_kwargs)
+                    main_call_kwargs.update(
+                        provider=self.provider,
+                        model=self.model,
+                    )
+                    try:
+                        response = call_llm(**main_call_kwargs)
+                    except SinriaEgressBlocked as main_boundary_error:
+                        response = _retry_configured_local(main_boundary_error)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
             if not isinstance(content, str):
@@ -1067,10 +1362,36 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
-            self._summary_model_fallen_back = False
+            self._reset_summary_recovery_state()
             self._last_summary_error = None
             return self._with_summary_prefix(summary)
-        except RuntimeError:
+        except (SinriaEgressBlocked, SinriaEgressGuardFailure) as e:
+            # Boundary decisions are neither missing-provider errors nor
+            # transient provider failures. Never retry on another external
+            # provider: preserve the local transcript and surface the safety
+            # stop to the caller. Do not log exception text because policy
+            # implementations may attach sensitive detail to it.
+            self._summary_failure_cooldown_until = 0.0
+            self._last_summary_boundary_stop = True
+            self._last_summary_error = (
+                "compression blocked by Sinria egress boundary"
+            )
+            logger.warning(
+                "Context compression stopped at Sinria model-provider "
+                "boundary; history will be preserved error_type=%s",
+                type(e).__name__,
+            )
+            return None
+        except RuntimeError as e:
+            # No usable auxiliary provider.  In production this is what a
+            # Codex weekly-quota outage looks like: ``auxiliary.compression``
+            # pins one provider, and ``call_llm`` fails fast for an explicit
+            # provider rather than trying anything else.  The main runtime is
+            # frequently still answering — the main loop may already have
+            # failed over to another provider — so spend one attempt there
+            # before accepting a summary-less compaction.
+            if self._advance_summary_recovery(e, "unavailable"):
+                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
             # No provider configured — long cooldown, unlikely to self-resolve
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             self._last_summary_error = "no auxiliary LLM provider configured"
@@ -1080,6 +1401,17 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                             _SUMMARY_FAILURE_COOLDOWN_SECONDS)
             return None
         except Exception as e:
+            # A configured task-local chain is an explicit routing boundary.
+            # Once every declared model failed, do not leak compression content
+            # into the conversation model or the global provider fallback.
+            if getattr(e, "task_fallback_exhausted", False):
+                self._summary_failure_cooldown_until = time.monotonic() + 60
+                self._last_summary_error = "configured compression fallback chain exhausted"
+                logger.warning(
+                    "Context compression task-local fallback chain exhausted; "
+                    "history will be preserved"
+                )
+                return None
             # If the summary model is different from the main model and the
             # error looks permanent (model not found, 503, 404), fall back to
             # using the main model instead of entering cooldown that leaves
@@ -1127,12 +1459,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     self.base_url or "default",
                     e,
                 )
-            if (
-                (_is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed)
-                and self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
+            if _is_model_not_found or _is_timeout or _is_json_decode or _is_streaming_closed:
                 if _is_json_decode:
                     _reason = "returned invalid JSON"
                 elif _is_model_not_found:
@@ -1141,8 +1468,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                     _reason = "closed stream prematurely"
                 else:
                     _reason = "timed out"
-                self._fallback_to_main_for_compression(e, _reason)
-                return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
+                if self._advance_summary_recovery(e, _reason):
+                    return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
             # context is almost always worse than one extra summary attempt, so
@@ -1153,12 +1480,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # everything else (400s, provider-specific "no route" strings,
             # aggregator rejections, etc.) where auto-retry is still safer
             # than dropping the turns.
-            if (
-                self.summary_model
-                and self.summary_model != self.model
-                and not getattr(self, "_summary_model_fallen_back", False)
-            ):
-                self._fallback_to_main_for_compression(e, "failed")
+            if self._advance_summary_recovery(e, "failed"):
                 return self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
 
             # Transient errors (timeout, rate limit, network, JSON decode,
@@ -1498,13 +1820,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
         """
+        # Keep the caller-owned pre-prune list so a safety boundary stop can
+        # abort compaction without losing or rewriting any local history.
+        original_messages = messages
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
+        self._last_summary_boundary_stop = False
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
+        self._reset_summary_recovery_state()
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -1579,6 +1906,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # Phase 3: Generate structured summary
         summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+
+        if self._last_summary_boundary_stop:
+            # Fail closed without destructive compaction. The external request
+            # did not pass Sinria's boundary; replacing middle turns with a
+            # static "context lost" marker would corrupt the only complete local
+            # recovery source. The caller can redact/approve or route locally.
+            logger.warning(
+                "Context compression aborted after Sinria boundary stop; "
+                "preserving all %d local messages",
+                len(original_messages),
+            )
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []

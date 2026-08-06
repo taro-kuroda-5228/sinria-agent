@@ -8,9 +8,39 @@ prompt caching, interrupt handling, or retry logic.  Those stay on AIAgent.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from agent.transports.types import NormalizedResponse
+
+
+class RequestConfigurationError(TypeError):
+    """Deterministic local request configuration error; never retry/fail over."""
+
+
+def validate_extra_headers(headers: Any, *, source: str) -> None:
+    """Reject malformed SDK headers before the provider client sees them."""
+    if not isinstance(headers, Mapping) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in headers.items()
+    ):
+        raise RequestConfigurationError(
+            f"{source}.extra_headers must be a dict[str, str], "
+            f"got {type(headers).__name__}"
+        )
+
+
+def validate_request_overrides(overrides: Any) -> None:
+    """Validate request overrides shared by OpenAI-compatible transports."""
+    if overrides is None:
+        return
+    if not isinstance(overrides, Mapping):
+        raise RequestConfigurationError(
+            "request_overrides must be a mapping, "
+            f"got {type(overrides).__name__}"
+        )
+    if "extra_headers" in overrides:
+        validate_extra_headers(overrides["extra_headers"], source="request_overrides")
 
 
 class ProviderTransport(ABC):

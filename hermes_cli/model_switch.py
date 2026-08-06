@@ -112,6 +112,11 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
     "sonnet":    ModelIdentity("anthropic", "claude-sonnet"),
     "opus":      ModelIdentity("anthropic", "claude-opus"),
     "haiku":     ModelIdentity("anthropic", "claude-haiku"),
+    # Claude Code CLI resolves "fable" but 404s on "fable5"; accept the
+    # spellings users actually type so /model fable5 doesn't dead-end.
+    "fable":     ModelIdentity("anthropic", "claude-fable"),
+    "fable5":    ModelIdentity("anthropic", "claude-fable"),
+    "fable-5":   ModelIdentity("anthropic", "claude-fable"),
     "claude":    ModelIdentity("anthropic", "claude"),
 
     # OpenAI

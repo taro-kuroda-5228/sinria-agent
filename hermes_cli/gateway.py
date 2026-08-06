@@ -292,7 +292,8 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
     Returns:
         True if the PID was signalled and exited within the timeout.
         False if SIGUSR1 couldn't be sent or the process didn't exit in
-        time (caller should fall back to a harder restart path).
+        time.  The caller decides whether to abort or use a platform-specific
+        recovery path.
     """
     if not hasattr(signal, "SIGUSR1"):
         return False
@@ -2185,8 +2186,15 @@ def _runtime_home_for_target_user(target_home_dir: str) -> str:
       /root/.sinria/profiles/coder     → /home/alice/.sinria/profiles/coder
       /opt/custom-sinria               → /opt/custom-sinria  (kept as-is)
     """
+    # The default dir name must mirror get_hermes_home()'s own fallback
+    # (hermes_constants._default_home_dir_name) — deriving it from the
+    # gateway's product-name default ("sinria" when env is unset) diverges
+    # from the actual resolved home (~/.hermes when env is unset) and makes
+    # the remap silently no-op, leaking the calling user's home into the unit.
+    from hermes_constants import _default_home_dir_name
+
     current_home = get_hermes_home().resolve()
-    default_dir_name = ".sinria" if _cli_command_name() == "sinria" else ".hermes"
+    default_dir_name = _default_home_dir_name()
     current_default = (Path.home() / default_dir_name).resolve()
     target_default = Path(target_home_dir) / default_dir_name
 
@@ -2362,13 +2370,28 @@ def _normalize_launchd_plist_for_comparison(text: str) -> str:
     invoking shell so user-installed tools remain reachable under launchd.
     That makes raw text comparison unstable across shells, so ignore the PATH
     payload when deciding whether the installed plist is stale.
+
+    The launcher binary in ProgramArguments[0] is resolved through the same
+    ambient PATH (shutil.which), so it drifts with the shell exactly like the
+    PATH payload — comparing it raw made ``launchd_plist_is_current()`` report
+    stale on pure PATH drift, churning bootout/bootstrap on every update.
+    Mask the launcher string too; genuine definition changes (args, env keys,
+    labels, entrypoint shape) still compare raw.
     """
     import re
 
     normalized = _normalize_service_definition(text)
-    return re.sub(
+    normalized = re.sub(
         r'(<key>PATH</key>\s*<string>)(.*?)(</string>)',
         r'\1__SERVICE_PATH__\3',
+        normalized,
+        flags=re.S,
+    )
+    # First <string> of the ProgramArguments array = the PATH-resolved
+    # launcher binary; later entries (subcommands/flags) stay significant.
+    return re.sub(
+        r'(<key>ProgramArguments</key>\s*<array>\s*<string>)(.*?)(</string>)',
+        r'\1__SERVICE_LAUNCHER__\3',
         normalized,
         flags=re.S,
     )
@@ -3149,6 +3172,16 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
 
 
 def launchd_restart():
+    """Restart the launchd gateway without a persistent ``kickstart -k``.
+
+    ``launchctl kickstart -k`` can remain blocked while a KeepAlive process
+    drains.  If another supervisor kills and relaunches that process meanwhile,
+    the still-running command may terminate the replacement too, creating an
+    unbounded restart loop.  Signal the observed PID and wait for its graceful
+    exit instead.  If graceful drain does not complete, abort rather than
+    introducing a second termination mechanism.  A plain kickstart is safe to
+    use after a completed drain because it never terminates a replacement.
+    """
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
@@ -3160,15 +3193,13 @@ def launchd_restart():
             print("✓ Service restart requested")
             return
         if pid is not None:
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
-                pid = None
-            if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
-        subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
+            exited = _graceful_restart_via_sigusr1(pid, drain_timeout)
+            if not exited:
+                raise RuntimeError(
+                    f"Gateway PID {pid} did not complete graceful restart within "
+                    f"{drain_timeout:.0f}s; no force restart was issued"
+                )
+        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")
     except subprocess.CalledProcessError as e:
         if e.returncode not in {3, 113}:
@@ -3247,9 +3278,9 @@ def _guard_official_docker_root_gateway() -> None:
         f"Refusing to run the {_gateway_product_name()} gateway as root inside the official Docker image."
     )
     print(
-        "  The image entrypoint normally drops privileges to the 'sinria' user. "
+        "  The image entrypoint normally drops privileges to the non-root service user. "
         "If you override entrypoint in Docker Compose, include "
-        "/opt/sinria/docker/entrypoint.sh before the Sinria command."
+        f"{PROJECT_ROOT / 'docker' / 'entrypoint.sh'} before the {_gateway_product_name()} command."
     )
     print(
         "  Running the gateway as root can leave root-owned files in "

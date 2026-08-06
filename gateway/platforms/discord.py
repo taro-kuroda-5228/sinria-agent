@@ -28,6 +28,34 @@ VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
+
+_CRON_ACTION_LABELS = {
+    "approve": "承認して進める",
+    "reject": "却下",
+    "details": "詳細",
+}
+_CRON_ACTION_REPLY_ALIASES = {
+    "承認": "approve",
+    "承認して進める": "approve",
+    "approve": "approve",
+    "却下": "reject",
+    "reject": "reject",
+    "詳細": "details",
+    "details": "details",
+}
+
+
+def _build_cron_action_user_message(action: str, notification: str) -> str:
+    """Bind a user's decision to the complete cron notification body."""
+    action_code = _CRON_ACTION_REPLY_ALIASES.get(str(action).strip().lower(), action)
+    label = _CRON_ACTION_LABELS.get(str(action_code), str(action))
+    return (
+        "[Sinria cron action]\n"
+        f"選択: {label}\n\n"
+        "以下の元通知全文に対して、この選択を処理してください。"
+        "追加の危険操作は既存の承認ゲートを維持してください。\n\n"
+        f"--- 元通知 ---\n{notification}"
+    )
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 
@@ -48,6 +76,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.repair_report import should_route_user_repair_report
 import re
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
@@ -556,6 +585,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        self._cron_action_notifications: Dict[str, str] = {}
+        self._resolved_cron_action_messages: set[str] = set()
+        self._cron_persistent_view_registered = False
+        self._cron_action_store = None
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -691,6 +724,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 finally:
                     self._client = None
                     self._ready_event.clear()
+                    self._cron_persistent_view_registered = False
 
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
@@ -707,6 +741,56 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
+                if not adapter_self._cron_persistent_view_registered:
+                    try:
+                        client = adapter_self._client
+                        if client is None:
+                            raise RuntimeError("Discord client unavailable")
+                        client.add_view(CronActionView(
+                            adapter=adapter_self,
+                            notification="",
+                            action_context={},
+                            allowed_user_ids=adapter_self._allowed_user_ids,
+                            allowed_role_ids=adapter_self._allowed_role_ids,
+                        ))
+                        from cron.action_runtime import CronActionState, CronActionStore
+                        adapter_self._cron_action_store = CronActionStore()
+                        pending = adapter_self._cron_action_store.list_actions(
+                            states={CronActionState.AWAITING_DECISION}
+                        )
+                        for pending_action in pending:
+                            client.add_view(CronActionView(
+                                adapter=adapter_self,
+                                notification=str(pending_action.payload.get("notification") or ""),
+                                action_context={
+                                    "action_id": pending_action.action_id,
+                                    "version": pending_action.version,
+                                },
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                                allowed_role_ids=adapter_self._allowed_role_ids,
+                                action_store=adapter_self._cron_action_store,
+                            ))
+                        recoverable = adapter_self._cron_action_store.list_actions(
+                            states={CronActionState.APPROVED, CronActionState.VERIFYING}
+                        )
+                        for recoverable_action in recoverable:
+                            target = recoverable_action.payload.get("target") or {}
+                            target_id = str(target.get("thread_id") or target.get("chat_id") or "")
+                            asyncio.create_task(
+                                adapter_self.execute_cron_action(
+                                    recoverable_action.action_id,
+                                    channel_id=target_id,
+                                )
+                            )
+                        adapter_self._cron_persistent_view_registered = True
+                    except Exception as exc:
+                        # Do not block the entire Discord connection if a custom
+                        # client implementation cannot register persistent views.
+                        logger.warning(
+                            "[%s] Could not register persistent cron action view: %s",
+                            adapter_self.name,
+                            exc,
+                        )
                 adapter_self._ready_event.set()
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
@@ -893,6 +977,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._client = None
         self._ready_event.clear()
         self._post_connect_task = None
+        if self._cron_action_store is not None:
+            try:
+                self._cron_action_store.close()
+            finally:
+                self._cron_action_store = None
 
         self._release_platform_lock()
 
@@ -1479,6 +1568,125 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_cron_action(
+        self,
+        chat_id: str,
+        content: str,
+        action_context: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a cron result with same-channel decision buttons and reply fallback."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            target_id = (metadata or {}).get("thread_id") or chat_id
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel {target_id} not found")
+            if self._is_forum_parent(channel):
+                return await self._send_to_forum(channel, content)
+
+            allowed_users = {str(value) for value in self._allowed_user_ids}
+            origin_user_id = action_context.get("origin_user_id")
+            if origin_user_id:
+                allowed_users.add(str(origin_user_id))
+            view = CronActionView(
+                adapter=self,
+                notification=content,
+                action_context=action_context,
+                allowed_user_ids=allowed_users,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+
+            chunks = self.truncate_message(
+                self.format_message(content),
+                self.MAX_MESSAGE_LENGTH,
+            )
+            message_ids: list[str] = []
+            last_message = None
+            for index, chunk in enumerate(chunks):
+                last_message = await channel.send(
+                    content=chunk,
+                    view=view if index == len(chunks) - 1 else None,
+                )
+                message_ids.append(str(last_message.id))
+
+            if not message_ids:
+                return SendResult(success=False, error="Cron notification was empty")
+
+            view.message = last_message
+            final_message_id = message_ids[-1]
+            for message_id in message_ids:
+                self._cron_action_notifications[message_id] = content
+            while len(self._cron_action_notifications) > 256:
+                self._cron_action_notifications.pop(next(iter(self._cron_action_notifications)))
+            self._last_self_message_id[str(target_id)] = final_message_id
+            return SendResult(
+                success=True,
+                message_id=message_ids[0],
+                raw_response={"message_ids": message_ids, "actionable": True},
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] Failed to send actionable cron notification: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+            return SendResult(success=False, error=str(exc))
+
+    async def execute_cron_action(
+        self,
+        action_id: str,
+        *,
+        channel_id: str,
+        message: Any = None,
+    ):
+        """Execute an approved durable action and report verified state."""
+        from cron.action_executor import (
+            CronActionExecutor,
+            scheduler_readback_verifier,
+            scheduler_resume_runner,
+        )
+        from cron.action_runtime import CronActionState, CronActionStore
+
+        store = self._cron_action_store
+        if store is None:
+            store = CronActionStore()
+            self._cron_action_store = store
+        executor = CronActionExecutor(
+            store,
+            runner=scheduler_resume_runner,
+            verifier=scheduler_readback_verifier,
+            lease_ttl=3600,
+        )
+        result = await asyncio.to_thread(executor.execute, action_id)
+        status_text = {
+            CronActionState.COMPLETED: "Cron処理は実行され、readback確認まで完了しました。",
+            CronActionState.NEEDS_REVIEW: "Cron処理は実行されましたが、readbackを確認できないため要確認です。",
+            CronActionState.FAILED: "Cron処理の再開に失敗しました。再実行は自動では行いません。",
+            CronActionState.REJECTED: "Cron処理は却下されました。",
+        }.get(result.state, f"Cron処理の現在状態: {result.state.value}")
+
+        if message is not None:
+            try:
+                await message.edit(view=None)
+            except Exception:
+                logger.debug("Could not finalize cron action message", exc_info=True)
+        if self._client and channel_id:
+            try:
+                channel = self._client.get_channel(int(channel_id))
+                if not channel:
+                    channel = await self._client.fetch_channel(int(channel_id))
+                if channel:
+                    await channel.send(status_text)
+            except Exception:
+                logger.exception("Failed to report cron action %s state", action_id)
+        return result
+
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
@@ -1608,7 +1816,18 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
-            msg = await channel.fetch_message(int(message_id))
+            try:
+                msg = await channel.fetch_message(int(message_id))
+            except Exception as e:
+                server_error = getattr(discord, "DiscordServerError", ())
+                if not isinstance(e, server_error):
+                    raise
+                logger.warning(
+                    "[%s] Transient Discord server error fetching message %s; retrying once",
+                    self.name,
+                    message_id,
+                )
+                msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
                 formatted = formatted[:self.MAX_MESSAGE_LENGTH - 3] + "..."
@@ -4414,6 +4633,76 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    @staticmethod
+    def _format_reply_embeds(embeds: list[Any]) -> str:
+        """Convert Discord embeds in a replied-to message into bounded text context."""
+        blocks: list[str] = []
+        for embed in embeds[:10]:
+            title = str(getattr(embed, "title", "") or "").strip()
+            description = str(getattr(embed, "description", "") or "").strip()
+            lines = [f"[Embed] {title}" if title else "[Embed]"]
+            if description:
+                lines.append(description)
+            for field in (getattr(embed, "fields", None) or [])[:25]:
+                name = str(getattr(field, "name", "") or "").strip()
+                value = str(getattr(field, "value", "") or "").strip()
+                if name or value:
+                    lines.append(f"{name}: {value}" if name else value)
+            url = str(getattr(embed, "url", "") or "").strip()
+            if url:
+                lines.append(f"URL: {url}")
+            if len(lines) > 1 or title:
+                blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)[:8000]
+
+    async def _resolve_reply_context(
+        self,
+        message: Any,
+    ) -> tuple[Optional[str], Optional[str], list[Any]]:
+        """Resolve a Discord reply's text, embeds, and attachments.
+
+        Discord gateway payloads may omit ``reference.resolved``. Fetch the
+        original message in that case so reply intent remains complete across
+        reconnects and partial gateway events.
+        """
+        reference = getattr(message, "reference", None)
+        if not reference:
+            return None, None, []
+
+        message_id = getattr(reference, "message_id", None)
+        reply_to_message_id = str(message_id) if message_id is not None else None
+        resolved = getattr(reference, "resolved", None)
+        if resolved is None and message_id is not None:
+            fetch_message = getattr(message.channel, "fetch_message", None)
+            if callable(fetch_message):
+                try:
+                    resolved = await fetch_message(int(message_id))
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Could not fetch replied-to Discord message %s: %s",
+                        self.name,
+                        message_id,
+                        exc,
+                    )
+
+        if resolved is None:
+            return reply_to_message_id, None, []
+
+        content = str(getattr(resolved, "content", "") or "").strip()
+        attachments = list(getattr(resolved, "attachments", None) or [])
+        embed_text = self._format_reply_embeds(
+            list(getattr(resolved, "embeds", None) or [])
+        )
+        text_parts = [part for part in (content, embed_text) if part]
+        if not text_parts and attachments:
+            names = [
+                str(getattr(att, "filename", "attachment") or "attachment")
+                for att in attachments[:10]
+            ]
+            text_parts.append(f"[Attachment: {', '.join(names)}]")
+        reply_to_text = "\n\n".join(text_parts) or None
+        return reply_to_message_id, reply_to_text, attachments
+
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -4528,7 +4817,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
 
+        reply_to_id, reply_to_text, reply_attachments = (
+            await self._resolve_reply_context(message)
+        )
+        # A reply explicitly carries the original message's attachments into
+        # this turn. Preserve current-message attachments first and deduplicate
+        # by Discord attachment id (or URL for partial objects).
         all_attachments = list(message.attachments) + snapshot_attachments
+        seen_attachment_keys = {
+            getattr(att, "id", None) or getattr(att, "url", None)
+            for att in all_attachments
+        }
+        for att in reply_attachments:
+            key = getattr(att, "id", None) or getattr(att, "url", None)
+            if key not in seen_attachment_keys:
+                all_attachments.append(att)
+                seen_attachment_keys.add(key)
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -4752,6 +5056,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 if _backfill_text:
                     _channel_context = _backfill_text
 
+        # Error screenshots explicitly asking for diagnosis/repair must stay on
+        # the local repair-report path instead of entering provider multimodal
+        # input. The cached image path is consumed locally by OCR downstream.
+        if should_route_user_repair_report(event_text, has_image=bool(media_urls)):
+            for prefix in ("/repair-report", "repair:", "エラー修正", "エラーを修正"):
+                if event_text.strip().lower().startswith(prefix.lower()):
+                    event_text = event_text.strip()[len(prefix):].lstrip(" :：")
+                    break
+            event_text = f"/repair-report {event_text}".rstrip()
+
         # Defense-in-depth: prevent empty user messages from entering session
         # (can happen when user sends @mention-only with no other text).
         # When channel_context is present, a bare mention means "catch me up"
@@ -4765,12 +5079,13 @@ class DiscordAdapter(BasePlatformAdapter):
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 
-        reply_to_id = None
-        reply_to_text = None
-        if message.reference:
-            reply_to_id = str(message.reference.message_id)
-            if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+        # Actionable cron posts keep the full notification in adapter state so
+        # a plain Discord reply has the same contract as clicking a button.
+        cron_notification = getattr(self, "_cron_action_notifications", {}).get(reply_to_id)
+        cron_action = _CRON_ACTION_REPLY_ALIASES.get(str(event_text).strip().lower())
+        if cron_notification and cron_action:
+            event_text = _build_cron_action_user_message(cron_action, cron_notification)
+            reply_to_text = cron_notification
 
         event = MessageEvent(
             text=event_text,
@@ -4954,6 +5269,125 @@ def _component_check_auth(
 
 if DISCORD_AVAILABLE:
 
+    class CronActionView(discord.ui.View):
+        """Durable cron decision transport with a legacy compatibility path."""
+
+        def __init__(self, adapter: "DiscordAdapter", notification: str,
+                     action_context: Dict[str, Any], allowed_user_ids: set,
+                     allowed_role_ids: Optional[set] = None, action_store=None):
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            self.notification = notification
+            self.action_context = dict(action_context)
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self.action_id = str(self.action_context.get("action_id") or "")
+            self.action_version = self.action_context.get("version")
+            self.action_store = action_store
+            if self.action_id and self.action_store is None:
+                from cron.action_runtime import CronActionStore
+                self.action_store = CronActionStore()
+            self.message = None
+            for action, style in (("approve", discord.ButtonStyle.green),
+                                  ("reject", discord.ButtonStyle.red),
+                                  ("details", discord.ButtonStyle.grey)):
+                custom_id = f"sinria_cron_action:{action}"
+                if self.action_id:
+                    custom_id = f"sinria_cron_action:{self.action_id}:{self.action_version}:{action}"
+                label = _CRON_ACTION_LABELS[action]
+                if self.action_id and action == "approve":
+                    label = "Cron処理を再開"
+                button = discord.ui.Button(label=label, style=style, custom_id=custom_id)
+                async def callback(interaction, selected=action):
+                    await self._dispatch(interaction, selected)
+                button.callback = callback
+                self.add_item(button)
+
+        async def _dispatch_durable(self, interaction, action: str) -> None:
+            from cron.action_runtime import CronActionState, InvalidTransition, StaleActionVersion
+            self.message = getattr(interaction, "message", None)
+            try:
+                current = self.action_store.get(self.action_id)
+            except KeyError:
+                await interaction.response.send_message("この操作は見つかりません。Cron実行履歴を確認してください。", ephemeral=True)
+                return
+            if action == "details":
+                payload = current.payload
+                details = (f"状態: {current.state.value}\n"
+                           f"種別: {payload.get('action_type', 'continue_cron_run')}\n"
+                           f"概要: {payload.get('summary', '')}\n"
+                           f"ジョブ: {payload.get('job_id', '')}")
+                await interaction.response.send_message(details[:1900], ephemeral=True)
+                return
+            decision = CronActionState.APPROVED if action == "approve" else CronActionState.REJECTED
+            try:
+                updated = self.action_store.decide(self.action_id, decision,
+                    expected_version=int(self.action_version), actor_id=str(interaction.user.id))
+            except (StaleActionVersion, InvalidTransition):
+                current = self.action_store.get(self.action_id)
+                await interaction.response.send_message(
+                    f"この操作は処理済みです（現在: {current.state.value}）。", ephemeral=True)
+                return
+            for child in self.children:
+                setattr(child, "disabled", True)
+            label = "承認済み" if updated.state is CronActionState.APPROVED else "却下済み"
+            await interaction.response.send_message(label, ephemeral=True)
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                logger.debug("Could not disable resolved cron action buttons", exc_info=True)
+            if updated.state is CronActionState.APPROVED:
+                await self.adapter.execute_cron_action(
+                    updated.action_id,
+                    channel_id=str(getattr(interaction, "channel_id", "")),
+                    message=self.message,
+                )
+
+        async def _dispatch(self, interaction: discord.Interaction, action: str) -> None:
+            if not _component_check_auth(interaction, self.allowed_user_ids, self.allowed_role_ids):
+                await interaction.response.send_message("この操作を行う権限がありません。", ephemeral=True)
+                return
+            if self.action_id:
+                await self._dispatch_durable(interaction, action)
+                return
+            message = getattr(interaction, "message", None)
+            message_id = str(getattr(message, "id", ""))
+            resolved_messages = getattr(self.adapter, "_resolved_cron_action_messages", set())
+            if message_id in resolved_messages and action != "details":
+                await interaction.response.send_message("この通知はすでに処理されています。", ephemeral=True)
+                return
+            if action != "details":
+                resolved_messages.add(message_id)
+                self.adapter._resolved_cron_action_messages = resolved_messages
+            label = _CRON_ACTION_LABELS[action]
+            await interaction.response.send_message(
+                f"「{label}」を受け付けました。同じチャンネルのSinriaへ引き渡しています。", ephemeral=True)
+            notification = self.adapter._cron_action_notifications.get(message_id)
+            if not notification:
+                notification = self.notification or str(getattr(message, "content", ""))
+            user_message = _build_cron_action_user_message(action, notification)
+            event = self.adapter._build_slash_event(interaction, user_message)
+            event.text = user_message
+            event.reply_to_text = notification
+            event.reply_to_message_id = message_id or None
+            try:
+                await self.adapter.handle_message(event)
+            except Exception:
+                if action != "details": resolved_messages.discard(message_id)
+                logger.exception("Cron action handoff failed; leaving buttons retryable (message_id=%s, action=%s)", message_id, action)
+                raise
+            if action != "details" and message:
+                resolved_view = CronActionView(self.adapter, "", {}, self.allowed_user_ids, self.allowed_role_ids)
+                for child in resolved_view.children: setattr(child, "disabled", True)
+                try: await message.edit(view=resolved_view)
+                except Exception as exc: logger.debug("Could not disable resolved cron action buttons: %s", exc)
+
+        async def on_timeout(self):
+            for child in self.children: setattr(child, "disabled", True)
+            if self.message is not None:
+                try: await self.message.edit(view=self)
+                except Exception: pass
+
     class ExecApprovalView(discord.ui.View):
         """
         Interactive button view for exec approval of dangerous commands.
@@ -4999,30 +5433,93 @@ if DISCORD_AVAILABLE:
                 )
                 return
 
+            # Resolve the durable queue first.  A rejected/stale approval must
+            # leave the prompt actionable for an authorized reviewer.
+            try:
+                from gateway.collaboration_policy import (
+                    Capability,
+                    authorize_approval,
+                )
+                from gateway.collaboration_store import CollaborationStore
+                from tools.approval import resolve_gateway_approval
+
+                actor_id = str(interaction.user.id)
+                actor_roles = {
+                    str(getattr(role, "id", role))
+                    for role in (getattr(interaction.user, "roles", ()) or ())
+                }
+
+                def _authorize(data: dict, requested_choice: str) -> bool:
+                    if requested_choice == "deny":
+                        return True
+                    metadata = data.get("metadata") if isinstance(data, dict) else None
+                    if not isinstance(metadata, dict) or not metadata.get("work_item_id"):
+                        return True
+                    required_roles = {
+                        str(value) for value in metadata.get("allowed_role_ids", ())
+                    }
+                    capabilities = set()
+                    if not required_roles or actor_roles & required_roles:
+                        capabilities.add(Capability.REVIEW)
+                    store = CollaborationStore()
+                    try:
+                        return authorize_approval(
+                            data,
+                            actor_id,
+                            actor_roles,
+                            capabilities,
+                            store,
+                        )
+                    finally:
+                        store.close()
+
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    authorize=_authorize,
+                )
+            except PermissionError:
+                await interaction.response.send_message(
+                    "Approval rejected: wrong role, self-approval, or stale task version.",
+                    ephemeral=True,
+                )
+                return
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                await interaction.response.send_message(
+                    "Approval could not be resolved. Please retry or use /approve.",
+                    ephemeral=True,
+                )
+                return
+
+            if not count:
+                self.resolved = True
+                await interaction.response.send_message(
+                    "This approval has expired or was already resolved.",
+                    ephemeral=True,
+                )
+                return
+
             self.resolved = True
 
-            # Update the embed with the decision
+            # Update the embed with the verified decision.
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
             if embed:
                 embed.color = color
                 embed.set_footer(text=f"{label} by {interaction.user.display_name}")
 
-            # Disable all buttons
             for child in self.children:
                 child.disabled = True
 
             await interaction.response.edit_message(embed=embed, view=self)
-
-            # Unblock the waiting agent thread via the gateway approval queue
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
+            logger.info(
+                "Discord button resolved %d approval(s) for session %s "
+                "(choice=%s, actor_id=%s)",
+                count,
+                self.session_key,
+                choice,
+                actor_id,
+            )
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(
@@ -5558,26 +6055,17 @@ if DISCORD_AVAILABLE:
                 embed.color = discord.Color.green()
                 embed.set_footer(text=f"Answered by {display_name}: {choice}")
 
-            try:
-                await interaction.response.edit_message(embed=embed, view=self)
-            except Exception:
-                logger.debug(
-                    "Discord clarify edit_message failed for %s",
-                    self.clarify_id,
-                    exc_info=True,
-                )
-                try:
-                    await interaction.response.defer()
-                except Exception:
-                    pass
-
-            # Resolve via the gateway clarify primitive — same mechanism as
-            # Telegram. Look up the canonical choice text from the entry so
-            # we round-trip the original value, not a button-label variant.
+            # Resolve durable agent state before awaiting Discord presentation.
+            # Component edits can exceed Discord's acknowledgement window or fail;
+            # neither condition may leave the clarify waiter pinned indefinitely.
+            # Look up the canonical choice text so we round-trip the original
+            # value, not a truncated button-label variant.
             resolved_text: Optional[str] = None
+            entry_exists = False
             try:
                 from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                 entry = _clarify_entries.get(self.clarify_id)
+                entry_exists = entry is not None
                 if entry and entry.choices and 0 <= index < len(entry.choices):
                     resolved_text = entry.choices[index]
             except Exception:
@@ -5587,7 +6075,21 @@ if DISCORD_AVAILABLE:
 
             try:
                 from tools.clarify_gateway import resolve_gateway_clarify
-                resolved = resolve_gateway_clarify(self.clarify_id, resolved_text)
+                resolved = resolve_gateway_clarify(
+                    self.clarify_id,
+                    resolved_text,
+                    requester_user_id=str(getattr(interaction.user, "id", "")),
+                )
+                if not resolved and entry_exists:
+                    self.resolved = False
+                    for child in self.children:
+                        if hasattr(child, "disabled"):
+                            setattr(child, "disabled", False)
+                    await interaction.response.send_message(
+                        "Only the requesting user can answer this prompt~",
+                        ephemeral=True,
+                    )
+                    return
                 logger.info(
                     "Discord clarify button resolved (id=%s, choice=%r, user=%s, ok=%s)",
                     self.clarify_id, resolved_text,
@@ -5599,6 +6101,19 @@ if DISCORD_AVAILABLE:
                     "Discord clarify resolve_gateway_clarify failed (id=%s): %s",
                     self.clarify_id, exc,
                 )
+
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                logger.debug(
+                    "Discord clarify edit_message failed for %s after waiter release",
+                    self.clarify_id,
+                    exc_info=True,
+                )
+                try:
+                    await interaction.response.defer()
+                except Exception:
+                    pass
 
         async def _on_other(self, interaction: "discord.Interaction") -> None:
             """Flip the clarify entry into text-capture mode."""
@@ -5618,7 +6133,16 @@ if DISCORD_AVAILABLE:
             # and disable the buttons so the user can't double-click.
             try:
                 from tools.clarify_gateway import mark_awaiting_text
-                mark_awaiting_text(self.clarify_id)
+                marked = mark_awaiting_text(
+                    self.clarify_id,
+                    requester_user_id=str(getattr(interaction.user, "id", "")),
+                )
+                if not marked:
+                    await interaction.response.send_message(
+                        "Only the requesting user can answer this prompt~",
+                        ephemeral=True,
+                    )
+                    return
             except Exception as exc:
                 logger.warning(
                     "Discord clarify mark_awaiting_text failed (id=%s): %s",

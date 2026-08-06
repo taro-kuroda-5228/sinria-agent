@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Google Workspace API CLI for Hermes Agent.
+"""Google Workspace API CLI for Sinria Agent.
 
 Uses the Google Workspace CLI (`gws`) when available, but preserves the
-existing Hermes-facing JSON contract and falls back to the Python client
+existing Sinria-facing JSON contract and falls back to the Python client
 libraries if `gws` is not installed.
 
 Usage:
@@ -19,6 +19,8 @@ Usage:
   python google_api.py sheets append SHEET_ID RANGE --values '[[...]]'
   python google_api.py docs get DOC_ID
 """
+
+from __future__ import annotations
 
 import argparse
 import base64
@@ -129,7 +131,22 @@ def _run_gws(parts: list[str], *, params: dict | None = None, body: dict | None 
 
 
 def _headers_dict(msg: dict) -> dict[str, str]:
-    return {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    canonical_names = {
+        "from": "From",
+        "to": "To",
+        "cc": "Cc",
+        "subject": "Subject",
+        "date": "Date",
+        "message-id": "Message-ID",
+    }
+    normalized: dict[str, str] = {}
+    for header in msg.get("payload", {}).get("headers", []):
+        name = header.get("name")
+        value = header.get("value")
+        if not isinstance(name, str) or not isinstance(value, str):
+            continue
+        normalized[canonical_names.get(name.lower(), name)] = value
+    return normalized
 
 
 def _extract_message_body(msg: dict) -> str:
@@ -314,12 +331,12 @@ def gmail_get(args):
 def gmail_send(args):
     if _gws_binary():
         message = MIMEText(args.body, "html" if args.html else "plain")
-        message["to"] = args.to
-        message["subject"] = args.subject
+        message["To"] = args.to
+        message["Subject"] = args.subject
         if args.cc:
-            message["cc"] = args.cc
+            message["Cc"] = args.cc
         if args.from_header:
-            message["from"] = args.from_header
+            message["From"] = args.from_header
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
         body = {"raw": raw}
@@ -336,12 +353,12 @@ def gmail_send(args):
 
     service = build_service("gmail", "v1")
     message = MIMEText(args.body, "html" if args.html else "plain")
-    message["to"] = args.to
-    message["subject"] = args.subject
+    message["To"] = args.to
+    message["Subject"] = args.subject
     if args.cc:
-        message["cc"] = args.cc
+        message["Cc"] = args.cc
     if args.from_header:
-        message["from"] = args.from_header
+        message["From"] = args.from_header
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
     body = {"raw": raw}
@@ -372,10 +389,10 @@ def gmail_reply(args):
             subject = f"Re: {subject}"
 
         message = MIMEText(args.body)
-        message["to"] = headers.get("From", "")
-        message["subject"] = subject
+        message["To"] = headers.get("From", "")
+        message["Subject"] = subject
         if args.from_header:
-            message["from"] = args.from_header
+            message["From"] = args.from_header
         if headers.get("Message-ID"):
             message["In-Reply-To"] = headers["Message-ID"]
             message["References"] = headers["Message-ID"]
@@ -401,10 +418,10 @@ def gmail_reply(args):
         subject = f"Re: {subject}"
 
     message = MIMEText(args.body)
-    message["to"] = headers.get("From", "")
-    message["subject"] = subject
+    message["To"] = headers.get("From", "")
+    message["Subject"] = subject
     if args.from_header:
-        message["from"] = args.from_header
+        message["From"] = args.from_header
     if headers.get("Message-ID"):
         message["In-Reply-To"] = headers["Message-ID"]
         message["References"] = headers["Message-ID"]

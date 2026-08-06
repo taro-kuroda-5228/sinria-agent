@@ -92,7 +92,7 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 msg = (
                     "⚠ No auxiliary LLM provider configured — context "
                     "compression will drop middle turns without a summary. "
-                    "Run `hermes setup` or set OPENROUTER_API_KEY."
+                    "Run `sinria setup` or set OPENROUTER_API_KEY."
                 )
             agent._compression_warning = msg
             agent._emit_status(msg)
@@ -290,6 +290,30 @@ def compress_context(
         compressed = agent.context_compressor.compress(messages, current_tokens=approx_tokens)
 
     summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
+    _boundary_stop = (
+        getattr(agent.context_compressor, "_last_summary_boundary_stop", False) is True
+    )
+    if _boundary_stop:
+        # Compression did not happen. Preserve the current session identity,
+        # prompt cache, DB lineage, and full local transcript. Rotating the
+        # session here would falsely mark every blocked retry as a successful
+        # compaction and can duplicate persisted history.
+        if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
+            agent._last_compression_summary_warning = summary_error
+            agent._emit_warning(
+                "🔒 Context compression paused by Sinria's confidentiality "
+                "boundary. Full local history was preserved and automatic "
+                "retries are paused for this session. Switch to a local/internal "
+                "model or start a redacted session to resume compression."
+            )
+        logger.info(
+            "context compression paused after confidentiality boundary stop: "
+            "session=%s messages=%d",
+            agent.session_id or "none",
+            _pre_msg_count,
+        )
+        return messages, system_message
+
     if summary_error:
         if getattr(agent, "_last_compression_summary_warning", None) != summary_error:
             agent._last_compression_summary_warning = summary_error

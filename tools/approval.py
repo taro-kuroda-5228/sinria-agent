@@ -9,6 +9,7 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import hashlib
 import logging
 import os
 import re
@@ -16,17 +17,16 @@ import sys
 import threading
 import time
 import unicodedata
-from typing import Optional
+import uuid
+from typing import Any, Callable, Optional
+
+from tools import approval_store
 from hermes_cli.config import cfg_get
 
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
-# Per-thread/per-task gateway session identity.
-# Gateway runs agent turns concurrently in executor threads, so reading a
-# process-global env var for session identity is racy. Keep env fallback for
-# legacy single-threaded callers, but prefer the context-local value when set.
 _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
@@ -200,7 +200,7 @@ _CMDPOS = (
     r'\s*'                          # optional whitespace
     r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
     r'(?:env\s+(?:\w+=\S*\s+)*)?'   # optional env with VAR=VAL pairs
-    r'(?:(?:exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
+    r'(?:(?:command|exec|nohup|setsid|time)\s+)*'  # optional wrapper commands
     r'\s*'
 )
 
@@ -326,6 +326,12 @@ DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    # Python deletion APIs can be embedded in heredocs, which bypass shell-only
+    # rm patterns.  Match the destructive call itself without flagging read-only
+    # pathlib/os inspection.
+    (r'\.unlink\s*\(', "delete file via Python unlink API"),
+    (r'\bos\.remove\s*\(', "delete file via Python os.remove API"),
+    (r'\bshutil\.rmtree\s*\(', "recursive delete via Python shutil.rmtree API"),
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
@@ -340,6 +346,24 @@ DANGEROUS_PATTERNS = [
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    (
+        _CMDPOS
+        + r'(?:\S*/)?launchctl\s+(?:bootstrap|bootout|enable|disable|kickstart|kill|load|remove|start|stop|submit|unload)\b',
+        "mutate launchd service",
+    ),
+    (
+        _CMDPOS + r'(?:\S*/)?(?:sinria|hermes)\s+gateway\s+(?:restart|stop)\b',
+        "stop/restart Sinria gateway",
+    ),
+    (
+        _CMDPOS
+        + r'(?:\S*/)?(?:sinria|hermes)\s+gateway\s+run\b[^\n;|&]*--replace\b',
+        "replace running Sinria gateway",
+    ),
+    (
+        _CMDPOS + r'(?:\S*/)?(?:sinria|hermes)\s+update\b',
+        "update Sinria Agent",
+    ),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (parallel to pkill -9). Catches -9 / -KILL /
@@ -353,6 +377,10 @@ DANGEROUS_PATTERNS = [
     # Any shell invocation via -c or combined flags like -lc, -ic, etc.
     (r'\b(bash|sh|zsh|ksh)\s+-[^\s]*c(\s+|$)', "shell command via -c/-lc flag"),
     (r'\b(python[23]?|perl|ruby|node)\s+-[ec]\s+', "script execution via -e/-c flag"),
+    (
+        r'\bnode\s+(?:--eval|--print)(?:=|\s+)',
+        "script execution via Node.js long option",
+    ),
     (r'\b(curl|wget)\b.*\|\s*(ba)?sh\b', "pipe remote content to shell"),
     (r'\b(bash|sh|zsh|ksh)\s+<\s*<?\s*\(\s*(curl|wget)\b', "execute remote script via process substitution"),
     (rf'\btee\b.*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via tee"),
@@ -366,16 +394,23 @@ DANGEROUS_PATTERNS = [
     # approving -exec / -delete flags.
     (r'\bfind\b.*-exec(?:dir)?\s+(/\S*/)?rm\b', "find -exec/-execdir rm"),
     (r'\bfind\b.*-delete\b', "find -delete"),
-    # Gateway lifecycle protection: prevent the agent from killing its own
-    # gateway process.  These commands trigger a gateway restart/stop that
-    # terminates all running agents mid-work.
-    (r'\bhermes\s+gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
-    (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
-    # Gateway protection: never start gateway outside systemd management
-    (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart sinria-gateway')"),
-    (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart sinria-gateway')"),
-    # Self-termination protection: prevent agent from killing its own process
-    (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
+    # Gateway lifecycle protection: lifecycle mutations are handled by the
+    # command-position-aware Sinria/Hermes compatibility patterns above.
+    # Never start a detached gateway outside the platform service manager.
+    (
+        r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)',
+        "start gateway outside its platform service manager",
+    ),
+    (
+        r'\bnohup\b.*gateway\s+run\b',
+        "start gateway outside its platform service manager",
+    ),
+    # Self-termination protection: prevent the agent from killing its own process.
+    # Keep Hermes in the matcher for fork compatibility, but report Sinria-native labels.
+    (
+        r'\b(pkill|killall)\b.*\b(sinria|hermes|gateway|cli\.py)\b',
+        "kill Sinria/gateway process (self-termination)",
+    ),
     # Self-termination via kill + command substitution (pgrep/pidof).
     # The name-based pattern above catches `pkill hermes` but not
     # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
@@ -429,6 +464,18 @@ DANGEROUS_PATTERNS_COMPILED = [
     (re.compile(pattern, _RE_FLAGS), description)
     for pattern, description in DANGEROUS_PATTERNS
 ]
+
+# Lifecycle operations can terminate every in-flight gateway session.  Scope
+# session/permanent approval keys to the exact normalized command so approving
+# one service mutation never silently authorizes another.
+_COMMAND_SCOPED_APPROVAL_DESCRIPTIONS = frozenset(
+    {
+        "mutate launchd service",
+        "stop/restart Sinria gateway",
+        "replace running Sinria gateway",
+        "update Sinria Agent",
+    }
+)
 
 
 def _legacy_pattern_key(pattern: str) -> str:
@@ -486,6 +533,9 @@ def detect_dangerous_command(command: str) -> tuple:
     for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
         if pattern_re.search(command_lower):
             pattern_key = description
+            if description in _COMMAND_SCOPED_APPROVAL_DESCRIPTIONS:
+                digest = hashlib.sha256(command_lower.encode("utf-8")).hexdigest()[:12]
+                pattern_key = f"{description} [{digest}]"
             return (True, pattern_key, description)
     return (False, None, None)
 
@@ -509,14 +559,19 @@ _permanent_approved: set = set()
 # resolves every pending approval in the session.
 
 
+class ApprovalAuthorizationError(PermissionError):
+    """The approver is not authorized for the pending operation."""
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("event", "data", "result", "approval_id")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        self.approval_id = uuid.uuid4().hex[:12]
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -545,36 +600,103 @@ def unregister_gateway_notify(session_key: str) -> None:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
+        approval_store.clear_pending(entry.approval_id)
         entry.event.set()
 
 
-def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False) -> int:
-    """Called by the gateway's /approve or /deny handler to unblock
-    waiting agent thread(s).
+def annotate_pending_gateway_approval(session_key: str, metadata: dict) -> bool:
+    """Atomically attach sanitized collaboration binding data to the oldest entry.
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    This is called by the gateway notifier immediately before the approval is
+    rendered.  Only identifiers, versions, capabilities, and digests belong
+    here; raw task or patient content must never be supplied.
+    """
+    allowed = {
+        "work_item_id",
+        "work_item_version",
+        "requester_actor_id",
+        "required_capability",
+        "payload_sha256",
+        "require_distinct_approver",
+        "allowed_role_ids",
+    }
+    sanitized = {key: metadata[key] for key in allowed if key in metadata}
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return False
+        entry = queue[0]
+        current = entry.data.setdefault("metadata", {})
+        if not isinstance(current, dict):
+            current = {}
+            entry.data["metadata"] = current
+        current.update(sanitized)
+        approval_store.record_pending(entry.approval_id, session_key, entry.data)
+        return True
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+
+def resolve_gateway_approval(
+    session_key: str,
+    choice: str,
+    resolve_all: bool = False,
+    authorize: Optional[Callable[[dict, str], bool]] = None,
+) -> int:
+    """Resolve pending gateway approval(s), optionally under an atomic policy.
+
+    ``authorize`` is evaluated while the queue lock is held and before any
+    entry is removed.  A rejected positive approval leaves every waiter
+    pending.  Denial is always allowed because it cannot increase authority.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        targets = list(queue) if resolve_all else [queue[0]]
+        if choice != "deny" and authorize is not None:
+            if not all(bool(authorize(entry.data, choice)) for entry in targets):
+                raise ApprovalAuthorizationError(
+                    "approver is not authorized for this pending operation"
+                )
         if resolve_all:
-            targets = list(queue)
             queue.clear()
         else:
-            targets = [queue.pop(0)]
+            queue.pop(0)
         if not queue:
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
         entry.result = choice
+        approval_store.clear_pending(entry.approval_id)
         entry.event.set()
     return len(targets)
+
+def _wait_for_gateway_entry(entry: "_ApprovalEntry", timeout: int) -> bool:
+    """Block until the entry resolves, times out, or a desktop answer lands.
+
+    Polls in 1s slices so we can (a) heartbeat the inactivity tracker and
+    (b) pick up remote answers written by the dashboard/Desktop through
+    tools.approval_store. Returns True when resolved.
+    """
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover
+        touch_activity_if_due = None
+
+    now = time.monotonic()
+    deadline = now + max(timeout, 0)
+    activity_state = {"last_touch": now, "start": now}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if entry.event.wait(timeout=min(1.0, remaining)):
+            return True
+        remote = approval_store.poll_response(entry.approval_id)
+        if remote is not None:
+            entry.result = remote
+            return True
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(activity_state, "waiting for user approval")
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -612,7 +734,15 @@ def disable_session_yolo(session_key: str) -> None:
 
 
 def clear_session(session_key: str) -> None:
-    """Remove all approval and yolo state for a given session."""
+    """Remove all approval and yolo state for a given session.
+
+    Does NOT call approval_store.clear_pending directly: setting entry.result
+    and entry.event.set() wakes the waiter thread, which calls
+    approval_store.clear_pending itself as part of normal resolution teardown
+    (see request_gateway_approval / _wait_for_gateway_entry).  If the waiter
+    thread is already dead (process crash, premature exit), the 2-hour stale
+    sweep in approval_store.list_pending covers any leftover files.
+    """
     if not session_key:
         return
     with _lock:
@@ -930,6 +1060,7 @@ def request_gateway_approval(
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
+    approval_store.record_pending(entry.approval_id, session_key, approval_data)
 
     _fire_approval_hook(
         "pre_approval_request",
@@ -951,8 +1082,11 @@ def request_gateway_approval(
                 queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(session_key, None)
+        approval_store.clear_pending(entry.approval_id)
         return {
             "approved": False,
+            "status": "approval_delivery_failed",
+            "reason_code": "approval_notification_failed",
             "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
             "pattern_key": pattern_key,
             "description": description,
@@ -964,24 +1098,7 @@ def request_gateway_approval(
     except (ValueError, TypeError):
         timeout = 300
 
-    try:
-        from tools.environments.base import touch_activity_if_due
-    except Exception:  # pragma: no cover
-        touch_activity_if_due = None
-
-    _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
-    _activity_state = {"last_touch": _now, "start": _now}
-    resolved = False
-    while True:
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
-            resolved = True
-            break
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(_activity_state, "waiting for user approval")
+    resolved = _wait_for_gateway_entry(entry, timeout)
 
     with _lock:
         queue = _gateway_queues.get(session_key, [])
@@ -989,6 +1106,7 @@ def request_gateway_approval(
             queue.remove(entry)
         if not queue:
             _gateway_queues.pop(session_key, None)
+    approval_store.clear_pending(entry.approval_id)
 
     choice = entry.result
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
@@ -1004,9 +1122,16 @@ def request_gateway_approval(
     )
 
     if not resolved or choice is None or choice == "deny":
-        reason = "timed out" if not resolved else "denied by user"
+        timed_out = not resolved or choice is None
+        reason = (
+            "is still required; the approval request was not resolved"
+            if timed_out
+            else "was denied by user"
+        )
         return {
             "approved": False,
+            "status": "approval_required" if timed_out else "blocked",
+            "reason_code": "approval_wait_timeout" if timed_out else "approval_denied",
             "message": f"BLOCKED: Approval {reason}. Do NOT retry automatically.",
             "pattern_key": pattern_key,
             "description": description,
@@ -1234,8 +1359,18 @@ def check_all_command_guards(command: str, env_type: str,
         except Exception:
             logger.debug("Sinria terminal egress guard failed open for command approval", exc_info=True)
 
-    # Skip containers for both checks
-    if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+    session_key = get_current_session_key()
+    # G2 is an unattended wearable surface: destructive actions must always
+    # reach its explicit double-action approval UI. This surface-specific
+    # safety floor overrides container trust, stored grants, yolo, mode=off,
+    # and Smart Approval auto-approval.
+    requires_explicit_approval = session_key.startswith("even-g2:")
+
+    # Skip containers unless the request requires a fresh human approval.
+    if (
+        env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
+        and not requires_explicit_approval
+    ):
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -1258,10 +1393,16 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
+
+    # --yolo or approvals.mode=off: bypass all approval prompts except on
+    # surfaces that require an explicit human approval round-trip.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-wide.
+    yolo_enabled = (
+        is_truthy_value(os.getenv("HERMES_YOLO_MODE"))
+        or is_current_session_yolo_enabled()
+    )
+    if (yolo_enabled or approval_mode == "off") and not requires_explicit_approval:
         return {"approved": True, "message": None}
 
     is_cli = env_var_enabled("HERMES_INTERACTIVE")
@@ -1308,8 +1449,6 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = get_current_session_key()
-
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
     # Now both block and warn go through the approval flow so users can
@@ -1319,11 +1458,11 @@ def check_all_command_guards(command: str, env_type: str,
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
-        if not is_approved(session_key, tirith_key):
+        if requires_explicit_approval or not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, tirith_desc, True))
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if requires_explicit_approval or not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
@@ -1334,7 +1473,7 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not requires_explicit_approval:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
@@ -1386,6 +1525,7 @@ def check_all_command_guards(command: str, env_type: str,
             entry = _ApprovalEntry(approval_data)
             with _lock:
                 _gateway_queues.setdefault(session_key, []).append(entry)
+            approval_store.record_pending(entry.approval_id, session_key, approval_data)
 
             # Notify plugins that an approval is being requested. Fires before
             # the gateway notify callback so observers (e.g. macOS notifier
@@ -1411,8 +1551,11 @@ def check_all_command_guards(command: str, env_type: str,
                         queue.remove(entry)
                     if not queue:
                         _gateway_queues.pop(session_key, None)
+                approval_store.clear_pending(entry.approval_id)
                 return {
                     "approved": False,
+                    "status": "approval_delivery_failed",
+                    "reason_code": "approval_notification_failed",
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
@@ -1420,41 +1563,15 @@ def check_all_command_guards(command: str, env_type: str,
 
             # Block until the user responds or timeout (default 5 min).
             # Poll in short slices so we can fire activity heartbeats every
-            # ~10s to the agent's inactivity tracker.  Without this, the
-            # blocking event.wait() never touches activity, and the
-            # gateway's inactivity watchdog (agent.gateway_timeout, default
-            # 1800s) kills the agent while the user is still responding to
-            # the approval prompt.  Mirrors the _wait_for_process() cadence
-            # in tools/environments/base.py.
+            # ~10s to the agent's inactivity tracker and pick up remote
+            # answers from the Desktop/dashboard via approval_store.
             timeout = _get_approval_config().get("gateway_timeout", 300)
             try:
                 timeout = int(timeout)
             except (ValueError, TypeError):
                 timeout = 300
 
-            try:
-                from tools.environments.base import touch_activity_if_due
-            except Exception:  # pragma: no cover
-                touch_activity_if_due = None
-
-            _now = time.monotonic()
-            _deadline = _now + max(timeout, 0)
-            _activity_state = {"last_touch": _now, "start": _now}
-            resolved = False
-            while True:
-                _remaining = _deadline - time.monotonic()
-                if _remaining <= 0:
-                    break
-                # 1s poll slice — the event is set immediately when the
-                # user responds, so slice length only controls heartbeat
-                # cadence, not user-visible responsiveness.
-                if entry.event.wait(timeout=min(1.0, _remaining)):
-                    resolved = True
-                    break
-                if touch_activity_if_due is not None:
-                    touch_activity_if_due(
-                        _activity_state, "waiting for user approval"
-                    )
+            resolved = _wait_for_gateway_entry(entry, timeout)
 
             # Clean up this entry from the queue
             with _lock:
@@ -1463,6 +1580,7 @@ def check_all_command_guards(command: str, env_type: str,
                     queue.remove(entry)
                 if not queue:
                     _gateway_queues.pop(session_key, None)
+            approval_store.clear_pending(entry.approval_id)
 
             choice = entry.result
             # Normalize outcome for the post hook. Unresolved (timeout) and
@@ -1484,10 +1602,17 @@ def check_all_command_guards(command: str, env_type: str,
             )
 
             if not resolved or choice is None or choice == "deny":
-                reason = "timed out" if not resolved else "denied by user"
+                timed_out = not resolved or choice is None
+                reason = (
+                    "is still required; the approval request was not resolved"
+                    if timed_out
+                    else "was denied by user"
+                )
                 return {
                     "approved": False,
-                    "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
+                    "status": "approval_required" if timed_out else "blocked",
+                    "reason_code": "approval_wait_timeout" if timed_out else "approval_denied",
+                    "message": f"BLOCKED: Approval {reason}. Do NOT retry this command.",
                     "pattern_key": primary_key,
                     "description": combined_desc,
                 }

@@ -1,0 +1,78 @@
+version: 1
+product: sinria
+policy:
+  target: Z0
+  description: >-
+    Enforced user-visible identity-zero surfaces. Every surface listed here is
+    audited on demand and must be free of the upstream product identity. Only
+    surfaces that Sinria actually enforces today belong in this manifest; do not
+    add a surface here until it passes the audit, so a green run is an honest
+    statement of what is complete.
+  forbidden_patterns:
+    - id: upstream_product_token
+      pattern: '(?i)hermes'
+  allowed_exception_categories:
+    - provenance
+    - compatibility
+    - official_model_id
+
+# SCOPE (read before adding surfaces)
+# -----------------------------------
+# This manifest enforces the CLI-owned rendered surfaces that the visible
+# identity-zero slice actually made clean: the recursive `--help` tree (also
+# covered by tests/hermes_cli/test_sinria_cli_rendered_surfaces.py), `profile`,
+# and `skills list`. A green audit here is an honest statement that those
+# surfaces are residue-free.
+#
+# Two categories are intentionally NOT enforced yet, because doing so would
+# overstate completion:
+#
+#   1. `sinria plugins list` renders BUNDLED plugin descriptions (from each
+#      plugins/*/plugin.yaml). Several still carry upstream residue such as
+#      `$HERMES_HOME/cache`, `~/.hermes/auth.json`, and "the Hermes agent". That
+#      is bundled third-party metadata, not a CLI identity string, and each
+#      occurrence must be individually classified (residue vs provenance vs
+#      load-bearing name) in its own slice before it can be enforced.
+#   2. The full-repository static inventory — README/website docs, bundled
+#      plugin and skill metadata, and Docker/Nix packaging — likewise mixes
+#      user-facing residue, internal compatibility identifiers, upstream
+#      provenance, and load-bearing package/service names. It is a separate,
+#      still-in-progress classification slice and must not be declared enforced
+#      until each occurrence has an exact, bounded exception or a fix.
+
+surfaces:
+  - id: cli.root_help
+    type: command
+    command: [sinria, --help]
+    timeout_seconds: 30
+  - id: cli.config_help
+    type: command
+    command: [sinria, config, --help]
+    timeout_seconds: 30
+  - id: cli.cron_create_help
+    type: command
+    command: [sinria, cron, create, --help]
+    timeout_seconds: 30
+  - id: cli.dashboard_help
+    type: command
+    command: [sinria, dashboard, --help]
+    timeout_seconds: 30
+  - id: cli.profile
+    type: command
+    command: [sinria, profile]
+    timeout_seconds: 30
+    accepted_exit_codes: [0, 1]
+  - id: cli.skills_record_video_help
+    type: command
+    command: [sinria, skills, record-video, --help]
+    timeout_seconds: 30
+  - id: cli.status_help
+    type: command
+    command: [sinria, status, --help]
+    timeout_seconds: 30
+  - id: cli.skills_list
+    type: command
+    command: [sinria, skills, list]
+    timeout_seconds: 60
+
+exceptions: []

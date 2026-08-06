@@ -144,8 +144,8 @@ def build_top_level_parser():
         default=None,
         help=(
             "Model override for this invocation (e.g. anthropic/claude-sonnet-4.6). "
-            "Applies to -z/--oneshot and --tui. Also settable via SINRIA_INFERENCE_MODEL env var "
-            "(legacy HERMES_INFERENCE_MODEL is still accepted)."
+            "Applies to -z/--oneshot and --tui. Also settable via "
+            "SINRIA_INFERENCE_MODEL."
         ),
     )
     _inherited_flag(
@@ -154,8 +154,8 @@ def build_top_level_parser():
         default=None,
         help=(
             "Provider override for this invocation (e.g. openrouter, anthropic). "
-            "Applies to -z/--oneshot and --tui. Also settable via SINRIA_INFERENCE_PROVIDER env var "
-            "(legacy HERMES_INFERENCE_PROVIDER is still accepted)."
+            "Applies to -z/--oneshot and --tui. Also settable via "
+            "SINRIA_INFERENCE_PROVIDER."
         ),
     )
     parser.add_argument(
@@ -333,7 +333,7 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help=(
             "Auto-approve any unseen shell hooks declared in config.yaml "
-            "without a TTY prompt (see also HERMES_ACCEPT_HOOKS env var and "
+            "without a TTY prompt (see also SINRIA_ACCEPT_HOOKS and "
             "hooks_auto_accept: in config.yaml)."
         ),
     )

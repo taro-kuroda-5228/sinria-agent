@@ -45,6 +45,45 @@ integrations:
       notes: Prefer sandbox/read-only scopes first; writeback requires physician approval and adapter review.
 ```
 
+## Offline Clinical Gateway harness
+
+Sinria includes a versioned Clinical Gateway v1 contract with a deterministic,
+synthetic-only harness. It can search or retrieve bundled non-PHI fixture
+documents without reading files, opening network connections, loading
+credentials, or contacting an EMR/EHR. Unknown fields and versions, mutating
+operations, real-patient provenance, PHI-like identifiers, endpoint/secret
+metadata, and non-synthetic record IDs are rejected by default.
+
+This harness is for adapter development and safety regression testing. It is not
+a live clinical connector and does not enable export-file content ingestion,
+FHIR/HL7 calls, patient-data processing, or writeback. Every response includes
+audit markers confirming synthetic provenance, disabled raw-payload logging,
+no network call, and no writeback.
+
+## Try the complete offline workflow
+
+The synthetic workflow can generate a deterministic discharge-summary or
+referral-letter draft, keep it pending until an explicit physician decision,
+and finalize approved drafts locally. Every success, rejection, blocked action,
+and simulated integration failure receives a correlation ID and a hash-chained
+audit record.
+
+Use the `sinria_integrations` tool with:
+
+```json
+{
+  "mode": "run_clinical_workflow_demo",
+  "action": "preview",
+  "clinical_document_kind": "discharge_summary"
+}
+```
+
+Change `action` to `approve` and set `approved_by` to `physician` for the
+approved local path. `reject` and `simulate_integration_failure` exercise the
+other audited paths. This demo remains synthetic and offline: it performs no
+diagnosis, live EHR access, autonomous approval, writeback, file access, or
+external transmission.
+
 ## Safety policy
 
 Sinria's default policy is conservative:

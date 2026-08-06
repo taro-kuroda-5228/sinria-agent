@@ -115,11 +115,24 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        *,
+        vault_primary: bool = False,
+        vault_path: str | os.PathLike[str] | None = None,
+        hot_cache_entry_limit: int = 200,
+        hot_cache_soft_limit: int = 1500,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.vault_primary = bool(vault_primary)
+        self.vault_path = Path(vault_path).expanduser() if vault_path else None
+        self.hot_cache_entry_limit = max(1, int(hot_cache_entry_limit))
+        self.hot_cache_soft_limit = max(1, int(hot_cache_soft_limit))
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -218,6 +231,35 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    def _vault_is_available(self) -> bool:
+        """Return whether the configured local vault can accept durable notes."""
+        return bool(
+            self.vault_primary
+            and self.vault_path
+            and self.vault_path.is_dir()
+            and os.access(self.vault_path, os.W_OK)
+        )
+
+    def _vault_route_response(self, target: str, *, reason: str) -> Dict[str, Any]:
+        """Stop local growth and return a structured route to the vault.
+
+        The caller must classify and update the correct canonical vault note;
+        blindly appending here would bypass source-lock and safety review.
+        """
+        current = self._char_count(target)
+        return {
+            "success": False,
+            "error": (
+                f"Local hot cache write stopped: {reason}. "
+                "Route the durable detail to the configured vault source of truth; "
+                "keep only a short pointer here when every-turn discovery is necessary."
+            ),
+            "route_to_vault": True,
+            "vault_path": str(self.vault_path),
+            "target": target,
+            "usage": f"{current:,}/{self._char_limit(target):,}",
+        }
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -243,6 +285,25 @@ class MemoryStore:
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
+
+            if self._vault_is_available():
+                if len(content) > self.hot_cache_entry_limit:
+                    return self._vault_route_response(
+                        target,
+                        reason=(
+                            f"entry is {len(content)} chars, above the "
+                            f"{self.hot_cache_entry_limit}-char hot-cache limit"
+                        ),
+                    )
+                local_soft_limit = min(self.hot_cache_soft_limit, limit)
+                if new_total > local_soft_limit:
+                    return self._vault_route_response(
+                        target,
+                        reason=(
+                            f"write would grow the local hot cache to {new_total} chars, "
+                            f"above its {local_soft_limit}-char local limit"
+                        ),
+                    )
 
             if new_total > limit:
                 current = self._char_count(target)
@@ -305,6 +366,28 @@ class MemoryStore:
             test_entries = entries.copy()
             test_entries[idx] = new_content
             new_total = len(ENTRY_DELIMITER.join(test_entries))
+            current_total = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+
+            # Capacity-reducing edits remain allowed so operators can replace
+            # legacy detail with a short vault pointer. Only growth is routed.
+            if self._vault_is_available() and new_total > current_total:
+                if len(new_content) > self.hot_cache_entry_limit:
+                    return self._vault_route_response(
+                        target,
+                        reason=(
+                            f"replacement is {len(new_content)} chars, above the "
+                            f"{self.hot_cache_entry_limit}-char hot-cache limit"
+                        ),
+                    )
+                local_soft_limit = min(self.hot_cache_soft_limit, limit)
+                if new_total > local_soft_limit:
+                    return self._vault_route_response(
+                        target,
+                        reason=(
+                            f"replacement would grow the local hot cache to {new_total} chars, "
+                            f"above its {local_soft_limit}-char local limit"
+                        ),
+                    )
 
             if new_total > limit:
                 return {
@@ -525,6 +608,10 @@ MEMORY_SCHEMA = {
         "The most valuable memory prevents the user from having to repeat themselves.\n\n"
         "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
         "state to memory; use session_search to recall those from past transcripts.\n"
+        "If a vault-primary policy is configured, treat this store only as a local hot cache: "
+        "write detailed durable knowledge to the vault source of truth first, and keep only a "
+        "short pointer here when it must be injected every turn. Follow any structured "
+        "route_to_vault response instead of compacting or deleting entries without approval.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"

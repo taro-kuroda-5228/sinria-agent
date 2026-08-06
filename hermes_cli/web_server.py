@@ -989,6 +989,7 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
     "mcp",
     "title_generation",
     "curator",
+    "background_review",
 )
 
 
@@ -2607,6 +2608,339 @@ async def delete_cron_job(job_id: str):
     if not remove_job(job_id):
         raise HTTPException(status_code=404, detail="Job not found")
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Approvals (Human Approval Layer projection) + audit trail
+# ---------------------------------------------------------------------------
+
+
+class ApprovalResolvePayload(BaseModel):
+    """POST /api/approvals/{id}/resolve — remote answer from the Desktop.
+
+    Restricted to once/deny by design: session/permanent escalation is only
+    possible on the owning surface (CLI prompt or gateway /approve).
+    """
+
+    choice: str
+
+
+@app.get("/api/approvals")
+def list_approvals():
+    """Pending blocking gateway approvals, sanitized (preview + digest)."""
+    try:
+        from tools.approval_store import list_pending
+
+        return {"approvals": list_pending()}
+    except Exception:
+        _log.exception("GET /api/approvals failed")
+        return {"approvals": []}
+
+
+@app.post("/api/approvals/{approval_id}/resolve")
+def resolve_approval(approval_id: str, payload: ApprovalResolvePayload):
+    from tools.approval_store import (
+        ALLOWED_RESPONSE_CHOICES,
+        list_pending,
+        write_response,
+    )
+
+    if payload.choice not in ALLOWED_RESPONSE_CHOICES:
+        raise HTTPException(status_code=400, detail="choice must be 'once' or 'deny'")
+    if not any(r.get("id") == approval_id for r in list_pending()):
+        raise HTTPException(status_code=404, detail="No such pending approval")
+    if not write_response(approval_id, payload.choice):
+        raise HTTPException(status_code=404, detail="No such pending approval")
+    return {"ok": True}
+
+
+@app.get("/api/audit")
+def get_audit(days: int = 7, limit: int = 200):
+    """Sanitized audit events from {home}/audit/audit-YYYYMMDD.jsonl."""
+    days = max(1, min(int(days), 31))
+    limit = max(1, min(int(limit), 1000))
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        import tools.audit_log as audit
+
+        directory = Path(audit.get_hermes_home()) / "audit"
+        events: list = []
+        if directory.is_dir():
+            today = datetime.now(timezone.utc)
+            for offset in range(days):
+                day = (today - timedelta(days=offset)).strftime("%Y%m%d")
+                path = directory / f"audit-{day}.jsonl"
+                if not path.is_file():
+                    continue
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        continue
+        events.sort(key=lambda e: str(e.get("ts", "")), reverse=True)
+        truncated = len(events) > limit
+        return {"events": events[:limit], "truncated": truncated}
+    except Exception:
+        _log.exception("GET /api/audit failed")
+        return {"events": [], "truncated": False}
+
+
+# ---------------------------------------------------------------------------
+# Correction Loop improvement candidate review endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/corrections/status")
+def get_correction_loop_status():
+    """Self-improvement loop status projection for the dashboard."""
+    try:
+        from agent.correction_loop.loop_metrics import compute_loop_status
+
+        status = compute_loop_status()
+        d = status.to_dict()
+        return {
+            "pending_candidate_count": d["pending_candidate_count"],
+            "approved_candidate_count": d["approved_candidate_count"],
+            "distinct_pending_classes": d["distinct_pending_classes"],
+            "backlog_alert": d["backlog_alert"],
+        }
+    except Exception:
+        _log.exception("GET /api/corrections/status failed")
+        return {
+            "pending_candidate_count": 0,
+            "approved_candidate_count": 0,
+            "distinct_pending_classes": 0,
+            "backlog_alert": False,
+        }
+
+
+@app.get("/api/corrections/candidates")
+def list_correction_loop_candidates():
+    """Proposed (pending-review) improvement candidates — sanitized fields only."""
+    try:
+        from agent.correction_loop.review_queue import load_review_candidates
+
+        candidates = load_review_candidates()
+        result = []
+        for c in candidates:
+            if c.approval_state != "proposed":
+                continue
+            result.append({
+                "candidate_id": c.candidate_id,
+                "summary": c.evidence.summary,
+                "sanitized_sample": c.evidence.sanitized_sample,
+                "source_kind": c.evidence.source_kind,
+                "scope": c.evidence.scope,
+                "sensitivity": c.evidence.sensitivity,
+                "extraction_reason": c.extraction_reason,
+                "occurrence_count": c.occurrence_count,
+                "last_seen_at": c.last_seen_at,
+                "confidence": c.evidence.confidence,
+            })
+        return {"candidates": result}
+    except Exception:
+        _log.exception("GET /api/corrections/candidates failed")
+        return {"candidates": []}
+
+
+@app.post("/api/corrections/candidates/{candidate_id}/approve")
+def approve_correction_loop_candidate(candidate_id: str):
+    """Human approve a single improvement candidate (reviewer=desktop_human)."""
+    from agent.correction_loop.review_queue import approve_candidate
+
+    try:
+        approve_candidate(candidate_id, reviewer="desktop_human")
+    except (ValueError, KeyError):
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"ok": True}
+
+
+@app.post("/api/corrections/candidates/{candidate_id}/reject")
+def reject_correction_loop_candidate(candidate_id: str):
+    """Human reject a single improvement candidate (reviewer=desktop_human)."""
+    from agent.correction_loop.review_queue import reject_candidate
+
+    try:
+        reject_candidate(candidate_id, reviewer="desktop_human")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Backup / snapshot API
+# ---------------------------------------------------------------------------
+#
+# Exposes three endpoints:
+#   GET  /api/backup/list            — list full-zip backups + quick snapshots
+#   POST /api/backup/create {kind}   — create a full zip or quick snapshot
+#   POST /api/backup/restore {snapshot} — restore a quick snapshot (pre-restore
+#                                         safety snapshot created automatically)
+#
+# run_import / full-zip restore is NOT exposed because run_import:
+#   - calls input() for confirmation (interactive — no --force equivalent in API)
+#   - calls sys.exit(1) on errors (would crash the server process)
+#   - prints to stdout rather than returning structured data
+# The brief explicitly permits omitting full-zip restore when unsafe.
+
+
+class BackupCreateRequest(BaseModel):
+    kind: str  # "full" | "quick"
+
+
+class BackupRestoreRequest(BaseModel):
+    snapshot: str
+
+
+@app.get("/api/backup/list")
+def backup_list():
+    """List full-zip backups and quick state snapshots."""
+    from hermes_cli.backup import list_quick_snapshots
+
+    hermes_home = get_hermes_home()
+    backups_dir = hermes_home / "backups"
+
+    backups = []
+    if backups_dir.is_dir():
+        for p in sorted(backups_dir.glob("*.zip"), reverse=True):
+            try:
+                stat = p.stat()
+                backups.append(
+                    {
+                        "name": p.name,
+                        "path": str(p),
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                    }
+                )
+            except OSError:
+                continue
+
+    snapshots = list_quick_snapshots(hermes_home=hermes_home)
+    return {"backups": backups, "snapshots": snapshots}
+
+
+@app.post("/api/backup/create")
+def backup_create(body: BackupCreateRequest):
+    """Create a full-zip backup or a quick state snapshot.
+
+    kind="quick" → create_quick_snapshot(); returns {ok, snapshot: id}
+    kind="full"  → _write_full_zip_backup() under <hermes_home>/backups/;
+                   returns {ok, path, name, size}
+    """
+    from datetime import datetime as _dt
+
+    from hermes_cli.backup import _write_full_zip_backup, create_quick_snapshot
+
+    kind = (body.kind or "").strip().lower()
+    if kind not in ("full", "quick"):
+        raise HTTPException(status_code=400, detail="kind must be 'full' or 'quick'")
+
+    hermes_home = get_hermes_home()
+
+    if kind == "quick":
+        snap_id = create_quick_snapshot(hermes_home=hermes_home)
+        if snap_id is None:
+            raise HTTPException(
+                status_code=500, detail="No state files found to snapshot"
+            )
+        return {"ok": True, "snapshot": snap_id}
+
+    # kind == "full"
+    backups_dir = hermes_home / "backups"
+    try:
+        backups_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Cannot create backups dir: {exc}")
+
+    stamp = _dt.now().strftime("%Y-%m-%d-%H%M%S")
+    out_path = backups_dir / f"api-backup-{stamp}.zip"
+
+    result = _write_full_zip_backup(out_path, hermes_home)
+    if result is None:
+        raise HTTPException(
+            status_code=500, detail="Backup failed: no files found or write error"
+        )
+
+    try:
+        size = result.stat().st_size
+    except OSError:
+        size = 0
+
+    return {"ok": True, "path": str(result), "name": result.name, "size": size}
+
+
+@app.post("/api/backup/restore")
+def backup_restore(body: BackupRestoreRequest):
+    """Restore a quick snapshot by ID.
+
+    Always creates a pre-restore safety snapshot first; its ID is returned
+    in the response so the caller can undo the restore if needed.
+
+    Only quick snapshots are supported (full-zip restore is omitted — see
+    module comment above for rationale).
+    """
+    import shutil
+    import tempfile
+
+    from hermes_cli.backup import (
+        _quick_snapshot_root,
+        create_quick_snapshot,
+        list_quick_snapshots,
+        restore_quick_snapshot,
+    )
+
+    hermes_home = get_hermes_home()
+    snapshot_id = (body.snapshot or "").strip()
+
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshot id required")
+
+    # Validate snapshot exists before touching any state
+    existing = {s["id"] for s in list_quick_snapshots(hermes_home=hermes_home)}
+    if snapshot_id not in existing:
+        raise HTTPException(status_code=404, detail=f"Snapshot not found: {snapshot_id}")
+
+    # TOCTOU guard: stash a copy of the target snapshot directory before
+    # creating the pre-restore snapshot.  create_quick_snapshot() auto-prunes
+    # old snapshots (keep=20); if the store is at capacity and the caller is
+    # restoring the oldest snapshot, the prune step will delete the very
+    # directory we are about to restore from.  Keeping a temp copy lets us
+    # re-materialise it after the prune so restore_quick_snapshot() can
+    # still find it.
+    # _quick_snapshot_root is a private helper imported from hermes_cli.backup
+    # to avoid duplicating path-derivation logic.
+    snap_root = _quick_snapshot_root(hermes_home)
+    target_snap_dir = snap_root / snapshot_id
+    tmp_base = Path(tempfile.mkdtemp())
+    try:
+        tmp_copy = tmp_base / "snap"
+        shutil.copytree(target_snap_dir, tmp_copy)
+
+        # Safety: capture current state so the restore can be undone.
+        # If create_quick_snapshot returns None it found no state files —
+        # proceeding without a safety net would make the restore irreversible.
+        pre_restore_id = create_quick_snapshot(label="pre-restore", hermes_home=hermes_home)
+        if pre_restore_id is None:
+            raise HTTPException(
+                status_code=500, detail="pre-restore safety snapshot failed"
+            )
+
+        # Re-materialise target if it was pruned during pre-restore snapshot
+        if not target_snap_dir.exists():
+            shutil.copytree(tmp_copy, target_snap_dir)
+
+        ok = restore_quick_snapshot(snapshot_id, hermes_home=hermes_home)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Restore failed: no files restored")
+
+        return {"ok": True, "pre_restore_snapshot": pre_restore_id}
+    finally:
+        shutil.rmtree(tmp_base, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

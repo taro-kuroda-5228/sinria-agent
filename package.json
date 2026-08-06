@@ -8,13 +8,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/taro-kuroda-5228/sinria-agent.git"
+    "url": "git+https://github.com/taro-kuroda-5228/sinria.git"
   },
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/taro-kuroda-5228/sinria-agent/issues"
+    "url": "https://github.com/taro-kuroda-5228/sinria/issues"
   },
-  "homepage": "https://github.com/taro-kuroda-5228/sinria-agent#readme",
+  "homepage": "https://github.com/taro-kuroda-5228/sinria#readme",
   "dependencies": {
     "agent-browser": "^0.26.0"
   },

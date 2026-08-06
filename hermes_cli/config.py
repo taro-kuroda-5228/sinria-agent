@@ -10,6 +10,7 @@ setup-wizard support for the CLI.
 """
 
 import copy
+import json
 import logging
 import os
 import platform
@@ -224,7 +225,8 @@ def detect_install_method(project_root: Optional[Path] = None) -> str:
         return managed.lower().replace(" ", "-")
     if project_root is None:
         project_root = Path(__file__).parent.parent.resolve()
-    if (project_root / ".git").is_dir():
+    git_marker = project_root / ".git"
+    if git_marker.is_dir() or git_marker.is_file():
         return "git"
     return "pip"
 
@@ -611,6 +613,20 @@ DEFAULT_CONFIG = {
                     "retention": "contract_defined",
                     "requires_sanitization": True,
                 },
+                # Moonshot (Kimi) direct API — untrusted external cloud. There is
+                # no "untrusted" trust level, so model it as approved_cloud limited
+                # to the ``public`` data class: PHI/PII (and internal/credential/
+                # classified) are never approved for egress here. Advisory under the
+                # default dogfood_frontier profile — the registry is only enforced at
+                # model-call time when agent.sinria_boundary_config is set.
+                "kimi-coding": {
+                    "trust_level": "approved_cloud",
+                    "external_egress": True,
+                    "approved_data_classes": ["public"],
+                    "training_use": False,
+                    "retention": "provider_defined",
+                    "requires_sanitization": True,
+                },
             },
         },
     },
@@ -899,6 +915,15 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Per-turn schema selection. Shadow mode only records sanitized projected
+    # savings; request tools remain unchanged. Active filtering requires mode=active,
+    # explicit human approval, and a passed Wave 2 quality regression gate.
+    "dynamic_tool_selection": {
+        "mode": "shadow",
+        "active_approved": False,
+        "quality_gate_passed": False,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
@@ -1007,6 +1032,7 @@ DEFAULT_CONFIG = {
         "compression": {
             "provider": "auto",
             "model": "",
+            "fallback_models": [],  # ordered task-local routes; never uses global fallback
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
@@ -1072,6 +1098,21 @@ DEFAULT_CONFIG = {
         # model; override via `hermes model` → auxiliary → Curator to route
         # to a cheaper aux model (e.g. openrouter google/gemini-3-flash-preview).
         "curator": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 600,
+            "extra_body": {},
+        },
+        # Background review — the post-turn memory/skill self-improvement
+        # fork (agent/background_review.py). "auto" + empty model = inherit
+        # the parent session's live model, provider, and credentials
+        # (default — identical to the historical behavior). Set provider +
+        # model to route the 16-iteration review fork to a cheaper model so
+        # it stops burning main-model quota every few turns (e.g.
+        # openrouter google/gemini-3-flash-preview).
+        "background_review": {
             "provider": "auto",
             "model": "",
             "base_url": "",
@@ -1290,6 +1331,10 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # When toolsets are omitted, infer the minimum parent-authorized set
+        # from each task's goal/context. This keeps irrelevant schemas out of
+        # subagent requests. Set false to restore broad parent inheritance.
+        "auto_toolsets": True,
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
@@ -1300,9 +1345,9 @@ DEFAULT_CONFIG = {
                                # independent of the parent's max_iterations)
         "child_timeout_seconds": 600,  # wall-clock timeout for each child agent (floor 30s,
                                        # no ceiling). High-reasoning models on large tasks
-                                       # (e.g. gpt-5.5 xhigh, opus-4.6) need generous budgets;
+                                       # (e.g. gpt-5.6 max, opus-4.7 max) need generous budgets;
                                        # raise if children time out before producing output.
-        "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
+        "reasoning_effort": "",  # reasoning effort for subagents: "max", "xhigh", "high", "medium",
                                  # "low", "minimal", "none" (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
@@ -1403,6 +1448,37 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+    },
+
+    # Codebase self-repair loop
+    # (design: docs/plans/2026-07-06-codebase-self-repair-loop-design.md).
+    # `telemetry` records sanitized DefectRecords (metadata only, same
+    # confidentiality class as outcome_gap) — on by default. `enabled` is the
+    # Phase 2 Repair Orchestrator kill switch: OFF by default (org-safe);
+    # turning it on only ever produces PR *proposals* (merge stays human), and
+    # real patch generation additionally requires the local-adapter env gates
+    # (SINRIA_ALLOWED_LOCAL_EXECUTION_ENGINES + SINRIA_LOCAL_ADAPTER_EXECUTION_APPROVED).
+    "repair": {
+        "telemetry": True,
+        "enabled": False,
+        "min_occurrences": 3,             # recurrence threshold for ticket creation
+        "daily_ticket_cap": 3,            # max new tickets per day
+        "max_attempts_per_fingerprint": 2,  # then escalate to human
+        # In-flight tickets (reproducing/patching/verifying) with no progress
+        # for this many hours are recovered to failed (crash/kill cleanup).
+        "stale_active_hours": 24,
+        "adapter_engine": "claude_code",  # local execution adapter for patch generation
+        # Local discovery emits only sanitized categories/counters/code pointers.
+        # It never stores source log lines or workflow payloads.
+        "discovery": {"enabled": False, "repo": "sinria"},
+        # Editing remains review-gated by default. Approval is recorded per ticket.
+        "approval": {"edit_requires_human_approval": True},
+        # Workflow-exit signals remain issue proposals unless explicitly promoted.
+        "turn_signal_tickets": False,
+        # Objective refactoring is doubly opt-in: this global kill switch and
+        # each repository's .sinria/repair.yaml contract must both enable it.
+        "refactor": {"enabled": False},
+        "repo_paths": {},                 # repo name -> local checkout root (apps opt in here)
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
@@ -5234,7 +5310,7 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
-def set_config_value(key: str, value: str):
+def set_config_value(key: str, value: Any):
     """Set a configuration value."""
     if is_managed():
         managed_error("set configuration values")
@@ -5283,6 +5359,16 @@ def set_config_value(key: str, value: str):
         value = int(value)
     elif value.replace('.', '', 1).isdigit():
         value = float(value)
+    elif value.lstrip().startswith(("[", "{")):
+        # Preserve structured CLI values as YAML collections rather than
+        # quoted strings. Use strict JSON so ordinary strings keep their type.
+        try:
+            structured = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(structured, (list, dict)):
+                value = structured
 
     _set_nested(user_config, key, value)
     

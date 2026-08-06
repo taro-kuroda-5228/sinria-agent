@@ -102,6 +102,11 @@ _BILLING_PATTERNS = [
     "exceeded your current quota",
     "account is deactivated",
     "plan does not include",
+    # Anthropic Claude subscription overage exhausted (HTTP 400):
+    # "You're out of extra usage. Add more at claude.ai/settings/usage …".
+    # Distinct from the 429 "extra usage is required for long context" tier
+    # gate, which is matched earlier (status 429 + "long context").
+    "out of extra usage",
 ]
 
 # Patterns that indicate rate limiting (transient, will resolve)
@@ -122,6 +127,22 @@ _RATE_LIMIT_PATTERNS = [
     "too many concurrent requests",
     "servicequotaexceededexception",
 ]
+
+# Provider overload responses whose SDK exception lost the HTTP status code.
+# OpenAI Codex has returned this body without preserving the original 503:
+# "Our servers are currently overloaded. Please try again later."
+_OVERLOADED_PATTERNS = [
+    "servers are currently overloaded",
+    "server is currently overloaded",
+    "service is currently overloaded",
+    "servers are overloaded",
+    "server is overloaded",
+    "service is overloaded",
+    "server overloaded",
+    "service overloaded",
+]
+
+_OVERLOADED_ERROR_TYPES = {"overloadederror", "overloaderror"}
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
 _USAGE_LIMIT_PATTERNS = [
@@ -670,10 +691,28 @@ def _classify_by_status(
         )
 
     if status_code == 429:
-        # Already checked long_context_tier above; this is a normal rate limit
+        # A periodic account quota (Codex weekly cap, subscription usage cap)
+        # is not a burst rate limit. Retrying the identical request cannot
+        # succeed before the provider's reset timestamp and only burns more
+        # quota/latency. Keep the rate-limit reason so callers preserve their
+        # fallback UX, but mark it non-retryable and do not rotate credentials
+        # unless a real credential pool decides otherwise.
+        nested_error = body.get("error") if isinstance(body, dict) else None
+        if not isinstance(nested_error, dict):
+            nested_error = body if isinstance(body, dict) else {}
+        quota_type = str(nested_error.get("type") or "").lower()
+        quota_message = str(nested_error.get("message") or error_msg).lower()
+        is_hard_usage_limit = (
+            quota_type in {"usage_limit_reached", "weekly_usage_limit_reached"}
+            or "weekly usage limit" in quota_message
+            or "usage limit has been reached" in quota_message
+        )
         return result_fn(
             FailoverReason.rate_limit,
-            retryable=True,
+            retryable=not is_hard_usage_limit,
+            # A distinct configured credential may belong to another account
+            # with independent subscription quota. Allow at most that rotation,
+            # while keeping same-credential request retries disabled.
             should_rotate_credential=True,
             should_fallback=True,
         )
@@ -929,6 +968,17 @@ def _classify_by_message(
             should_rotate_credential=True,
             should_fallback=True,
         )
+
+    # Provider overload body with no status code. Keep this distinct from a
+    # transport timeout: very-large requests suppress ambiguous transport
+    # replays, while an explicit overload response should receive the normal
+    # primary-provider retry/backoff path.
+    if (
+        error_type.lower() in _OVERLOADED_ERROR_TYPES
+        or error_msg.strip() == "overloaded"
+        or any(p in error_msg for p in _OVERLOADED_PATTERNS)
+    ):
+        return result_fn(FailoverReason.overloaded, retryable=True)
 
     # Rate limit patterns
     if any(p in error_msg for p in _RATE_LIMIT_PATTERNS):

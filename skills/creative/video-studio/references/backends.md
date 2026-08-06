@@ -1,6 +1,6 @@
 # Generation backends — which to use when
 
-Grounded in public 2026 market research on AI video production cases.
+Grounded in the 2026-06 research (`video-production-research.md`).
 Split generation into **"avatar/full-AI generation"** vs **"template/data
 synthesis"** — most product use cases end up using both as two layers.
 

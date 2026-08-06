@@ -52,8 +52,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + review-gated self-improvement + delegation
-    "execute_code", "self_improvement", "delegate_task",
+    # Code execution + delegation
+    "execute_code", "delegate_task",
     # ML training/fine-tuning helpers (scaffold/validate/plan; long runs stay
     # observable via terminal/process)
     "ml_training",
@@ -247,7 +247,7 @@ TOOLSETS = {
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
-        "tools": ["execute_code", "self_improvement"],
+        "tools": ["execute_code"],
         "includes": []
     },
     

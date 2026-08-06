@@ -1,4 +1,4 @@
-"""On-demand recall over durable Context Share evidence and memory files.
+"""On-demand recall over durable Correction Loop evidence and memory files.
 
 Architecture-centric P0 (docs/plans/2026-07-06-architecture-centric-agent-os-p0.md,
 Task 4): small-context models cannot afford inject-everything memory, so the
@@ -44,7 +44,7 @@ def _memory_lines_matching(query_l: str, terms: list[str], max_lines: int) -> li
 
 
 def recall_context(query: str, max_results: int = 6, task_id: str = None) -> str:
-    """Search durable Context Share evidence + memory files for a query."""
+    """Search durable Correction Loop evidence + memory files for a query."""
     query = (query or "").strip()
     if not query:
         return json.dumps(
@@ -52,8 +52,8 @@ def recall_context(query: str, max_results: int = 6, task_id: str = None) -> str
         )
     max_results = max(1, min(int(max_results or 6), 20))
 
-    from agent.context_share.evidence import EvidenceLedger
-    from agent.context_share.storage import load_durable_evidence
+    from agent.correction_loop.evidence import EvidenceLedger
+    from agent.correction_loop.storage import load_durable_evidence
 
     try:
         evidence_items = load_durable_evidence()

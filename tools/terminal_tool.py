@@ -35,6 +35,7 @@ Usage:
 """
 
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -122,6 +123,7 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
 )
 _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
+DEFAULT_TERMINAL_LIFETIME_SECONDS = 300
 
 
 def _is_supported_vercel_runtime(runtime: str) -> bool:
@@ -991,6 +993,18 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     """
     if task_id and task_id in _task_env_overrides:
         return task_id
+    # Gateway requests must not share the process-global ``default`` shell.
+    # Digest the key so channel/user identifiers never enter logs or registry
+    # metadata. CLI callers have no session key and retain the old default.
+    try:
+        from gateway.session_context import get_session_env
+
+        session_key = get_session_env("HERMES_SESSION_KEY", "")
+    except Exception:
+        session_key = ""
+    if session_key:
+        digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:20]
+        return f"gateway-session:{digest}"
     return "default"
 
 
@@ -1040,13 +1054,19 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    try:
+        from gateway.session_context import get_session_env
+
+        session_cwd = get_session_env("TERMINAL_CWD", "")
+    except Exception:
+        session_cwd = ""
+    cwd = session_cwd or os.getenv("TERMINAL_CWD", default_cwd)
     if cwd:
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or os.getcwd()
+        docker_cwd_source = session_cwd or os.getenv("TERMINAL_CWD") or os.getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in host_prefixes)
@@ -1077,7 +1097,10 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
-        "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
+        "lifetime_seconds": _parse_env_var(
+            "TERMINAL_LIFETIME_SECONDS",
+            str(DEFAULT_TERMINAL_LIFETIME_SECONDS),
+        ),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
@@ -1288,7 +1311,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
 
-def _cleanup_inactive_envs(lifetime_seconds: int = 300):
+def _cleanup_inactive_envs(
+    lifetime_seconds: int = DEFAULT_TERMINAL_LIFETIME_SECONDS,
+):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
     current_time = time.time()
 
@@ -1356,7 +1381,16 @@ def _cleanup_thread_worker():
     while _cleanup_running:
         try:
             config = _get_env_config()
-            _cleanup_inactive_envs(config["lifetime_seconds"])
+            # The config reader is intentionally patchable by backend-focused
+            # tests, some of which return only the fields they exercise.  The
+            # daemon must remain resilient while such a patch is visible from
+            # this background thread.
+            _cleanup_inactive_envs(
+                config.get(
+                    "lifetime_seconds",
+                    DEFAULT_TERMINAL_LIFETIME_SECONDS,
+                )
+            )
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 

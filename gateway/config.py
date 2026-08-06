@@ -22,6 +22,14 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def hospital_closed_profile() -> bool:
+    """Whether this process must stay inside the hospital-managed boundary."""
+    profile = os.environ.get("SINRIA_DEPLOYMENT_PROFILE") or os.environ.get(
+        "COMPANY_OS_DEPLOYMENT_PROFILE", ""
+    )
+    return str(profile).strip().lower() == "hospital_closed"
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
@@ -469,9 +477,17 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
 
-    # Session isolation in shared chats
+    # Session isolation and human collaboration in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
+    collaboration_enabled: bool = True  # Presence, ownership, proposals, and handoff for shared sessions
+    collaboration_role_capabilities: Dict[str, List[str]] = field(default_factory=dict)
+    collaboration_user_capabilities: Dict[str, List[str]] = field(default_factory=dict)
+    collaboration_require_distinct_approver: bool = True
+    collaboration_source_of_truth: str = "local"  # "local" compatibility mode or "company_os"
+    company_os_base_url: Optional[str] = None
+    company_os_member_mapping: Dict[str, str] = field(default_factory=dict)
+    company_os_instance_mapping: Dict[str, str] = field(default_factory=dict)
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
@@ -490,6 +506,11 @@ class GatewayConfig:
         """Return list of platforms that are enabled and configured."""
         connected = []
         for platform, config in self.platforms.items():
+            # A stale token or enabled flag must not reactivate a SaaS messaging
+            # adapter in a hospital deployment. API Server is the sole transport
+            # because it can be bound behind the institution's own reverse proxy.
+            if hospital_closed_profile() and platform != Platform.API_SERVER:
+                continue
             if not config.enabled:
                 continue
             if self._is_platform_connected(platform, config):
@@ -621,6 +642,20 @@ class GatewayConfig:
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
+        collaboration_source_of_truth = str(
+            data.get("collaboration_source_of_truth", "local")
+        ).strip().lower()
+        if collaboration_source_of_truth not in {"local", "company_os"}:
+            collaboration_source_of_truth = "local"
+        company_os_base_url = data.get("company_os_base_url")
+        if company_os_base_url is not None:
+            company_os_base_url = str(company_os_base_url).strip() or None
+        company_os_member_mapping = data.get("company_os_member_mapping", {})
+        if not isinstance(company_os_member_mapping, dict):
+            company_os_member_mapping = {}
+        company_os_instance_mapping = data.get("company_os_instance_mapping", {})
+        if not isinstance(company_os_instance_mapping, dict):
+            company_os_instance_mapping = {}
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -644,6 +679,18 @@ class GatewayConfig:
             stt_enabled=_coerce_bool(stt_enabled, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
+            collaboration_source_of_truth=collaboration_source_of_truth,
+            company_os_base_url=company_os_base_url,
+            company_os_member_mapping={
+                str(key): str(value)
+                for key, value in company_os_member_mapping.items()
+                if str(key).strip() and str(value).strip()
+            },
+            company_os_instance_mapping={
+                str(key): str(value)
+                for key, value in company_os_instance_mapping.items()
+                if str(key).strip() and str(value).strip()
+            },
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
@@ -733,6 +780,48 @@ def load_gateway_config() -> GatewayConfig:
 
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
+
+            if "collaboration_enabled" in yaml_cfg:
+                gw_data["collaboration_enabled"] = _coerce_bool(
+                    yaml_cfg["collaboration_enabled"], True
+                )
+            for _collab_mapping in (
+                "collaboration_role_capabilities",
+                "collaboration_user_capabilities",
+            ):
+                _value = yaml_cfg.get(_collab_mapping)
+                if isinstance(_value, dict):
+                    gw_data[_collab_mapping] = {
+                        str(key): [str(item) for item in value]
+                        for key, value in _value.items()
+                        if isinstance(value, (list, tuple, set))
+                    }
+            if "collaboration_require_distinct_approver" in yaml_cfg:
+                gw_data["collaboration_require_distinct_approver"] = _coerce_bool(
+                    yaml_cfg["collaboration_require_distinct_approver"], True
+                )
+            source_of_truth = str(yaml_cfg.get("collaboration_source_of_truth", "local")).strip().lower()
+            if source_of_truth not in {"local", "company_os"}:
+                logger.warning(
+                    "Ignoring invalid collaboration_source_of_truth=%r; using local",
+                    source_of_truth,
+                )
+                source_of_truth = "local"
+            gw_data["collaboration_source_of_truth"] = source_of_truth
+            company_os_base_url = yaml_cfg.get("company_os_base_url")
+            if company_os_base_url is not None:
+                gw_data["company_os_base_url"] = str(company_os_base_url).strip() or None
+            for _company_os_mapping in (
+                "company_os_member_mapping",
+                "company_os_instance_mapping",
+            ):
+                _value = yaml_cfg.get(_company_os_mapping)
+                if isinstance(_value, dict):
+                    gw_data[_company_os_mapping] = {
+                        str(key): str(value)
+                        for key, value in _value.items()
+                        if str(key).strip() and str(value).strip()
+                    }
 
             streaming_cfg = yaml_cfg.get("streaming")
             if not isinstance(streaming_cfg, dict):

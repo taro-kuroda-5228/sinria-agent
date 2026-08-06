@@ -14,7 +14,7 @@ knobs the rest of the runtime reads:
 * ``max_iterations_cap`` — small models cannot sustain 90 tool-calling
   iterations inside their window
 * per-block character budgets for volatile system-prompt injection
-  (memory snapshot, user profile, Context Share resolver block)
+  (memory snapshot, user profile, advisory correction checklist)
 
 Budgets of ``0`` mean *unlimited* — the ``large`` tier keeps today's
 behavior byte-identical, which also keeps the prompt-caching invariant
@@ -28,6 +28,7 @@ derived prompt stays deterministic for the session.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,15 +40,33 @@ SMALL_CONTEXT_FLOOR = 8_000
 TIER_SMALL_MAX = 32_000  # ctx < 32K  -> "small"
 TIER_MEDIUM_MAX = 100_000  # ctx < 100K -> "medium"; else "large"
 
+# Parameter-size tier caps. Context length stopped being a usable capability
+# proxy on its own: current small local models advertise frontier-sized
+# windows (qwen3.5:9b = 131K), which resolved every local model to "large" —
+# frontier iteration caps, unlimited prompt budgets, and a routing-signal
+# substrate (P1) that could never fire. When the model NAME carries an
+# explicit parameter count ("...:9b", "phi4:3.8b"), that is strong capability
+# evidence and CAPS the tier; a small context window can still lower it.
+PARAM_SMALL_MAX_B = 8.0  # ≤8B params  -> at most "small"
+PARAM_MEDIUM_MAX_B = 32.0  # ≤32B params -> at most "medium"
+
+_TIER_ORDER = {"small": 0, "medium": 1, "large": 2}
+
+# "qwen3.5:9b" -> 9, "llama3:70b-instruct" -> 70, "phi4:3.8b" -> 3.8.
+# Requires the b-suffix to end the token so version fragments ("3.5") and
+# frontier names ("claude-fable-5", "gpt-5.5") never match.
+_PARAM_RE = re.compile(r"(?:^|[:\-_/ ])(\d+(?:\.\d+)?)b(?=$|[:\-_/ .])", re.IGNORECASE)
+
 _TIER_MAX_ITERATIONS = {"small": 30, "medium": 60, "large": 90}
 
 # Character budgets (~4 chars/token) for volatile system-prompt blocks.
 # 0 = unlimited.
 _TIER_CHAR_BUDGETS = {
-    "small": {"memory": 4_000, "user_profile": 2_000, "resolver": 3_000},
-    "medium": {"memory": 12_000, "user_profile": 4_000, "resolver": 6_000},
-    "large": {"memory": 0, "user_profile": 0, "resolver": 0},
+    "small": {"memory": 4_000, "user_profile": 2_000, "advice": 3_000},
+    "medium": {"memory": 12_000, "user_profile": 4_000, "advice": 6_000},
+    "large": {"memory": 0, "user_profile": 0, "advice": 0},
 }
+
 
 # Injected into the stable prompt tier for small-tier models (fixed at
 # agent init, so the cached system prompt stays stable across turns).
@@ -69,7 +88,7 @@ class ModelCapabilityProfile:
     max_iterations_cap: int
     memory_char_budget: int  # 0 = unlimited
     user_profile_char_budget: int  # 0 = unlimited
-    resolver_char_budget: int  # 0 = unlimited
+    advice_char_budget: int  # 0 = unlimited
 
 
 def tier_for_context_length(context_length: Optional[int]) -> str:
@@ -88,9 +107,48 @@ def tier_for_context_length(context_length: Optional[int]) -> str:
     return "large"
 
 
-def resolve_capability_profile(context_length: Optional[int]) -> ModelCapabilityProfile:
-    """Resolve the capability profile for a context length."""
+def parse_param_billions(model: Optional[str]) -> Optional[float]:
+    """Extract a parameter count in billions from a model name, or None.
+
+    Matches only an explicit b-suffixed token ("qwen3.5:9b", "phi4:3.8b",
+    "llama3:70b-instruct"); frontier/cloud names without one return None.
+    """
+    if not model:
+        return None
+    match = _PARAM_RE.search(model)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _param_tier_cap(model: Optional[str]) -> Optional[str]:
+    """Tier ceiling implied by an explicit parameter count, or None."""
+    params = parse_param_billions(model)
+    if params is None:
+        return None
+    if params <= PARAM_SMALL_MAX_B:
+        return "small"
+    if params <= PARAM_MEDIUM_MAX_B:
+        return "medium"
+    return None  # big-param model: no cap beyond the ctx tier.
+
+
+def resolve_capability_profile(
+    context_length: Optional[int], *, model: Optional[str] = None
+) -> ModelCapabilityProfile:
+    """Resolve the capability profile for a context length (+ optional model name).
+
+    The tier is the more conservative of the context tier and the
+    parameter-size cap parsed from the model name — params can only lower
+    the tier, never raise it above what the window supports.
+    """
     tier = tier_for_context_length(context_length)
+    cap = _param_tier_cap(model)
+    if cap is not None and _TIER_ORDER[cap] < _TIER_ORDER[tier]:
+        tier = cap
     budgets = _TIER_CHAR_BUDGETS[tier]
     return ModelCapabilityProfile(
         context_length=int(context_length or 0),
@@ -98,7 +156,7 @@ def resolve_capability_profile(context_length: Optional[int]) -> ModelCapability
         max_iterations_cap=_TIER_MAX_ITERATIONS[tier],
         memory_char_budget=budgets["memory"],
         user_profile_char_budget=budgets["user_profile"],
-        resolver_char_budget=budgets["resolver"],
+        advice_char_budget=budgets["advice"],
     )
 
 
@@ -164,6 +222,7 @@ __all__ = [
     "SMALL_CONTEXT_OPERATIONS_GUIDANCE",
     "ModelCapabilityProfile",
     "apply_char_budget",
+    "parse_param_billions",
     "resolve_capability_profile",
     "tier_for_context_length",
     "validate_context_length",

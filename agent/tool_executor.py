@@ -55,6 +55,63 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_WORKERS = 8
 
 
+def _safe_failure_suffix(function_name: str, summary: str) -> str:
+    """Return only schema-validated failure metadata safe for persistent logs."""
+    if function_name != "terminal":
+        return ""
+    try:
+        payload = json.loads(summary)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    exit_code = payload.get("exit_code")
+    if type(exit_code) is not int or not -255 <= exit_code <= 255:
+        return ""
+    return f" [exit {exit_code}]"
+
+
+def _log_internal_exception(
+    operation: str,
+    exc: BaseException,
+    *,
+    function_name: str | None = None,
+    level: int = logging.ERROR,
+) -> None:
+    """Log exception class only; traceback final lines repeat secret-bearing messages."""
+    if function_name:
+        logger.log(level, "%s failed for %s: %s", operation, function_name, type(exc).__name__)
+    else:
+        logger.log(level, "%s failed: %s", operation, type(exc).__name__)
+
+
+def _log_tool_result_metadata(
+    function_name: str,
+    function_result: Any,
+    tool_duration: float,
+    *,
+    is_error: bool,
+) -> None:
+    """Persist operational metadata without persisting tool output."""
+    summary = _multimodal_text_summary(function_result)
+    if is_error:
+        failure_suffix = _safe_failure_suffix(function_name, summary)
+        logger.warning(
+            "Tool %s returned error%s (%.2fs; result_chars=%d)",
+            function_name,
+            failure_suffix,
+            tool_duration,
+            len(summary),
+        )
+        return
+    logger.info(
+        "tool %s completed (%.2fs, %d chars)",
+        function_name,
+        tool_duration,
+        len(summary),
+    )
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -100,6 +157,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if not isinstance(function_args, dict):
             function_args = {}
 
+        block_result = None
+        blocked_by_guardrail = False
+
         # Checkpoint for file-mutating tools
         if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
             try:
@@ -115,26 +175,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
-                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                    from gateway.session_context import get_session_env
+                    cwd = function_args.get("workdir") or get_session_env("TERMINAL_CWD", os.getcwd())
                     agent._checkpoint_mgr.ensure_checkpoint(
                         cwd, f"before terminal: {cmd[:60]}"
                     )
             except Exception:
                 pass
 
-        block_result = None
-        blocked_by_guardrail = False
-        try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            block_message = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
-            )
-        except Exception:
-            block_message = None
+        block_message = None
+        if block_result is None:
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_block_message
+                block_message = get_pre_tool_call_block_message(
+                    function_name, function_args, task_id=effective_task_id or "",
+                )
+            except Exception:
+                block_message = None
 
-        if block_message is not None:
+        if block_result is None and block_message is not None:
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-        else:
+        elif block_result is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 block_result = agent._guardrail_block_result(guardrail_decision)
@@ -163,7 +224,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 preview = _build_tool_preview(name, args)
                 agent.tool_progress_callback("tool.started", name, preview, args)
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                _log_internal_exception(
+                    "tool progress callback", cb_err, function_name=name, level=logging.DEBUG,
+                )
 
     for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
@@ -172,7 +235,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 agent.tool_start_callback(tc.id, name, args)
             except Exception as cb_err:
-                logging.debug(f"Tool start callback error: {cb_err}")
+                _log_internal_exception("tool start callback", cb_err, level=logging.DEBUG)
 
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag)
@@ -244,13 +307,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         except Exception as tool_error:
             result = f"Error executing tool '{function_name}': {tool_error}"
-            logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            _log_internal_exception("_invoke_tool", tool_error, function_name=function_name)
         duration = time.time() - start
         is_error, _ = _detect_tool_failure(function_name, result)
-        if is_error:
-            logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
-        else:
-            logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+        _log_tool_result_metadata(
+            function_name,
+            result,
+            duration,
+            is_error=is_error,
+        )
         results[index] = (function_name, function_args, result, duration, is_error, False)
         # Tear down worker-tid tracking.  Clear any interrupt bit we may
         # have set so the next task scheduled onto this recycled tid
@@ -368,9 +433,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
 
             if is_error:
-                _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
-                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                _log_tool_result_metadata(
+                    function_name,
+                    function_result,
+                    tool_duration,
+                    is_error=True,
+                )
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -381,7 +449,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         function_name, function_args, function_result, is_error,
                     )
                 except Exception as _ver_err:
-                    logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                    _log_internal_exception(
+                        "file-mutation verifier record", _ver_err, level=logging.DEBUG,
+                    )
 
             if not blocked and agent.tool_progress_callback:
                 try:
@@ -390,11 +460,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         duration=tool_duration, is_error=is_error,
                     )
                 except Exception as cb_err:
-                    logging.debug(f"Tool progress callback error: {cb_err}")
+                    _log_internal_exception(
+                        "tool progress callback", cb_err,
+                        function_name=function_name, level=logging.DEBUG,
+                    )
 
             if agent.verbose_logging:
-                logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
+                logging.debug(
+                    "Tool %s completed in %.2fs; result_chars=%d",
+                    function_name,
+                    tool_duration,
+                    len(_multimodal_text_summary(function_result)),
+                )
 
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
@@ -416,7 +493,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             try:
                 agent.tool_complete_callback(tc.id, name, args, function_result)
             except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
+                _log_internal_exception("tool complete callback", cb_err, level=logging.DEBUG)
 
         function_result = maybe_persist_tool_result(
             content=function_result,
@@ -497,28 +574,35 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         try:
             function_args = json.loads(tool_call.function.arguments)
         except json.JSONDecodeError as e:
-            logging.warning(f"Unexpected JSON error after validation: {e}")
+            _log_internal_exception("JSON decode after validation", e, level=logging.WARNING)
             function_args = {}
         if not isinstance(function_args, dict):
             function_args = {}
 
+        _context_block_result = None
+
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
-        try:
-            from hermes_cli.plugins import get_pre_tool_call_block_message
-            _block_msg = get_pre_tool_call_block_message(
-                function_name, function_args, task_id=effective_task_id or "",
-            )
-        except Exception:
-            pass
+        if _context_block_result is None:
+            try:
+                from hermes_cli.plugins import get_pre_tool_call_block_message
+                _block_msg = get_pre_tool_call_block_message(
+                    function_name, function_args, task_id=effective_task_id or "",
+                )
+            except Exception:
+                pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
+        if _context_block_result is None and _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _context_block_result is not None
+            or _block_msg is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -558,13 +642,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 preview = _build_tool_preview(function_name, function_args)
                 agent.tool_progress_callback("tool.started", function_name, preview, function_args)
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                _log_internal_exception(
+                    "tool progress callback", cb_err, function_name=function_name, level=logging.DEBUG,
+                )
 
         if not _execution_blocked and agent.tool_start_callback:
             try:
                 agent.tool_start_callback(tool_call.id, function_name, function_args)
             except Exception as cb_err:
-                logging.debug(f"Tool start callback error: {cb_err}")
+                _log_internal_exception("tool start callback", cb_err, level=logging.DEBUG)
 
         # Checkpoint: snapshot working dir before file-mutating tools
         if not _execution_blocked and function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
@@ -583,7 +669,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             try:
                 cmd = function_args.get("command", "")
                 if _is_destructive_command(cmd):
-                    cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
+                    from gateway.session_context import get_session_env
+                    cwd = function_args.get("workdir") or get_session_env("TERMINAL_CWD", os.getcwd())
                     agent._checkpoint_mgr.ensure_checkpoint(
                         cwd, f"before terminal: {cmd[:60]}"
                     )
@@ -592,7 +679,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         tool_start_time = time.time()
 
-        if _block_msg is not None:
+        if _context_block_result is not None:
+            function_result = _context_block_result
+            tool_duration = 0.0
+        elif _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
             tool_duration = 0.0
@@ -705,7 +795,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _ce_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Context engine tool '{function_name}' failed: {tool_error}"})
-                logger.error("context_engine.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_internal_exception(
+                    "context_engine.handle_tool_call", tool_error, function_name=function_name,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_ce_result)
@@ -729,7 +821,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _mem_result = function_result
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
-                logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_internal_exception(
+                    "memory_manager.handle_tool_call", tool_error, function_name=function_name,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
@@ -757,7 +851,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _spinner_result = function_result
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_internal_exception(
+                    "handle_function_call", tool_error, function_name=function_name,
+                )
             finally:
                 tool_duration = time.time() - tool_start_time
                 cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_spinner_result)
@@ -776,7 +872,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
-                logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                _log_internal_exception(
+                    "handle_function_call", tool_error, function_name=function_name,
+                )
             tool_duration = time.time() - tool_start_time
 
         if isinstance(function_result, str):
@@ -802,10 +900,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
-        if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-        else:
-            logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        _log_tool_result_metadata(
+            function_name,
+            function_result,
+            tool_duration,
+            is_error=_is_error_result,
+        )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed
@@ -817,7 +917,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name, function_args, function_result, _is_error_result,
                 )
             except Exception as _ver_err:
-                logging.debug("file-mutation verifier record failed: %s", _ver_err)
+                _log_internal_exception(
+                    "file-mutation verifier record", _ver_err, level=logging.DEBUG,
+                )
 
         if not _execution_blocked and agent.tool_progress_callback:
             try:
@@ -826,21 +928,26 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     duration=tool_duration, is_error=_is_error_result,
                 )
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                _log_internal_exception(
+                    "tool progress callback", cb_err, function_name=function_name, level=logging.DEBUG,
+                )
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
 
         if agent.verbose_logging:
-            logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-            _log_result = _multimodal_text_summary(function_result)
-            logging.debug(f"Tool result ({len(_log_result)} chars): {_log_result}")
+            logging.debug(
+                "Tool %s completed in %.2fs; result_chars=%d",
+                function_name,
+                tool_duration,
+                len(_multimodal_text_summary(function_result)),
+            )
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:
                 agent.tool_complete_callback(tool_call.id, function_name, function_args, function_result)
             except Exception as cb_err:
-                logging.debug(f"Tool complete callback error: {cb_err}")
+                _log_internal_exception("tool complete callback", cb_err, level=logging.DEBUG)
 
         function_result = maybe_persist_tool_result(
             content=function_result,

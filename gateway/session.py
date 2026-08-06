@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,10 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    workspace_session_key: Optional[str] = None  # First-party Workspace owner for bound connectors
+    workspace_boundary: Optional[str] = None  # private/internal/partner/clinical
+    workspace_task_id: Optional[str] = None  # Durable cross-channel task identity
+    workspace_task_revision: Optional[int] = None  # CAS revision for this task
     
     @property
     def description(self) -> str:
@@ -153,6 +157,14 @@ class SessionSource:
             d["parent_chat_id"] = self.parent_chat_id
         if self.message_id:
             d["message_id"] = self.message_id
+        if self.workspace_session_key:
+            d["workspace_session_key"] = self.workspace_session_key
+        if self.workspace_boundary:
+            d["workspace_boundary"] = self.workspace_boundary
+        if self.workspace_task_id:
+            d["workspace_task_id"] = self.workspace_task_id
+        if self.workspace_task_revision is not None:
+            d["workspace_task_revision"] = self.workspace_task_revision
         return d
 
     @classmethod
@@ -171,6 +183,10 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            workspace_session_key=data.get("workspace_session_key"),
+            workspace_boundary=data.get("workspace_boundary"),
+            workspace_task_id=data.get("workspace_task_id"),
+            workspace_task_revision=data.get("workspace_task_revision"),
         )
     
 
@@ -195,6 +211,8 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Internal-only filesystem lease; intentionally omitted from to_dict/prompt.
+    workspace_cwd: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -396,23 +414,12 @@ def build_session_context_prompt(
             "and target='yuanbao:group:<group_code>' for group chat."
         )
 
-    # Context Share v2 resolver guidance: gateway entrypoints should apply
-    # relevant prior corrections before the agent acts.  This is metadata-only
-    # guidance; raw chat history and private evidence remain in local stores.
-    try:
-        from agent.context_share.intent_resolver import build_context_resolver_prompt
-        resolver_block = build_context_resolver_prompt(
-            current_user_message,
-            platform=context.source.platform.value,
-        )
-        if resolver_block:
-            lines.append("")
-            lines.append(resolver_block)
-    except Exception as exc:
-        from agent.context_share.intent_resolver import build_context_resolver_fallback_prompt
-        logger.warning("Context Share Resolver failed in gateway prompt; injecting fail-closed defaults: %s", exc)
-        lines.append("")
-        lines.append(build_context_resolver_fallback_prompt(str(exc)))
+    # Correction Loop is not resolved here. ``run_conversation`` owns the
+    # model-aware per-turn overlay, so resolving during gateway prompt assembly
+    # would repeat durable lookups and store a block that the API boundary must
+    # strip again for prefix-cache stability. Keep current_user_message in the
+    # function signature for compatibility with gateway callers.
+    _ = current_user_message
 
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
@@ -665,6 +672,12 @@ def build_session_key(
         shared session per chat.
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
+    workspace_session_key = getattr(source, "workspace_session_key", None)
+    if workspace_session_key and parse_workspace_session_key(workspace_session_key):
+        # Only canonical first-party Workspace keys may override the external
+        # Discord/Slack transport identity.
+        return workspace_session_key
+
     platform = source.platform.value
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
@@ -703,6 +716,80 @@ def build_session_key(
         key_parts.append(str(participant_id))
 
     return ":".join(key_parts)
+
+
+# ---------------------------------------------------------------------------
+# Sinria Workspace structured session identity (first-party chat channels)
+#
+# A workspace channel is addressed by (workspace, space, conversation), not by
+# platform/chat/user. The `workspace` segment is reserved: no Platform enum
+# value is "workspace", so platform-derived keys from build_session_key can
+# never collide with these. The TypeScript side builds the identical string
+# (apps/company-os/lib/workspace-session-key.ts) — keep formats in lockstep.
+# ---------------------------------------------------------------------------
+
+WORKSPACE_SESSION_SEGMENT = "workspace"
+
+
+@dataclass(frozen=True)
+class WorkspaceChannelRef:
+    """Parsed structured identity of a first-party workspace channel."""
+
+    workspace_id: str
+    space_id: str
+    conversation_id: str
+
+    @property
+    def channel_key(self) -> str:
+        """Bare channel form (no agent prefix) used by the durable journal."""
+        return (
+            f"{WORKSPACE_SESSION_SEGMENT}:{self.workspace_id}"
+            f":{self.space_id}:{self.conversation_id}"
+        )
+
+    @property
+    def session_key(self) -> str:
+        """Full Gateway session key form."""
+        return f"agent:main:{self.channel_key}"
+
+
+def _validated_workspace_component(name: str, value: str) -> str:
+    if not value or not isinstance(value, str):
+        raise ValueError(f"workspace session key component {name} must be a non-empty string")
+    if ":" in value or any(ch in value for ch in "\r\n\x00") or value != value.strip() or " " in value:
+        raise ValueError(
+            f"workspace session key component {name} must not contain ':', whitespace, "
+            "or control characters"
+        )
+    return value
+
+
+def build_workspace_session_key(workspace_id: str, space_id: str, conversation_id: str) -> str:
+    """Deterministic session key for a workspace conversation channel."""
+    ref = WorkspaceChannelRef(
+        workspace_id=_validated_workspace_component("workspace_id", workspace_id),
+        space_id=_validated_workspace_component("space_id", space_id),
+        conversation_id=_validated_workspace_component("conversation_id", conversation_id),
+    )
+    return ref.session_key
+
+
+def parse_workspace_session_key(key: Optional[str]) -> Optional[WorkspaceChannelRef]:
+    """Parse a workspace session key (full or bare form). Returns None for
+    anything that is not a structurally valid workspace channel key."""
+    if not key:
+        return None
+    raw = key
+    if raw.startswith("agent:main:"):
+        raw = raw[len("agent:main:") :]
+    parts = raw.split(":")
+    if len(parts) != 4 or parts[0] != WORKSPACE_SESSION_SEGMENT:
+        return None
+    if not all(parts[1:]):
+        return None
+    return WorkspaceChannelRef(
+        workspace_id=parts[1], space_id=parts[2], conversation_id=parts[3]
+    )
 
 
 class SessionStore:
@@ -1131,38 +1218,84 @@ class SessionStore:
             )
         return len(removed_keys)
 
-    def suspend_recently_active(self, max_age_seconds: int = 120) -> int:
-        """Mark recently-active sessions as resumable after an unexpected exit.
+    def suspend_recently_active(
+        self,
+        max_age_seconds: Optional[float] = 120,
+        *,
+        in_flight_session_keys: Optional[Set[str]] = None,
+    ) -> int:
+        """Mark sessions interrupted mid-turn by an unexpected exit as resumable.
 
         Called on gateway startup after a crash or fast restart to preserve
         in-flight sessions instead of destroying their conversation history
-        (#7536).  Only marks sessions updated within *max_age_seconds* to
-        avoid touching long-idle sessions.  Sets ``resume_pending=True`` so
-        the next incoming message on the same session_key auto-resumes from
-        the existing transcript.
+        (#7536).  Sets ``resume_pending=True`` so the next incoming message on
+        the same session_key — or the startup auto-resume pass — continues
+        from the existing transcript.
 
-        Entries already flagged ``resume_pending=True`` are skipped.  Entries
-        explicitly ``suspended=True`` (from /stop or stuck-loop escalation)
-        are also skipped.  Terminal escalation for genuinely stuck sessions
-        is still handled by the existing ``.restart_failure_counts`` counter
-        (threshold 3), which runs after this method and sets ``suspended=True``.
+        ``in_flight_session_keys`` is the durable in-flight lane set claimed
+        from the previous process generation (see
+        ``gateway.inflight_lanes.InFlightLaneJournal``).  When supplied, ONLY
+        those lanes are marked.  ``updated_at`` alone cannot answer "was this
+        lane mid-turn when we died" — it is bumped by any session touch,
+        including a turn that completed and replied moments before the crash —
+        and marking such a lane makes the auto-resume pass post an unprompted
+        message into a channel where the work was already finished.
+
+        Omitting ``in_flight_session_keys`` keeps the pre-journal heuristic
+        (recency only).  That is the upgrade window: the first start after this
+        code lands has no journal to consult, and it is better to over-recover
+        once than to drop crash recovery entirely.  Every later start supplies
+        a set — possibly empty, which is authoritative for "nothing was
+        mid-turn".
+
+        The recency bound still applies on top of the lane set: it is what
+        keeps a gateway that was down for six hours from resuming a turn whose
+        user left long ago.  Note what it measures — ``updated_at`` is stamped
+        when the inbound message arrives and is not touched again until the
+        turn produces a result, so for a mid-turn lane it is the *start time of
+        that turn*, not a liveness signal.  A bound tight enough to be useful
+        as a standalone heuristic (the 120s default) therefore discards long
+        agent runs, which is why callers holding a durable in-flight set pass a
+        wider one.  ``None`` drops the bound entirely.
+
+        Entries already flagged ``resume_pending=True`` are skipped — the
+        drain-timeout path in ``_stop_impl`` marks those precisely from the
+        live ``_running_agents`` map, and that record is strictly better than
+        anything reconstructed here.  Entries explicitly ``suspended=True``
+        (from /stop or stuck-loop escalation) are also skipped.  Terminal
+        escalation for genuinely stuck sessions is still handled by the
+        existing ``.restart_failure_counts`` counter (threshold 3), which runs
+        after this method and sets ``suspended=True``.
 
         Returns the number of sessions marked resumable.
         """
         from datetime import timedelta
 
-        cutoff = _now() - timedelta(seconds=max_age_seconds)
+        cutoff = (
+            None
+            if max_age_seconds is None
+            else _now() - timedelta(seconds=max_age_seconds)
+        )
         count = 0
         with self._lock:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if not entry.suspended and entry.updated_at >= cutoff:
-                    entry.resume_pending = True
-                    entry.resume_reason = "restart_interrupted"
-                    entry.last_resume_marked_at = _now()
-                    count += 1
+                if entry.suspended:
+                    continue
+                if cutoff is not None and entry.updated_at < cutoff:
+                    continue
+                if (
+                    in_flight_session_keys is not None
+                    and entry.session_key not in in_flight_session_keys
+                ):
+                    # Recently active but not mid-turn: its last turn finished.
+                    continue
+                entry.resume_pending = True
+                entry.resume_reason = "restart_interrupted"
+                entry.last_resume_marked_at = _now()
+                count += 1
             if count:
                 self._save()
         return count

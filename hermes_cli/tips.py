@@ -1,8 +1,13 @@
 """Random tips shown at CLI session start to help users discover features."""
 
-import os
 import random
 import re
+
+from sinria_product import (
+    cli_command_name as _identity_cli_command_name,
+    display_home as _identity_display_home,
+    product_short_name as _identity_product_short_name,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -478,21 +483,21 @@ TIPS = [
 
 
 def _cli_command_name() -> str:
-    return (os.getenv("SINRIA_CLI_NAME") or os.getenv("HERMES_CLI_NAME") or "sinria").strip().lower() or "sinria"
+    return _identity_cli_command_name()
 
 
 def _display_home() -> str:
-    return "~/.sinria" if _cli_command_name() == "sinria" else "~/.hermes"
+    return _identity_display_home()
 
 
 def _product_name() -> str:
-    return "Sinria" if _cli_command_name() == "sinria" else "Hermes"
+    return _identity_product_short_name()
 
 
 def _render_tip(tip: str) -> str:
-    if _cli_command_name() != "sinria":
-        return tip
-    rendered = tip.replace("~/.hermes", _display_home())
+    rendered = tip.replace("HERMES_", "SINRIA_")
+    rendered = rendered.replace("~/.hermes", _display_home())
+    rendered = rendered.replace(".hermes.md", ".sinria.md")
     rendered = re.sub(r"\bhermes\b", _cli_command_name(), rendered)
     rendered = re.sub(r"\bHermes\b", _product_name(), rendered)
     return rendered

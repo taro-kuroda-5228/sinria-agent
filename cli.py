@@ -33,6 +33,7 @@ import concurrent.futures
 import base64
 import atexit
 import errno
+import hashlib
 import tempfile
 import time
 import uuid
@@ -96,6 +97,7 @@ from agent.markdown_tables import (
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
 from hermes_cli.banner import _format_context_length, format_banner_version_label
+from sinria_product import PRODUCT
 
 _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -353,6 +355,16 @@ def load_cli_config() -> Dict[str, Any]:
             },
         },
 
+        "openai_responses": {
+            "text_verbosity": "",
+            "reasoning_context": "",
+            "reasoning_mode": "",
+            "programmatic_tool_calling": {
+                "default_enabled": False,
+                "mark_all_tools_eligible": False,
+            },
+        },
+
         "display": {
             "compact": False,
             "resume_display": "full",
@@ -435,7 +447,7 @@ def load_cli_config() -> Dict[str, Any]:
             # config root instead of inside the model: section.  These are
             # only used as a FALLBACK when model.provider / model.base_url
             # is not already set — never as an override.  The canonical
-            # location is model.provider (written by `hermes model`).
+            # location is model.provider (written by `sinria model`).
             if not defaults["model"].get("provider"):
                 root_provider = file_config.get("provider")
                 if root_provider:
@@ -812,6 +824,83 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
+_WORKTREE_REGISTRY_THREAD_LOCK = threading.Lock()
+
+
+def _git_common_dir(repo_root: str | Path) -> Path:
+    """Return the shared Git metadata directory for every linked worktree."""
+    import subprocess
+
+    repo = Path(repo_root).resolve()
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError("Could not resolve Git common directory")
+    common = Path(result.stdout.strip())
+    return (repo / common).resolve() if not common.is_absolute() else common.resolve()
+
+
+def _cli_worktrees_dir(repo_root: str | Path) -> Path:
+    """Return a private, repo-specific worktree root outside the checkout."""
+    repo = Path(repo_root).resolve()
+    identity = repo
+    try:
+        identity = _git_common_dir(repo)
+    except Exception:
+        pass
+
+    digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:12]
+    configured_root = os.environ.get("SINRIA_CLI_WORKTREE_ROOT")
+    if configured_root:
+        base = Path(configured_root).expanduser().resolve()
+    else:
+        home = Path(os.environ.get("SINRIA_HOME") or get_hermes_home()).expanduser()
+        base = (home / "worktrees" / "cli-sessions").resolve()
+    target = base / f"repo-{digest}"
+    if _path_is_within_root(target, repo):
+        raise ValueError("CLI worktree root must be outside the repository checkout")
+    return target
+
+
+@contextmanager
+def _worktree_registry_lock(repo_root: str | Path):
+    """Serialize mutations of one repository's shared worktree registry.
+
+    The lock lives in Git's common metadata directory, so clients with different
+    ``SINRIA_HOME`` or ``SINRIA_CLI_WORKTREE_ROOT`` values still coordinate.
+    """
+    lock_path = _git_common_dir(repo_root) / "sinria-worktree-registry.lock"
+    with _WORKTREE_REGISTRY_THREAD_LOCK:
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
     """Create an isolated git worktree for this CLI session.
 
@@ -823,37 +912,30 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
     repo_root = repo_root or _git_repo_root()
     if not repo_root:
         print("\033[31m✗ --worktree requires being inside a git repository.\033[0m")
-        print("  cd into your project repo first, then run hermes -w")
+        print(f"  cd into your project repo first, then run {PRODUCT.cli_command} -w")
         return None
 
     short_id = uuid.uuid4().hex[:8]
-    wt_name = f"hermes-{short_id}"
-    branch_name = f"hermes/{wt_name}"
+    wt_name = f"sinria-{short_id}"
+    branch_name = f"sinria/{wt_name}"
 
-    worktrees_dir = Path(repo_root) / ".worktrees"
-    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        worktrees_dir = _cli_worktrees_dir(repo_root)
+        worktrees_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except Exception as e:
+        print(f"\033[31m✗ Failed to prepare isolated worktree root: {e}\033[0m")
+        return None
 
     wt_path = worktrees_dir / wt_name
 
-    # Ensure .worktrees/ is in .gitignore
-    gitignore = Path(repo_root) / ".gitignore"
-    _ignore_entry = ".worktrees/"
+    # Register the worktree under a process-safe lock. Git's common worktree
+    # metadata is shared by every CLI and gateway process using this repository.
     try:
-        existing = gitignore.read_text() if gitignore.exists() else ""
-        if _ignore_entry not in existing.splitlines():
-            with open(gitignore, "a", encoding="utf-8") as f:
-                if existing and not existing.endswith("\n"):
-                    f.write("\n")
-                f.write(f"{_ignore_entry}\n")
-    except Exception as e:
-        logger.debug("Could not update .gitignore: %s", e)
-
-    # Create the worktree
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "add", str(wt_path), "-b", branch_name, "HEAD"],
-            capture_output=True, text=True, timeout=30, cwd=repo_root,
-        )
+        with _worktree_registry_lock(repo_root):
+            result = subprocess.run(
+                ["git", "worktree", "add", str(wt_path), "-b", branch_name, "HEAD"],
+                capture_output=True, text=True, timeout=30, cwd=repo_root,
+            )
         if result.returncode != 0:
             print(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
             return None
@@ -928,6 +1010,69 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
         except Exception as e:
             logger.debug("Error copying .worktreeinclude entries: %s", e)
 
+    # Do not hand a session a workspace that starts dirty. Files copied from
+    # .worktreeinclude are valid only when the repository already ignores them.
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=wt_path,
+        )
+    except Exception:
+        status = None
+    if status is None or status.returncode != 0 or status.stdout.strip():
+        rollback_remove = None
+        rollback_branch = None
+        try:
+            with _worktree_registry_lock(repo_root):
+                try:
+                    rollback_remove = subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(wt_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        cwd=repo_root,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to roll back refused worktree %s: %s", wt_path, exc)
+                try:
+                    rollback_branch = subprocess.run(
+                        ["git", "branch", "-D", branch_name],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        cwd=repo_root,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to roll back refused branch %s: %s", branch_name, exc)
+        except Exception as exc:
+            logger.warning("Could not acquire rollback lock for %s: %s", wt_path, exc)
+
+        if rollback_remove is not None and rollback_remove.returncode != 0:
+            logger.warning(
+                "Failed to roll back refused worktree %s: %s",
+                wt_path,
+                rollback_remove.stderr.strip(),
+            )
+        if rollback_branch is not None and rollback_branch.returncode != 0:
+            logger.warning(
+                "Failed to roll back refused branch %s: %s",
+                branch_name,
+                rollback_branch.stderr.strip(),
+            )
+        rollback_incomplete = (
+            rollback_remove is None
+            or rollback_remove.returncode != 0
+            or rollback_branch is None
+            or rollback_branch.returncode != 0
+        )
+        print("\033[31m✗ Refused worktree with an unexpected dirty initial state.\033[0m")
+        if rollback_incomplete:
+            print(f"  ⚠ Automatic rollback was incomplete; inspect: {wt_path}")
+        return None
+
     info = {
         "path": str(wt_path),
         "branch": branch_name,
@@ -943,10 +1088,8 @@ def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:
 def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     """Remove a worktree and its branch on exit.
 
-    Preserves the worktree only if it has unpushed commits (real work
-    that hasn't been pushed to any remote).  Uncommitted changes alone
-    (untracked files, test artifacts) are not enough to keep it — agent
-    work lives in commits/PRs, not the working tree.
+    Preserves the worktree if it has either uncommitted changes or
+    unpushed commits. Automatic cleanup must never destroy recoverable work.
     """
     global _active_worktree
     info = info or _active_worktree
@@ -959,46 +1102,67 @@ def _cleanup_worktree(info: Dict[str, str] = None) -> None:
     branch = info["branch"]
     repo_root = info["repo_root"]
 
-    if not Path(wt_path).exists():
-        return
-
-    # Check for unpushed commits — commits reachable from HEAD but not
-    # from any remote branch.  These represent real work the agent did
-    # but didn't push.
-    has_unpushed = False
     try:
-        result = subprocess.run(
-            ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-            capture_output=True, text=True, timeout=10, cwd=wt_path,
-        )
-        has_unpushed = bool(result.stdout.strip())
-    except Exception:
-        has_unpushed = True  # Assume unpushed on error — don't delete
+        with _worktree_registry_lock(repo_root):
+            if not Path(wt_path).exists():
+                _active_worktree = None
+                return
 
-    if has_unpushed:
-        print(f"\n\033[33m⚠ Worktree has unpushed commits, keeping: {wt_path}\033[0m")
-        print(f"  To clean up manually: git worktree remove --force {wt_path}")
+            # Validate recoverability under the same repository lock used by
+            # setup and pruning, then remove without a registry race.
+            status_result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=10, cwd=wt_path,
+            )
+            has_dirty = status_result.returncode != 0 or bool(status_result.stdout.strip())
+            unpushed_result = subprocess.run(
+                ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+                capture_output=True, text=True, timeout=10, cwd=wt_path,
+            )
+            has_unpushed = (
+                unpushed_result.returncode != 0 or bool(unpushed_result.stdout.strip())
+            )
+
+            if has_dirty or has_unpushed:
+                reasons = []
+                if has_dirty:
+                    reasons.append("uncommitted changes")
+                if has_unpushed:
+                    reasons.append("unpushed commits")
+                print(
+                    f"\n\033[33m⚠ Worktree has {' and '.join(reasons)}, keeping: "
+                    f"{wt_path}\033[0m"
+                )
+                print(f"  Review before manual cleanup: git -C {wt_path} status --short")
+                _active_worktree = None
+                return
+
+            remove_result = subprocess.run(
+                ["git", "worktree", "remove", wt_path],
+                capture_output=True, text=True, timeout=15, cwd=repo_root,
+            )
+            if remove_result.returncode != 0:
+                logger.debug("Failed to remove worktree: %s", remove_result.stderr.strip())
+                _active_worktree = None
+                return
+
+            branch_result = subprocess.run(
+                ["git", "branch", "-D", branch],
+                capture_output=True, text=True, timeout=10, cwd=repo_root,
+            )
+            if branch_result.returncode != 0:
+                logger.debug(
+                    "Failed to delete branch %s: %s", branch, branch_result.stderr.strip()
+                )
+                _active_worktree = None
+                print(
+                    f"\033[33m⚠ Worktree removed but branch cleanup failed: {branch}\033[0m"
+                )
+                return
+    except Exception as e:
+        logger.debug("Failed to clean up worktree %s: %s", wt_path, e)
         _active_worktree = None
         return
-
-    # Remove worktree (even if working tree is dirty — uncommitted
-    # changes without unpushed commits are just artifacts)
-    try:
-        subprocess.run(
-            ["git", "worktree", "remove", wt_path, "--force"],
-            capture_output=True, text=True, timeout=15, cwd=repo_root,
-        )
-    except Exception as e:
-        logger.debug("Failed to remove worktree: %s", e)
-
-    # Delete the branch
-    try:
-        subprocess.run(
-            ["git", "branch", "-D", branch],
-            capture_output=True, text=True, timeout=10, cwd=repo_root,
-        )
-    except Exception as e:
-        logger.debug("Failed to delete branch %s: %s", branch, e)
 
     _active_worktree = None
     print(f"\033[32m✓ Worktree cleaned up: {wt_path}\033[0m")
@@ -1083,30 +1247,40 @@ def _run_checkpoint_auto_maintenance() -> None:
 
 
 def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
-    """Remove stale worktrees and orphaned branches on startup.
+    """Serialize and remove only verified-safe stale worktrees."""
+    try:
+        with _worktree_registry_lock(repo_root):
+            _prune_stale_worktrees_locked(repo_root, max_age_hours)
+    except Exception as exc:
+        logger.debug("Could not prune stale worktrees: %s", exc)
 
-    Age-based tiers:
-    - Under max_age_hours (24h): skip — session may still be active.
-    - 24h–72h: remove if no unpushed commits.
-    - Over 72h: force remove regardless (nothing should sit this long).
 
-    Also prunes orphaned ``hermes/*`` and ``pr-*`` local branches that
-    have no corresponding worktree.
+def _prune_stale_worktrees_locked(repo_root: str, max_age_hours: int = 24) -> None:
+    """Remove stale worktrees and orphaned branches with the registry lock held.
+
+    Worktrees younger than ``max_age_hours`` are skipped. Older worktrees
+    are removed only when both the working tree and remote divergence are
+    verified clean; age never overrides recoverability.
+
+    Also prunes verified-safe orphaned Sinria/legacy compatibility branches.
     """
     import subprocess
     import time
 
-    worktrees_dir = Path(repo_root) / ".worktrees"
+    try:
+        worktrees_dir = _cli_worktrees_dir(repo_root)
+    except Exception as exc:
+        logger.debug("Could not resolve isolated worktree root: %s", exc)
+        return
     if not worktrees_dir.exists():
-        _prune_orphaned_branches(repo_root)
+        _prune_orphaned_branches_locked(repo_root)
         return
 
     now = time.time()
     soft_cutoff = now - (max_age_hours * 3600)       # 24h default
-    hard_cutoff = now - (max_age_hours * 3 * 3600)   # 72h default
 
     for entry in worktrees_dir.iterdir():
-        if not entry.is_dir() or not entry.name.startswith("hermes-"):
+        if not entry.is_dir() or not entry.name.startswith(("sinria-", "hermes-")):
             continue
 
         # Check age
@@ -1117,19 +1291,27 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
         except Exception:
             continue
 
-        force = mtime <= hard_cutoff  # Over 72h — force remove
+        # Preserve any dirty state, regardless of age.
+        try:
+            status_result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, timeout=5, cwd=str(entry),
+            )
+            if status_result.returncode != 0 or status_result.stdout.strip():
+                continue
+        except Exception:
+            continue
 
-        if not force:
-            # 24h–72h tier: only remove if no unpushed commits
-            try:
-                result = subprocess.run(
-                    ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
-                    capture_output=True, text=True, timeout=5, cwd=str(entry),
-                )
-                if result.stdout.strip():
-                    continue  # Has unpushed commits — skip
-            except Exception:
-                continue  # Can't check — skip
+        # Preserve any commit not reachable from a remote ref.
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "HEAD", "--not", "--remotes"],
+                capture_output=True, text=True, timeout=5, cwd=str(entry),
+            )
+            if result.returncode != 0 or result.stdout.strip():
+                continue
+        except Exception:
+            continue
 
         # Safe to remove
         try:
@@ -1137,30 +1319,60 @@ def _prune_stale_worktrees(repo_root: str, max_age_hours: int = 24) -> None:
                 ["git", "branch", "--show-current"],
                 capture_output=True, text=True, timeout=5, cwd=str(entry),
             )
+            if branch_result.returncode != 0:
+                logger.debug(
+                    "Failed to resolve stale worktree branch %s: %s",
+                    entry.name,
+                    branch_result.stderr.strip(),
+                )
+                continue
             branch = branch_result.stdout.strip()
 
-            subprocess.run(
-                ["git", "worktree", "remove", str(entry), "--force"],
+            remove_result = subprocess.run(
+                ["git", "worktree", "remove", str(entry)],
                 capture_output=True, text=True, timeout=15, cwd=repo_root,
             )
+            if remove_result.returncode != 0:
+                logger.debug(
+                    "Failed to prune worktree %s: %s",
+                    entry.name,
+                    remove_result.stderr.strip(),
+                )
+                continue
             if branch:
-                subprocess.run(
+                delete_result = subprocess.run(
                     ["git", "branch", "-D", branch],
                     capture_output=True, text=True, timeout=10, cwd=repo_root,
                 )
-            logger.debug("Pruned stale worktree: %s (force=%s)", entry.name, force)
+                if delete_result.returncode != 0:
+                    logger.debug(
+                        "Removed stale worktree %s but failed to delete branch %s: %s",
+                        entry.name,
+                        branch,
+                        delete_result.stderr.strip(),
+                    )
+                    continue
+            logger.debug("Pruned verified-clean stale worktree: %s", entry.name)
         except Exception as e:
             logger.debug("Failed to prune worktree %s: %s", entry.name, e)
 
-    _prune_orphaned_branches(repo_root)
+    _prune_orphaned_branches_locked(repo_root)
 
 
 def _prune_orphaned_branches(repo_root: str) -> None:
-    """Delete local ``hermes/hermes-*`` and ``pr-*`` branches with no worktree.
+    """Serialize pruning of fully merged orphaned session branches."""
+    try:
+        with _worktree_registry_lock(repo_root):
+            _prune_orphaned_branches_locked(repo_root)
+    except Exception as exc:
+        logger.debug("Could not prune orphaned branches: %s", exc)
 
-    These are auto-generated by ``hermes -w`` sessions and PR review
-    workflows respectively.  Once their worktree is gone they serve no
-    purpose and just accumulate.
+
+def _prune_orphaned_branches_locked(repo_root: str) -> None:
+    """Delete fully merged orphaned session branches with the registry lock held.
+
+    Sinria-native branches are primary; legacy ``hermes/hermes-*`` names are
+    recognized solely for compatibility cleanup. Unpushed branches are kept.
     """
     import subprocess
 
@@ -1204,24 +1416,54 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     orphaned = [
         b for b in all_branches
         if b not in active_branches
-        and (b.startswith("hermes/hermes-") or b.startswith("pr-"))
+        and (
+            b.startswith("sinria/sinria-")
+            or b.startswith("hermes/hermes-")
+            or b.startswith("pr-")
+        )
     ]
 
     if not orphaned:
         return
 
-    # Delete in batches
+    safe_orphaned = []
+    for branch in orphaned:
+        try:
+            divergence = subprocess.run(
+                ["git", "log", "--oneline", branch, "--not", "--remotes"],
+                capture_output=True, text=True, timeout=10, cwd=repo_root,
+            )
+            if divergence.returncode == 0 and not divergence.stdout.strip():
+                safe_orphaned.append(branch)
+        except Exception:
+            continue
+
+    # Delete only branches whose commits are already remote-reachable.
+    orphaned = safe_orphaned
+    if not orphaned:
+        return
+
+    # Delete in batches and report only confirmed deletions.
+    deleted_count = 0
     for i in range(0, len(orphaned), 50):
         batch = orphaned[i:i + 50]
         try:
-            subprocess.run(
+            delete_result = subprocess.run(
                 ["git", "branch", "-D"] + batch,
                 capture_output=True, text=True, timeout=30, cwd=repo_root,
             )
+            if delete_result.returncode != 0:
+                logger.debug(
+                    "Failed to prune orphaned branch batch: %s",
+                    delete_result.stderr.strip(),
+                )
+                continue
+            deleted_count += len(batch)
         except Exception as e:
             logger.debug("Failed to prune orphaned branches: %s", e)
 
-    logger.debug("Pruned %d orphaned branches", len(orphaned))
+    if deleted_count:
+        logger.debug("Pruned %d orphaned branches", deleted_count)
 
 # ============================================================================
 # ASCII Art & Branding
@@ -2354,8 +2596,8 @@ def _build_compact_banner() -> str:
     dim_color = _skin.get_color("banner_dim", "#B8860B") if _skin else "#B8860B"
 
     if skin_name == "default":
-        line1 = "⚕ NOUS HERMES - AI Agent Framework"
-        tiny_line = "⚕ NOUS HERMES"
+        line1 = f"⚕ {PRODUCT.full_name.upper()} - AI Agent Framework"
+        tiny_line = f"⚕ {PRODUCT.full_name.upper()}"
     else:
         agent_name = _skin.get_branding("agent_name", "Sinria") if _skin else "Sinria"
         line1 = f"{agent_name} - AI Agent Framework"
@@ -2365,7 +2607,7 @@ def _build_compact_banner() -> str:
 
     w = min(shutil.get_terminal_size().columns - 2, 88)
     if w < 30:
-        return f"\n[{title_color}]{tiny_line}[/] [dim {dim_color}]- Nous Research[/]\n"
+        return f"\n[{title_color}]{tiny_line}[/] [dim {dim_color}]- Medical Horizon[/]\n"
 
     inner = w - 2  # inside the box border
     bar = "═" * w
@@ -2728,6 +2970,11 @@ class HermesCLI:
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
+        try:
+            from agent.openai_responses_config import build_openai_responses_request_overrides
+            self._openai_responses_request_overrides = build_openai_responses_request_overrides(CLI_CONFIG)
+        except Exception:
+            self._openai_responses_request_overrides = {}
         
         # OpenRouter provider routing preferences
         pr = CLI_CONFIG.get("provider_routing", {}) or {}
@@ -4306,8 +4553,8 @@ class HermesCLI:
             if should_use_runtime_model:
                 self.model = runtime_model
 
-        # If model is still empty (e.g. user ran `hermes auth add openai-codex`
-        # without `hermes model`), fall back to the provider's first catalog
+        # If model is still empty (e.g. user ran `sinria auth add openai-codex`
+        # without `sinria model`), fall back to the provider's first catalog
         # model so the API call doesn't fail with "model must be non-empty".
         if not self.model and resolved_provider:
             try:
@@ -4367,15 +4614,19 @@ class HermesCLI:
         }
 
         service_tier = getattr(self, "service_tier", None)
+        config_overrides = dict(getattr(self, "_openai_responses_request_overrides", {}) or {})
         if not service_tier:
-            route["request_overrides"] = None
+            route["request_overrides"] = config_overrides or None
             return route
 
         try:
             overrides = resolve_fast_mode_overrides(route["model"])
         except Exception:
             overrides = None
-        route["request_overrides"] = overrides
+        merged_overrides = dict(config_overrides)
+        if overrides:
+            merged_overrides.update(overrides)
+        route["request_overrides"] = merged_overrides or None
         return route
 
     def _init_agent(self, *, model_override: str = None, runtime_override: dict = None, request_overrides: dict | None = None) -> bool:
@@ -4466,6 +4717,9 @@ class HermesCLI:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            effective_request_overrides = dict(getattr(self, "_openai_responses_request_overrides", {}) or {})
+            if request_overrides:
+                effective_request_overrides.update(request_overrides)
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -4484,7 +4738,7 @@ class HermesCLI:
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
                 service_tier=self.service_tier,
-                request_overrides=request_overrides,
+                request_overrides=effective_request_overrides,
                 providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore,
                 providers_order=self._providers_order,

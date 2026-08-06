@@ -22,7 +22,10 @@ import concurrent.futures
 import json
 import logging
 import re
+from collections import OrderedDict
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
@@ -265,7 +268,7 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(db, limit: int, current_session_id: Optional[str] = None) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
         sessions = db.list_sessions_rich(
@@ -322,12 +325,85 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
+def _audit_sessions_for_date(
+    db,
+    audit_date: str,
+    timezone_name: str,
+    current_session_id: Optional[str] = None,
+) -> str:
+    """Deterministically enumerate every user turn in a local calendar day.
+
+    Unlike keyword search, this mode has no relevance/top-N filter and does not
+    collapse child sessions into their root.  It is intended to establish a
+    complete candidate set before an agent classifies task status.
+    """
+    if not isinstance(audit_date, str):
+        return tool_error("audit_date must be a YYYY-MM-DD string", success=False)
+    if not isinstance(timezone_name, str) or not timezone_name:
+        return tool_error("timezone must be a non-empty IANA timezone string", success=False)
+    try:
+        day = datetime.strptime(audit_date, "%Y-%m-%d")
+    except ValueError:
+        return tool_error("audit_date must use YYYY-MM-DD", success=False)
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return tool_error(f"Invalid timezone: {timezone_name}", success=False)
+
+    def _iso(value, fallback_label):
+        try:
+            return datetime.fromtimestamp(float(value), timezone).isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    start = day.replace(tzinfo=timezone)
+    end = start + timedelta(days=1)
+    try:
+        rows = db.audit_user_turns(start.timestamp(), end.timestamp())
+    except Exception as e:  # pragma: no cover - defensive DB guard
+        logging.error("audit_user_turns failed: %s", e, exc_info=True)
+        return tool_error(f"Failed to audit sessions: {e}", success=False)
+    sessions = OrderedDict()
+    for row in rows:
+        session_id = str(row["session_id"])
+        item = sessions.setdefault(session_id, {
+            "session_id": session_id,
+            "parent_session_id": row.get("parent_session_id"),
+            "source": row.get("source") or "unknown",
+            "automated_source": (row.get("source") or "") in {"cron", "tool"},
+            "title": row.get("title") or "",
+            "started_at": _iso(row.get("session_started_at"), "session_started_at"),
+            "is_current_session": session_id == current_session_id,
+            "user_turns": [],
+        })
+        content = re.sub(r"\s+", " ", str(row.get("content") or "")).strip()
+        item["user_turns"].append({
+            "message_id": row.get("message_id"),
+            "timestamp": _iso(row.get("message_timestamp"), "message_timestamp"),
+            "preview": content[:240],
+            "truncated": len(content) > 240,
+        })
+
+    return json.dumps({
+        "success": True,
+        "mode": "daily_audit",
+        "audit_date": audit_date,
+        "timezone": timezone_name,
+        "coverage": "all_user_turns_no_top_n_no_lineage_collapse",
+        "session_count": len(sessions),
+        "user_turn_count": len(rows),
+        "sessions": list(sessions.values()),
+    }, ensure_ascii=False)
+
+
 def session_search(
     query: str,
     role_filter: str = None,
     limit: int = 3,
+    audit_date: Optional[str] = None,
+    timezone_name: str = "UTC",
     db=None,
-    current_session_id: str = None,
+    current_session_id: Optional[str] = None,
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -345,6 +421,14 @@ def session_search(
             logging.debug("SessionDB unavailable for session_search", exc_info=True)
             from hermes_state import format_session_db_unavailable
             return tool_error(format_session_db_unavailable(), success=False)
+
+    if audit_date:
+        return _audit_sessions_for_date(
+            db,
+            audit_date=audit_date,
+            timezone_name=timezone_name,
+            current_session_id=current_session_id,
+        )
 
     # Defensive: models (especially open-source) may send non-int limit values
     # (None when JSON null, string "int", or even a type object).  Coerce to a
@@ -585,8 +669,17 @@ SESSION_SEARCH_SCHEMA = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Max sessions to summarize (default: 3, max: 5).",
+                "description": "Max sessions to summarize (default: 3, max: 5). Ignored in audit_date mode.",
                 "default": 3,
+            },
+            "audit_date": {
+                "type": "string",
+                "description": "YYYY-MM-DD calendar date for exhaustive task-candidate audit. Returns every user turn with session lineage; no top-N or current-session exclusion.",
+            },
+            "timezone": {
+                "type": "string",
+                "description": "IANA timezone for audit_date boundaries (default UTC), e.g. Asia/Tokyo.",
+                "default": "UTC",
             },
         },
         "required": [],
@@ -605,6 +698,8 @@ registry.register(
         query=args.get("query") or "",
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
+        audit_date=args.get("audit_date"),
+        timezone_name=args.get("timezone", "UTC"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id")),
     check_fn=check_session_search_requirements,

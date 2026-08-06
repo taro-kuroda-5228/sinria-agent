@@ -27,21 +27,6 @@ Sinria’s initial focus is Medical Horizon and healthcare workflows, but the sa
 
 ---
 
-## Open-core positioning
-
-This repository is the **Sinria OSS core**: the local-first runtime, CLI, tool/skill framework, gateway foundations, safety primitives, and developer documentation that make Sinria inspectable and self-hostable.
-
-Commercial deployments are built around the parts that regulated organizations usually need beyond the public core:
-
-- enterprise policy, audit, SSO/RBAC, and managed deployment support;
-- regulated workflow modules for healthcare, government, finance, legal, and similar environments;
-- institution-specific connectors, runbooks, approval flows, and operational automations;
-- customer-specific configuration, infrastructure, support, and compliance evidence.
-
-Do not commit customer data, PHI/PII, secrets, private deployment topology, proprietary evaluation sets, or institution-specific workflows to this public repository. Keep those in private enterprise/customer repositories or approved local Sinria runtime locations.
-
----
-
 ## Current status
 
 Sinria is actively being shaped into a standalone, installable agent product. The repository currently includes:
@@ -59,12 +44,12 @@ Some internals still retain Hermes-derived module names for compatibility while 
 
 ---
 
-## Quick start for employees and collaborators
+## Quick start for Kikuchi / collaborators
 
-> The installer uses the rolling `main` channel. It is the recommended path for internal users who should receive the latest reviewed Sinria core updates.
+> Recommended first path on macOS or Linux: clone the repo, run setup, then start Sinria locally.
 
 ```bash
-git clone https://github.com/taro-kuroda-5228/sinria-agent.git sinria
+git clone https://github.com/taro-kuroda-5228/sinria.git
 cd sinria
 ./setup-sinria.sh
 ./sinria
@@ -105,7 +90,7 @@ Do not commit `.env`, credentials, patient data, private vault content, or local
 ### macOS / Linux / WSL2
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/taro-kuroda-5228/sinria/main/scripts/install.sh | bash
 ```
 
 Then reload your shell and run:
@@ -128,28 +113,8 @@ To install natively on Windows instead, run the PowerShell installer
 (`scripts/install.ps1`) from an elevated PowerShell prompt:
 
 ```powershell
-irm https://raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/taro-kuroda-5228/sinria/main/scripts/install.ps1 | iex
 ```
-
-### Updates and immutable releases
-
-Git-based installs can check and apply reviewed updates without replacing local
-`~/.sinria/` configuration, memory, or credentials:
-
-```bash
-sinria update --check
-sinria update --yes
-```
-
-Tagged versions and immutable wheel/source archives are published through
-[GitHub Releases](https://github.com/taro-kuroda-5228/sinria-agent/releases).
-Each release includes `install.sh`, `install.ps1`, and `SHA256SUMS`. Verify the
-checksum before using a downloaded artifact in a regulated environment. Release
-publishing is separate from local configuration and never includes files from
-`~/.sinria/`.
-
-The release process and approval gate are documented in
-[`docs/releasing.md`](docs/releasing.md).
 
 ---
 

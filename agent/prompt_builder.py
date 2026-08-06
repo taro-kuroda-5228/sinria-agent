@@ -277,12 +277,15 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm")
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
-    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
-    "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
-    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
-    "the result.\n"
+    "- Use the smallest set of tools that can close a specific acceptance gap.\n"
+    "- State the acceptance criteria internally, batch independent lookups, and prefer "
+    "one high-information call over many narrow calls.\n"
+    "- Stop when the acceptance criteria are met and the result is verified; verification "
+    "is targeted evidence, not open-ended exploration.\n"
+    "- If a tool returns empty or partial results, retry with a different strategy only "
+    "when that retry can close a named gap.\n"
+    "- Do not inspect unrelated files, sources, projects, or optional references merely "
+    "because they are available.\n"
     "</tool_persistence>\n"
     "\n"
     "<mandatory_tool_use>\n"
@@ -660,7 +663,9 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
+    from gateway.session_context import get_session_env
+
+    cwd_hint = get_session_env("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
@@ -834,6 +839,10 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+# Detailed descriptions are useful for small, curated catalogs. Above this
+# size they become a fixed tax on every model request; use a globally
+# deduplicated name index and let skills_list/skill_view provide details.
+_SKILLS_COMPACT_THRESHOLD = 48
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1162,51 +1171,61 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
-                    index_lines.append(f"    - {name}")
+        # Canonicalize by frontmatter name across the whole catalog. Local
+        # aliases can expose the same skill through multiple category paths;
+        # showing each copy wastes prompt space and makes mandatory loading
+        # look like multiple separate workflows. Prefer a category whose name
+        # exactly matches the skill, then the shallowest/lexical category.
+        canonical: dict[str, tuple[str, str]] = {}
 
+        def _category_rank(category: str, skill_name: str) -> tuple[int, int, str]:
+            return (0 if category == skill_name else 1, category.count("/"), category)
+
+        for category in sorted(skills_by_category):
+            for name, desc in skills_by_category[category]:
+                existing = canonical.get(name)
+                if existing is None or _category_rank(category, name) < _category_rank(existing[0], name):
+                    canonical[name] = (category, desc)
+
+        canonical_by_category: dict[str, list[tuple[str, str]]] = {}
+        for name, (category, desc) in canonical.items():
+            canonical_by_category.setdefault(category, []).append((name, desc))
+
+        compact = len(canonical) > _SKILLS_COMPACT_THRESHOLD
+        index_lines = []
+        for category in sorted(canonical_by_category):
+            entries = sorted(canonical_by_category[category], key=lambda item: item[0])
+            if compact:
+                names = [name for name, _desc in entries]
+                # Dedicated one-skill categories such as ``sinria-agent`` do
+                # not need ``sinria-agent: sinria-agent`` repeated verbatim.
+                index_lines.append(
+                    f"  {category}"
+                    if names == [category]
+                    else f"  {category}: " + ", ".join(names)
+                )
+                continue
+
+            cat_desc = category_descriptions.get(category, "")
+            index_lines.append(f"  {category}: {cat_desc}" if cat_desc else f"  {category}:")
+            for name, desc in entries:
+                index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
+
+        discovery_hint = (
+            "This large catalog is names-only to keep requests small; call skills_list "
+            "once when a name is unclear, then load only matching skills. "
+            if compact else ""
+        )
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Sinria itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `sinria-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
+            "Scan this index before replying. If a skill is relevant or partially relevant, "
+            "load it with skill_view(name) and follow it. "
+            + discovery_hint
+            + "If a loaded skill is stale, patch it with skill_manage.\n\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            "</available_skills>\n\n"
+            "Proceed without loading a skill only when none is relevant."
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────

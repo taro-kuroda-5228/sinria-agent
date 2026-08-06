@@ -15,7 +15,11 @@ from typing import Any, Dict, List, Optional
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
-from agent.transports.base import ProviderTransport
+from agent.transports.base import (
+    ProviderTransport,
+    validate_extra_headers,
+    validate_request_overrides,
+)
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
@@ -383,10 +387,15 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
-        # Request overrides last (service_tier etc.)
+        # Request overrides last (service_tier etc.). Validate transport-sensitive
+        # values before they reach the SDK.
         overrides = params.get("request_overrides")
+        validate_request_overrides(overrides)
         if overrides:
             api_kwargs.update(overrides)
+
+        if "extra_headers" in api_kwargs:
+            validate_extra_headers(api_kwargs["extra_headers"], source="api_kwargs")
 
         return api_kwargs
 
@@ -492,8 +501,11 @@ class ChatCompletionsTransport(ProviderTransport):
         if additions:
             extra_body.update(additions)
 
-        # Request overrides (user config)
+        # Request overrides (user config). Validate transport-sensitive values
+        # before they reach the SDK: malformed headers otherwise fail inside
+        # OpenAI's case-normalization code and can consume the full turn budget.
         overrides = params.get("request_overrides")
+        validate_request_overrides(overrides)
         if overrides:
             for k, v in overrides.items():
                 if k == "extra_body" and isinstance(v, dict):
@@ -503,6 +515,11 @@ class ChatCompletionsTransport(ProviderTransport):
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
+
+        # Final invariant at the SDK boundary also protects future sources of
+        # top-level headers, not only today's request_overrides path.
+        if "extra_headers" in api_kwargs:
+            validate_extra_headers(api_kwargs["extra_headers"], source="api_kwargs")
 
         return api_kwargs
 

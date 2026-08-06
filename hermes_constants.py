@@ -8,6 +8,8 @@ legacy compatibility aliases from the pre-fork codebase. Sinria-native code
 should prefer ``SINRIA_*`` variables and the ``get_sinria_*`` aliases below.
 """
 
+from __future__ import annotations
+
 import os
 from pathlib import Path
 
@@ -230,16 +232,18 @@ def display_sinria_home() -> str:
     return display_hermes_home()
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none".
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
+    Transports that do not support GPT-5.6's "max" effort should clamp before
+    sending provider-specific API kwargs.
     """
     if not effort or not effort.strip():
         return None

@@ -81,9 +81,18 @@ hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
 
-# Local runtime/deploy state; may contain project links, OAuth/token files, or private operator scratch data
+# Local runtime/deploy state; may contain databases, certificates, credentials,
+# project links, OAuth/token files, or private operator scratch data.
+.dogfood/
+.tmp/
 .vercel/
-.sinria/
+# Local browser/QA captures are raw evidence; keep them out of shared git history.
+.playwright-mcp/
+*-error-state.png
+# .sinria/ is local state, except the repo-shipped repair contract (self-repair
+# loop Phase 2 policy data). `dir/*` instead of `dir/` so the negation can work.
+.sinria/*
+!.sinria/repair.yaml
 .sinria-runtime/
 apps/**/.sinria/
 apps/**/supabase/.temp/

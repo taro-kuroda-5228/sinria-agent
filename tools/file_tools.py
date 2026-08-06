@@ -79,6 +79,32 @@ _BLOCKED_DEVICE_PATHS = frozenset({
 })
 
 
+def _repair_scope_error(filepath: str, task_id: str = "default") -> str | None:
+    """Confine repair-worker file tools to their isolated worktree.
+
+    The worker sets ``SINRIA_REPAIR_WORKTREE_ROOT`` and has no terminal/web
+    tools. Resolve symlinks before comparing so an in-tree link cannot escape.
+    Normal Sinria sessions are unaffected when the variable is absent.
+    """
+    root_raw = os.getenv("SINRIA_REPAIR_WORKTREE_ROOT", "").strip()
+    if not root_raw:
+        return None
+    try:
+        root = Path(root_raw).expanduser().resolve(strict=True)
+        candidate = Path(filepath).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        resolved = candidate.resolve(strict=False)
+        if os.path.commonpath((str(root), str(resolved))) == str(root):
+            return None
+    except (OSError, ValueError):
+        pass
+    return (
+        f"Repair worker path is outside the isolated repair worktree: {filepath}. "
+        "Only files under SINRIA_REPAIR_WORKTREE_ROOT are allowed."
+    )
+
+
 def _resolve_path(filepath: str, task_id: str = "default") -> Path:
     """Resolve a path relative to TERMINAL_CWD (the worktree base directory)
     instead of the main repository root.
@@ -121,9 +147,15 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or os.environ.get(
-            "TERMINAL_CWD", os.getcwd()
-        )
+        base = _get_live_tracking_cwd(task_id)
+        if not base:
+            try:
+                from gateway.session_context import get_session_env
+
+                base = get_session_env("TERMINAL_CWD", "")
+            except Exception:
+                base = ""
+        base = base or os.environ.get("TERMINAL_CWD", os.getcwd())
         p = Path(base) / p
     return p.resolve()
 
@@ -527,6 +559,9 @@ def clear_file_ops_cache(task_id: str = None):
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
+    repair_scope_err = _repair_scope_error(path, task_id)
+    if repair_scope_err:
+        return tool_error(repair_scope_err)
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
@@ -873,6 +908,9 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    repair_scope_err = _repair_scope_error(path, task_id)
+    if repair_scope_err:
+        return tool_error(repair_scope_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -941,6 +979,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        repair_scope_err = _repair_scope_error(_p, task_id)
+        if repair_scope_err:
+            return tool_error(repair_scope_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -1029,6 +1070,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 output_mode: str = "content", context: int = 0,
                 task_id: str = "default") -> str:
     """Search for content or files."""
+    repair_scope_err = _repair_scope_error(path, task_id)
+    if repair_scope_err:
+        return tool_error(repair_scope_err)
     try:
         offset, limit = normalize_search_pagination(offset, limit)
 

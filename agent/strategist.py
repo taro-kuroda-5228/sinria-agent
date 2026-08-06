@@ -15,6 +15,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, List, Optional
 
 from hermes_constants import get_sinria_home
@@ -26,6 +27,9 @@ PACKET_CHAR_CAP = 6000
 PLAN_MAX_TOKENS = 700
 CORRECTION_MAX_TOKENS = 500
 _PLAN_LENGTH_THRESHOLD = 240
+# Provider assumed when ``model.strategist_provider`` is unset.  Shared by the
+# client resolver and the same-route check so the two cannot drift apart.
+DEFAULT_STRATEGIST_PROVIDER = "anthropic"
 
 _PLAN_SYSTEM_PROMPT = (
     "You are the strategist for a smaller executor model that will do the "
@@ -49,7 +53,7 @@ _MULTI_STEP_MARKERS = (
 
 
 def strategist_events_path(home: Optional[Path] = None) -> Path:
-    return (home or get_sinria_home()) / "context_share" / "strategist_events.jsonl"
+    return (home or get_sinria_home()) / "corrections" / "strategist_events.jsonl"
 
 
 def record_strategist_event(
@@ -103,24 +107,44 @@ def configure_strategist(agent: Any, model_cfg: Any, behavior_cfg: Any) -> None:
     agent._strategist_warned = False
 
 
+def _effective_strategist_provider(agent: Any) -> str:
+    return str(getattr(agent, "strategist_provider", None) or DEFAULT_STRATEGIST_PROVIDER)
+
+
 def strategist_enabled(agent: Any) -> bool:
-    return bool(getattr(agent, "strategist_model", None))
+    """False when unconfigured, or when it would just re-ask the executor.
+
+    Pointing the strategist at the main runtime doubles that provider's usage
+    per turn to get a second opinion from the same model on the same account
+    — no planning diversity, twice the quota burn.  The comparison uses the
+    *live* runtime, so a mid-session failover that lands the executor on the
+    strategist's own route stops the side-call too.
+    """
+    model = str(getattr(agent, "strategist_model", None) or "")
+    if not model:
+        return False
+    same_model = model == str(getattr(agent, "model", None) or "")
+    same_provider = _effective_strategist_provider(agent) == str(
+        getattr(agent, "provider", None) or ""
+    )
+    return not (same_model and same_provider)
 
 
 def should_request_plan(user_message: Any, *, tools_available: bool) -> bool:
     """Code-only complexity heuristic. Chit-chat and Q&A never plan."""
     if not tools_available:
         return False
-    from agent.context_share.outcome_gap import classify_goal
-    from agent.context_share.outcome_gap import _text as _extract_message_text
+    from agent.correction_loop.outcome_gap import classify_goal
+    from agent.correction_loop.outcome_gap import _text as _extract_message_text
 
-    if classify_goal(user_message) != "practical_action":
+    task_text = _clip_task_text(_extract_message_text(user_message), 2000)
+    lowered = task_text.lower()
+    has_multi_step = any(marker in lowered for marker in _MULTI_STEP_MARKERS)
+    if classify_goal(task_text) != "practical_action" and not has_multi_step:
         return False
-    text = _extract_message_text(user_message)
-    if len(text) >= _PLAN_LENGTH_THRESHOLD:
+    if len(task_text) >= _PLAN_LENGTH_THRESHOLD:
         return True
-    lowered = text.lower()
-    return any(marker in lowered for marker in _MULTI_STEP_MARKERS)
+    return has_multi_step
 
 
 def consume_strategist_budget(agent: Any) -> bool:
@@ -140,6 +164,21 @@ def _clip(text: str, cap: int) -> str:
     return text[:cap] + "\n…[truncated]"
 
 
+def _clip_task_text(text: str, cap: int) -> str:
+    """Bound gateway-expanded task text while retaining the real request tail.
+
+    Auto-loaded skill instructions precede the user's text in legacy gateway
+    payloads. A head-only clip therefore hid the request from the strategist.
+    """
+    if len(text) <= cap:
+        return text
+    marker = "\n…[auto-loaded context truncated; user request tail follows]\n"
+    remaining = max(0, cap - len(marker))
+    head = remaining // 2
+    tail = remaining - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
+
+
 def _tool_names(agent: Any) -> List[str]:
     names: List[str] = []
     for tool in getattr(agent, "tools", None) or []:
@@ -151,11 +190,11 @@ def _tool_names(agent: Any) -> List[str]:
 
 
 def _shared_packet_parts(agent: Any, user_message: Any) -> List[str]:
-    from agent.context_share.outcome_gap import _text as _extract_message_text
+    from agent.correction_loop.outcome_gap import _text as _extract_message_text
 
     _extracted = _extract_message_text(user_message)
     _task_text = _extracted if _extracted else str(user_message or "")
-    parts = [f"Task from user:\n{_clip(_task_text, 2000)}"]
+    parts = [f"Task from user:\n{_clip_task_text(_task_text, 2000)}"]
     todo = getattr(agent, "_todo_store", None)
     try:
         if todo is not None and todo.has_items():
@@ -202,13 +241,34 @@ def _resolve_strategist_client(agent: Any):
     """
     from agent.auxiliary_client import resolve_provider_client
 
-    provider = getattr(agent, "strategist_provider", None) or "anthropic"
+    provider = _effective_strategist_provider(agent)
     client, resolved_model = resolve_provider_client(
         provider, model=getattr(agent, "strategist_model", None)
     )
     if client is None:
         raise RuntimeError(f"no strategist client for provider {provider}")
     return client, resolved_model
+
+
+def _strategist_boundary_agent(
+    agent: Any, *, client: Any, provider: str, model: str
+) -> SimpleNamespace:
+    """Create an egress-policy view for the actual strategist destination."""
+
+    attributes = {
+        "provider": provider,
+        "model": model,
+        "base_url": str(getattr(client, "base_url", "") or ""),
+        "session_id": str(getattr(agent, "session_id", "") or "strategist"),
+    }
+    for name in (
+        "sinria_egress_config",
+        "sinria_boundary_config",
+        "sinria_egress_audit_path",
+    ):
+        if hasattr(agent, name):
+            attributes[name] = getattr(agent, name)
+    return SimpleNamespace(**attributes)
 
 
 def _call_strategist(
@@ -219,14 +279,26 @@ def _call_strategist(
         return None
     try:
         client, resolved_model = _resolve_strategist_client(agent)
-        response = client.chat.completions.create(
-            model=resolved_model or model,
-            messages=[
+        transport_model = resolved_model or model
+        provider = _effective_strategist_provider(agent)
+        payload = {
+            "model": transport_model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": packet},
             ],
-            max_tokens=max_tokens,
+            "max_tokens": max_tokens,
+        }
+        from agent.sinria_egress import prepare_model_provider_payload
+
+        boundary_agent = _strategist_boundary_agent(
+            agent,
+            client=client,
+            provider=provider,
+            model=transport_model,
         )
+        prepared_payload = prepare_model_provider_payload(boundary_agent, payload)
+        response = client.chat.completions.create(**prepared_payload)
         text = (response.choices[0].message.content or "").strip()
         return text or None
     except Exception as exc:

@@ -70,17 +70,23 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from sinria_product import (
+    cli_command_name as _identity_cli_command_name,
+    product_name as _identity_product_name,
+    product_short_name as _identity_product_short_name,
+)
+
 
 def _cli_command_name() -> str:
-    return (os.getenv("SINRIA_CLI_NAME") or os.getenv("HERMES_CLI_NAME") or "sinria").strip().lower() or "sinria"
+    return _identity_cli_command_name()
 
 
 def _product_name() -> str:
-    return "Sinria Agent" if _cli_command_name() == "sinria" else "Sinria"
+    return _identity_product_name()
 
 
 def _product_short_name() -> str:
-    return _product_name().replace(" Agent", "")
+    return _identity_product_short_name()
 
 
 def _cli_cmd(command: str) -> str:
@@ -2171,6 +2177,7 @@ _AUX_TASKS: list[tuple[str, str, str]] = [
     ("title_generation", "Title generation", "session titles"),
     ("skills_hub", "Skills hub", "skills search/install"),
     ("curator", "Curator", "skill-usage review pass"),
+    ("background_review", "Background review", "post-turn memory/skill self-review"),
 ]
 
 
@@ -5554,6 +5561,13 @@ def cmd_cron(args):
     from hermes_cli.cron import cron_command
 
     cron_command(args)
+
+
+def cmd_gcp(args):
+    """Sinria GCP project-lock preflight and scoped command helpers."""
+    from hermes_cli.gcp_project_lock import gcp_command
+
+    return gcp_command(args)
 
 
 def cmd_webhook(args):
@@ -9594,7 +9608,10 @@ def cmd_dashboard(args):
 
     from hermes_cli.web_server import start_server
 
-    embedded_chat = args.tui or os.environ.get("HERMES_DASHBOARD_TUI") == "1"
+    dashboard_tui_env = os.environ.get("SINRIA_DASHBOARD_TUI")
+    if dashboard_tui_env is None:
+        dashboard_tui_env = os.environ.get("HERMES_DASHBOARD_TUI")
+    embedded_chat = args.tui or dashboard_tui_env == "1"
     start_server(
         host=args.host,
         port=args.port,
@@ -9668,7 +9685,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "auth", "backup", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
-        "dump", "fallback", "gateway", "hooks", "import", "insights",
+        "dump", "fallback", "gateway", "gcp", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
         "model", "pairing", "plugins", "postinstall", "profile", "proxy", "send", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
@@ -9996,7 +10013,7 @@ def main():
         help="Remove legacy gateway units from pre-rename installs",
         description=(
             f"Stop, disable, and remove legacy {_product_short_name()} gateway unit files "
-            "(e.g. hermes.service) left over from older installs. Profile "
+            "left over from older installs. Profile "
             "units (sinria-gateway-<profile>.service) and unrelated "
             "third-party services are never touched."
         ),
@@ -10161,7 +10178,7 @@ def main():
         default=None,
         metavar="PATH",
         help="Write manifest to a file instead of stdout. With no PATH "
-        "writes to $HERMES_HOME/slack-manifest.json.",
+        f"writes to {display_sinria_home()}/slack-manifest.json.",
     )
     slack_manifest.add_argument(
         "--name",
@@ -10320,7 +10337,7 @@ def main():
         default="login",
     )
     auth_spotify.add_argument(
-        "--client-id", help="Spotify app client_id (or set HERMES_SPOTIFY_CLIENT_ID)"
+        "--client-id", help="Spotify app client_id (or set SINRIA_SPOTIFY_CLIENT_ID)"
     )
     auth_spotify.add_argument(
         "--redirect-uri",
@@ -10352,6 +10369,45 @@ def main():
         "--deep", action="store_true", help="Run deep checks (may take longer)"
     )
     status_parser.set_defaults(func=cmd_status)
+
+    # =========================================================================
+    # gcp command
+    # =========================================================================
+    gcp_parser = subparsers.add_parser(
+        "gcp",
+        help="GCP project-lock preflight",
+        description="Verify Sinria product → GCP project locks before Cloud Run/GCP work",
+    )
+    gcp_subparsers = gcp_parser.add_subparsers(dest="gcp_command")
+
+    gcp_preflight = gcp_subparsers.add_parser(
+        "preflight",
+        help="Fail closed if active gcloud project does not match the project-lock",
+    )
+    gcp_preflight.add_argument("--product", required=True, help="Sinria product key, e.g. medspot or medevidence")
+    gcp_preflight.add_argument("--lock-file", help="Explicit project-lock YAML path")
+    gcp_preflight.add_argument("--cwd", help="Repo/workdir used to discover .sinria/project-lock.yaml")
+    gcp_preflight.add_argument(
+        "--active-project",
+        help="Override active project for tests/dry probes; normally read from gcloud config",
+    )
+    gcp_preflight.add_argument(
+        "--check-auth",
+        action="store_true",
+        help="Also verify user and ADC token refresh without printing tokens",
+    )
+    gcp_preflight.add_argument("--json", action="store_true", help="Print JSON result")
+
+    gcp_scope = gcp_subparsers.add_parser(
+        "scope",
+        help="Print gcloud args with locked --project/--region appended; does not execute",
+    )
+    gcp_scope.add_argument("--product", required=True, help="Sinria product key, e.g. medspot or medevidence")
+    gcp_scope.add_argument("--lock-file", help="Explicit project-lock YAML path")
+    gcp_scope.add_argument("--cwd", help="Repo/workdir used to discover .sinria/project-lock.yaml")
+    gcp_scope.add_argument("--json", action="store_true", help="Print JSON result")
+    gcp_scope.add_argument("gcloud_args", nargs=argparse.REMAINDER, help="gcloud args after --")
+    gcp_parser.set_defaults(func=cmd_gcp)
 
     # =========================================================================
     # cron command
@@ -12339,7 +12395,7 @@ def main():
         action="store_true",
         help=(
             f"Expose the in-browser Chat tab (embedded `{_cli_command_name()} --tui` via PTY/WebSocket). "
-            "Alternatively set HERMES_DASHBOARD_TUI=1."
+            "Alternatively set SINRIA_DASHBOARD_TUI=1."
         ),
     )
     dashboard_parser.add_argument(
@@ -12600,7 +12656,9 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, int) and not isinstance(result, bool):
+            sys.exit(result)
     else:
         parser.print_help()
 

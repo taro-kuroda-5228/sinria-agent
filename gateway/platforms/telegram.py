@@ -2836,7 +2836,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     # is cleared by something else.
                     try:
                         from tools.clarify_gateway import mark_awaiting_text
-                        mark_awaiting_text(clarify_id)
+                        marked = mark_awaiting_text(
+                            clarify_id,
+                            requester_user_id=caller_id,
+                        )
+                        if not marked:
+                            await query.answer(
+                                text="Only the requesting user can answer this prompt."
+                            )
+                            return
                     except Exception as exc:
                         logger.warning("[%s] mark_awaiting_text failed: %s", self.name, exc)
 
@@ -2862,9 +2870,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # clarify primitive.  Fall back to the index if the entry
                 # has been cleaned up (race with timeout / session reset).
                 resolved_text: Optional[str] = None
+                entry_exists = False
                 try:
                     from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                     entry = _clarify_entries.get(clarify_id)
+                    entry_exists = entry is not None
                     if entry and entry.choices and 0 <= idx < len(entry.choices):
                         resolved_text = entry.choices[idx]
                 except Exception:
@@ -2876,15 +2886,24 @@ class TelegramAdapter(BasePlatformAdapter):
                     # rather than nothing.
                     resolved_text = f"choice {idx + 1}"
 
-                # Pop state and resolve
-                self._clarify_state.pop(clarify_id, None)
+                # Resolve first; only the requesting user may consume the state.
                 try:
                     from tools.clarify_gateway import resolve_gateway_clarify
-                    resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                    resolved = resolve_gateway_clarify(
+                        clarify_id,
+                        resolved_text,
+                        requester_user_id=caller_id,
+                    )
                 except Exception as exc:
                     logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
                     resolved = False
 
+                if not resolved and entry_exists:
+                    await query.answer(
+                        text="Only the requesting user can answer this prompt."
+                    )
+                    return
+                self._clarify_state.pop(clarify_id, None)
                 await query.answer(text=f"✓ {resolved_text[:60]}")
                 try:
                     await query.edit_message_text(
