@@ -46,6 +46,8 @@ Some internals still retain Hermes-derived module names for compatibility while 
 
 ## Quick start for Kikuchi / collaborators
 
+The rolling `main` channel follows the latest reviewed GitHub commit. Versioned builds are published through GitHub Releases; use `sinria update --check` to check whether an update is available.
+
 > Recommended first path on macOS or Linux: clone the repo, run setup, then start Sinria locally.
 
 ```bash
