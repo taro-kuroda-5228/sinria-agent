@@ -96,10 +96,14 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
         '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
         encoding="utf-8",
     )
+    chart_file = tmp_path / "deploy" / "helm" / "sinria-local" / "Chart.yaml"
+    chart_file.parent.mkdir(parents=True)
+    chart_file.write_text('version: 0.1.0\nappVersion: "0.13.0"\n', encoding="utf-8")
 
     module = _load_release_module(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
     monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
+    monkeypatch.setattr(module, "HELM_CHART_FILE", chart_file)
 
     module.update_version_files("0.14.0", "2026-05-21")
 
@@ -111,3 +115,4 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     )
     assert manifest["version"] == "0.14.0"
     assert manifest["distribution"]["uvx"]["package"] == "sinria-agent[acp]==0.14.0"
+    assert 'appVersion: "0.14.0"' in chart_file.read_text(encoding="utf-8")
