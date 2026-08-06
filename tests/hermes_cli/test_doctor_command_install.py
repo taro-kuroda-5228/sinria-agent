@@ -168,6 +168,7 @@ class TestDoctorCommandInstallation:
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
         monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "missing" / "bin" / "python"))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         fake_model_tools = types.SimpleNamespace(

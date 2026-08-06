@@ -3,4 +3,4 @@ name: sinria-local
 description: On-prem Sinria Hybrid Agent Bridge runtime for k3s/Kubernetes
 type: application
 version: 0.1.0
-appVersion: "0.14.0"
+appVersion: "0.14.3"

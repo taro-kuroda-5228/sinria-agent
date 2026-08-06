@@ -984,7 +984,14 @@ def run_doctor(args):
         # Determine the venv entry point location
         _cli_name = _cli_command_name()
         _venv_bin = None
+        # Wheel/uv installs can live outside the source checkout. In that case
+        # the console script is next to the active Python executable.
+        _runtime_candidate = Path(sys.executable).parent / _cli_name
+        if _runtime_candidate.exists():
+            _venv_bin = _runtime_candidate
         for _venv_name in ("venv", ".venv"):
+            if _venv_bin is not None:
+                break
             _candidate = PROJECT_ROOT / _venv_name / "bin" / _cli_name
             if _candidate.exists():
                 _venv_bin = _candidate
@@ -1011,7 +1018,11 @@ def run_doctor(args):
                 f"Reinstall entry point: cd {PROJECT_ROOT} && source venv/bin/activate && pip install -e '.[all]'"
             )
         else:
-            check_ok(f"Venv entry point exists ({_venv_bin.relative_to(PROJECT_ROOT)})")
+            try:
+                _entry_display = _venv_bin.relative_to(PROJECT_ROOT)
+            except ValueError:
+                _entry_display = _venv_bin
+            check_ok(f"Venv entry point exists ({_entry_display})")
 
             # Check the symlink at the command link location
             if _cmd_link.is_symlink():
