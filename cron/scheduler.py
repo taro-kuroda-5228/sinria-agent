@@ -997,6 +997,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         and _cron_action_required(job, text_to_send)
                     ):
                         from cron.action_runtime import CronActionState, CronActionStore
+                        from hermes_cli.profiles import get_active_profile_name
 
                         action_sender = getattr(runtime_adapter, "send_cron_action")
                         action_id = str(uuid.uuid4())
@@ -1007,7 +1008,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         try:
                             proposed = action_store.create(
                                 action_id=action_id,
-                                profile="default",
+                                profile=get_active_profile_name(),
                                 payload={
                                     "action_type": "continue_cron_run",
                                     "job_id": str(job.get("id") or ""),

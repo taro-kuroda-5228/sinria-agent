@@ -754,9 +754,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             allowed_role_ids=adapter_self._allowed_role_ids,
                         ))
                         from cron.action_runtime import CronActionState, CronActionStore
+                        from hermes_cli.profiles import get_active_profile_name
+
                         adapter_self._cron_action_store = CronActionStore()
+                        active_profile = get_active_profile_name()
                         pending = adapter_self._cron_action_store.list_actions(
-                            states={CronActionState.AWAITING_DECISION}
+                            states={CronActionState.AWAITING_DECISION},
+                            profile=active_profile,
                         )
                         for pending_action in pending:
                             client.add_view(CronActionView(
@@ -771,7 +775,8 @@ class DiscordAdapter(BasePlatformAdapter):
                                 action_store=adapter_self._cron_action_store,
                             ))
                         recoverable = adapter_self._cron_action_store.list_actions(
-                            states={CronActionState.APPROVED, CronActionState.VERIFYING}
+                            states={CronActionState.APPROVED, CronActionState.VERIFYING},
+                            profile=active_profile,
                         )
                         for recoverable_action in recoverable:
                             target = recoverable_action.payload.get("target") or {}
@@ -1619,6 +1624,53 @@ class DiscordAdapter(BasePlatformAdapter):
 
             view.message = last_message
             final_message_id = message_ids[-1]
+            action_id = str(action_context.get("action_id") or "")
+            if action_id:
+                from cron.action_runtime import CronActionStore
+
+                store = getattr(self, "_cron_action_store", None)
+                owns_store = store is None
+                if store is None:
+                    store = CronActionStore()
+                try:
+                    updated = store.update_payload(
+                        action_id,
+                        {
+                            "delivery": {
+                                "platform": "discord",
+                                "chat_id": str(chat_id),
+                                "thread_id": str((metadata or {}).get("thread_id") or ""),
+                                "message_id": final_message_id,
+                            }
+                        },
+                        expected_version=int(action_context["version"]),
+                    )
+                    view.version = updated.version
+                    action_context["version"] = updated.version
+                    view.action_version = updated.version
+                    view.action_context["version"] = updated.version
+                    for item in view.children:
+                        custom_id = str(getattr(item, "custom_id", ""))
+                        if not custom_id.startswith(
+                            f"sinria_cron_action:{action_id}:"
+                        ):
+                            continue
+                        selected_action = custom_id.rsplit(":", 1)[-1]
+                        item.custom_id = (
+                            f"sinria_cron_action:{action_id}:"
+                            f"{updated.version}:{selected_action}"
+                        )
+                    if last_message is not None:
+                        await last_message.edit(view=view)
+                except Exception:
+                    try:
+                        await last_message.edit(view=None)
+                    except Exception:
+                        logger.debug("Could not remove unbound cron action view", exc_info=True)
+                    raise
+                finally:
+                    if owns_store:
+                        store.close()
             for message_id in message_ids:
                 self._cron_action_notifications[message_id] = content
             while len(self._cron_action_notifications) > 256:
@@ -5319,6 +5371,24 @@ if DISCORD_AVAILABLE:
                            f"ジョブ: {payload.get('job_id', '')}")
                 await interaction.response.send_message(details[:1900], ephemeral=True)
                 return
+            delivery = current.payload.get("delivery")
+            if isinstance(delivery, dict) and delivery.get("platform") == "discord":
+                expected_channel = str(
+                    delivery.get("thread_id") or delivery.get("chat_id") or ""
+                )
+                expected_message = str(delivery.get("message_id") or "")
+                actual_channel = str(getattr(interaction, "channel_id", ""))
+                actual_message = str(
+                    getattr(getattr(interaction, "message", None), "id", "")
+                )
+                if (expected_channel and actual_channel != expected_channel) or (
+                    expected_message and actual_message != expected_message
+                ):
+                    await interaction.response.send_message(
+                        "この操作は別のDiscord通知に紐づいています。元の通知から操作してください。",
+                        ephemeral=True,
+                    )
+                    return
             decision = CronActionState.APPROVED if action == "approve" else CronActionState.REJECTED
             try:
                 updated = self.action_store.decide(self.action_id, decision,
