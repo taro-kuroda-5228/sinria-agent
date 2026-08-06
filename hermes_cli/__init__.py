@@ -12,7 +12,7 @@ runtime via ``SINRIA_CLI_NAME`` / ``HERMES_CLI_NAME``.
 import os
 import sys
 
-__version__ = "0.14.4"
+__version__ = "0.14.5"
 __release_date__ = "2026.8.6"
 
 

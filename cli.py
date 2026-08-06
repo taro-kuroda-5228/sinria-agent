@@ -824,9 +824,6 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
-_WORKTREE_REGISTRY_THREAD_LOCK = threading.Lock()
-
-
 def _git_common_dir(repo_root: str | Path) -> Path:
     """Return the shared Git metadata directory for every linked worktree."""
     import subprocess
@@ -867,38 +864,11 @@ def _cli_worktrees_dir(repo_root: str | Path) -> Path:
     return target
 
 
-@contextmanager
 def _worktree_registry_lock(repo_root: str | Path):
-    """Serialize mutations of one repository's shared worktree registry.
+    """Return the shared registry lock used by every worktree entrypoint."""
+    from sinria_workspace_lock import git_worktree_registry_lock
 
-    The lock lives in Git's common metadata directory, so clients with different
-    ``SINRIA_HOME`` or ``SINRIA_CLI_WORKTREE_ROOT`` values still coordinate.
-    """
-    lock_path = _git_common_dir(repo_root) / "sinria-worktree-registry.lock"
-    with _WORKTREE_REGISTRY_THREAD_LOCK:
-        with lock_path.open("a+b") as handle:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return git_worktree_registry_lock(repo_root)
 
 
 def _setup_worktree(repo_root: str = None) -> Optional[Dict[str, str]]:

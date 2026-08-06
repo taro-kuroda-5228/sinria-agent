@@ -180,14 +180,25 @@ class CronActionStore:
             raise KeyError(action_id)
         return self._action(row)
 
-    def list_actions(self, *, states: set[CronActionState] | None = None) -> list[CronAction]:
-        """Return durable actions in creation order, optionally filtered by state."""
+    def list_actions(
+        self,
+        *,
+        states: set[CronActionState] | None = None,
+        profile: str | None = None,
+    ) -> list[CronAction]:
+        """Return durable actions in creation order with optional isolation filters."""
+        clauses: list[str] = []
         params: tuple[Any, ...] = ()
         sql = "SELECT * FROM cron_action_actions"
         if states:
             values = tuple(sorted(state.value for state in states))
-            sql += f" WHERE state IN ({','.join('?' for _ in values)})"
+            clauses.append(f"state IN ({','.join('?' for _ in values)})")
             params = values
+        if profile is not None:
+            clauses.append("profile=?")
+            params += (profile,)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at, action_id"
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()

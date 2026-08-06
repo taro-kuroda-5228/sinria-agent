@@ -7,14 +7,14 @@ a crashed or restarted gateway must never delete uncommitted agent work.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
 import subprocess
 import threading
-from typing import Iterator
+
+from sinria_workspace_lock import git_worktree_registry_lock
 
 
 class WorkspaceLeaseError(RuntimeError):
@@ -238,27 +238,9 @@ class GitWorkspaceLeaseManager:
         )
         return proc.returncode == 0
 
-    @contextmanager
-    def _filesystem_lock(self) -> Iterator[None]:
-        """Serialize lease mutations across gateway processes when possible."""
-        lock_path = self.leases_root / ".lease.lock"
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            try:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except ImportError:  # pragma: no cover - thread lock remains on Windows
-                pass
-            yield
-        finally:
-            try:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except ImportError:  # pragma: no cover
-                pass
-            os.close(fd)
+    def _filesystem_lock(self):
+        """Serialize Git registry mutations with CLI and bootstrap processes."""
+        return git_worktree_registry_lock(self.repo_root)
 
 
 def workspace_manager_from_config(
