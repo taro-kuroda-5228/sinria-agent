@@ -72,20 +72,25 @@ ADAPTIVE_EFFORT_MAP = {
 
 # Models that accept the "xhigh" output_config.effort level.  Opus 4.7 added
 # xhigh as a distinct level between high and max; older adaptive-thinking
-# models (4.6) reject it with a 400.  Claude Fable 5 follows the 4.7+
-# adaptive-thinking contract.  Keep this substring list in sync with the
+# models (4.6) reject it with a 400.  Opus 4.8 and Claude Fable 5 follow the
+# 4.7+ adaptive-thinking contract.  Keep this substring list in sync with the
 # Anthropic migration guide as new model families ship.
-_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "fable-5")
+_XHIGH_EFFORT_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8", "fable-5")
 
 # Models where extended thinking is deprecated/removed (4.6+ behavior: adaptive
-# is the only supported mode; 4.7 additionally forbids manual thinking entirely
+# is the only supported mode; 4.7+ additionally forbids manual thinking entirely
 # and drops temperature/top_p/top_k).
-_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "fable-5")
+_ADAPTIVE_THINKING_SUBSTRINGS = ("4-6", "4.6", "4-7", "4.7", "4-8", "4.8", "fable-5")
 
 # Models where temperature/top_p/top_k return 400 if set to non-default values.
-# This is the Opus 4.7 contract; future 4.x+ models are expected to follow it.
-_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "fable-5")
-_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
+# This is the Opus 4.7+ contract (4.8 keeps the same request surface).
+_NO_SAMPLING_PARAMS_SUBSTRINGS = ("4-7", "4.7", "4-8", "4.8", "fable-5")
+# Fast mode (speed="fast") per current Anthropic docs: Opus 4.8 is the
+# durable fast-capable tier and Opus 4.7 still accepts it (deprecated,
+# removal announced for ~2026-07-25). Opus 4.6 fast has been retired —
+# sending speed:"fast" to 4.6 now 400s, so it is no longer allow-listed.
+# Fable 5 / Sonnet / Haiku never supported fast mode.
+_FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-7", "opus-4.7", "opus-4-8", "opus-4.8")
 
 # ── Max output token limits per Anthropic model ───────────────────────
 # Source: Anthropic docs + Cline model catalog.  Anthropic's API requires
@@ -94,6 +99,8 @@ _FAST_MODE_SUPPORTED_SUBSTRINGS = ("opus-4-6", "opus-4.6")
 _ANTHROPIC_OUTPUT_LIMITS = {
     # Claude Fable 5
     "claude-fable-5": 128_000,
+    # Claude 4.8
+    "claude-opus-4-8":   128_000,
     # Claude 4.7
     "claude-opus-4-7":   128_000,
     # Claude 4.6
@@ -234,10 +241,11 @@ def _forbids_sampling_params(model: str) -> bool:
 def _supports_fast_mode(model: str) -> bool:
     """Return True for models that support Anthropic Fast Mode (speed=fast).
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    Per current Anthropic docs, fast mode is supported on Opus 4.8 (durable)
+    and Opus 4.7 (deprecated). Sending ``speed: "fast"`` to any other Claude
+    model — including retired Opus 4.6 fast and Fable 5 — returns HTTP 400.
+    This guard prevents silently 400'ing when stale config or older callers
+    leave fast mode enabled across a model upgrade.
     """
     return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
 
@@ -2101,10 +2109,11 @@ def build_anthropic_kwargs(
         for _sampling_key in ("temperature", "top_p", "top_k"):
             kwargs.pop(_sampling_key, None)
 
-    # ── Fast mode (Opus 4.6 only) ────────────────────────────────────
+    # ── Fast mode (Opus 4.8 / 4.7 only) ──────────────────────────────
     # Adds extra_body.speed="fast" + the fast-mode beta header for ~2.5x
-    # output speed. Per Anthropic docs, fast mode is only supported on
-    # Opus 4.6 — Opus 4.7 and other models 400 on the speed parameter.
+    # output speed. Per current Anthropic docs, fast mode is supported on
+    # Opus 4.8 (durable) and Opus 4.7 (deprecated) — other models 400 on
+    # the speed parameter.
     # Only for native Anthropic endpoints — third-party providers would
     # reject the unknown beta header and speed parameter.
     if (

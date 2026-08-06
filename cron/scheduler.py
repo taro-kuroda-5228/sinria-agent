@@ -11,12 +11,15 @@ runs at a time if multiple processes overlap.
 import asyncio
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -27,6 +30,7 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -84,6 +88,53 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+def _resolve_cron_model_provider(
+    job: dict,
+    cfg: dict,
+    env_model: str = "",
+) -> tuple[str, str | None]:
+    """Resolve the model/provider pair for an agent-driven cron job.
+
+    Cron jobs are task workers, not the interactive commander. If a job does
+    not pin a model, prefer ``cron.default_model`` over the interactive
+    ``model.default`` so setting the main Sinria model to an expensive command
+    model does not silently make every cron job expensive too.
+
+    Precedence:
+    1. Per-job ``model`` / ``provider``.
+    2. ``cron.default_model`` / ``cron.default_provider``.
+    3. Explicit environment model override (legacy ``HERMES_MODEL`` support).
+    4. Interactive ``model.default`` / ``model.provider`` fallback.
+    """
+
+    def _clean(value: object) -> str:
+        return str(value or "").strip()
+
+    cfg = cfg if isinstance(cfg, dict) else {}
+    cron_cfg_raw = cfg.get("cron", {})
+    cron_cfg = cron_cfg_raw if isinstance(cron_cfg_raw, dict) else {}
+    model_cfg_raw = cfg.get("model", {})
+    model_cfg = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+
+    job_model = _clean(job.get("model")) if isinstance(job, dict) else ""
+    job_provider = _clean(job.get("provider")) if isinstance(job, dict) else ""
+    cron_model = _clean(cron_cfg.get("default_model"))
+    cron_provider = _clean(cron_cfg.get("default_provider"))
+    model_default = _clean(
+        model_cfg_raw if isinstance(model_cfg_raw, str) else model_cfg.get("default") or model_cfg.get("model")
+    )
+    model_provider = _clean(model_cfg.get("provider"))
+
+    if job_model:
+        return job_model, job_provider or cron_provider or model_provider or None
+    if cron_model:
+        return cron_model, job_provider or cron_provider or model_provider or None
+    if _clean(env_model):
+        return _clean(env_model), job_provider or model_provider or cron_provider or None
+    return model_default, job_provider or model_provider or cron_provider or None
+
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -486,6 +537,333 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _format_actionable_delivery(content: str) -> str:
+    """Put the human decision ahead of cron scheduler metadata.
+
+    Job names, IDs, and lifecycle instructions remain available through the
+    cron tools; they are implementation details and must not bury the result
+    that needs the user's attention.
+    """
+    issue = str(content or "").strip() or "結果の本文がありません。"
+    return (
+        f"**問題**\n{issue}\n\n"
+        "**影響**\n"
+        "この通知だけでは追加の変更・外部送信・削除は実行されません。\n\n"
+        "**必要判断**\n"
+        "「承認して進める」「却下」「詳細」のいずれかを選んでください。"
+        "Discordではボタン、この通知への返信でも選択できます。"
+    )
+
+
+def _cron_delivery_needs_decision(job: dict, content: str) -> bool:
+    """Return whether a cron delivery is an explicit approve/reject gate.
+
+    Generic reports and free-text questions must not receive binary decision
+    controls. Producers can set ``approval_buttons`` to a boolean when they
+    know the interaction contract; otherwise conservative markers identify
+    only explicit approval waits or requests.
+    """
+    override = job.get("approval_buttons")
+    if isinstance(override, bool):
+        return override
+
+    text = str(content or "").casefold()
+    non_decision_markers = (
+        "承認待ち: 0",
+        "承認待ち：0",
+        "承認待ち 0",
+        "承認待ち0",
+        "承認待ちなし",
+        "waiting_approval: false",
+        "waiting_approval=false",
+        "waiting_approval: 0",
+        "waiting_approval=0",
+        "approval required: false",
+        "approval required: no",
+        "no approval required",
+    )
+    if any(marker in text for marker in non_decision_markers):
+        return False
+
+    approval_wait_markers = (
+        "承認待ち",
+        "承認が必要",
+        "承認をお願いします",
+        "承認してください",
+        "awaiting_approval",
+        "waiting_approval",
+        "awaiting approval",
+        "waiting approval",
+        "approval required",
+        "requires approval",
+    )
+    if any(marker in text for marker in approval_wait_markers):
+        return True
+
+    decision_pair_markers = (
+        "承認または却下",
+        "承認・却下",
+        "承認/却下",
+        "承認 / 却下",
+        "承認して進める / 却下",
+        "承認して進める/却下",
+        "approve or reject",
+        "approve/reject",
+        "approve / reject",
+    )
+    request_markers = (
+        "してください",
+        "選んでください",
+        "選択してください",
+        "を選択",
+        "必要判断",
+        "required decision",
+        "please ",
+        "choose ",
+        "select ",
+    )
+    return (
+        any(marker in text for marker in decision_pair_markers)
+        and any(marker in text for marker in request_markers)
+    )
+
+
+def _cron_action_required(job: dict, content: str) -> bool:
+    """Return true only for typed producer intent; never infer authority from text."""
+    for key in (
+        "decision_required",
+        "requires_decision",
+        "action_required",
+        "requires_approval",
+    ):
+        if key in job:
+            return bool(job[key])
+    # Natural-language markers are presentation-only compatibility hints. They
+    # must never create an executable action or grant continuation authority.
+    return False
+
+
+def _mark_cron_action_delivery_failed(action_id: str) -> None:
+    """Make an undelivered decision request terminal instead of orphaning it."""
+    from cron.action_runtime import CronActionState, CronActionStore
+
+    store = CronActionStore()
+    try:
+        action = store.get(action_id)
+        if action.state is CronActionState.AWAITING_DECISION:
+            store.transition(
+                action_id,
+                CronActionState.FAILED,
+                expected_version=action.version,
+                actor_id="cron_scheduler_delivery",
+            )
+    except Exception:
+        logger.exception("Failed to finalize undelivered cron action %s", action_id)
+    finally:
+        store.close()
+
+
+_CRON_NOTIFICATION_PREFIXES = ("ℹ️ **", "🔴 **", "✅ **", "🔐 **", "🟡 **")
+_FAILURE_REMINDER_SECONDS = 6 * 60 * 60
+
+
+def _notification_fingerprint(value: str) -> str:
+    """Return a non-reversible key for deduplicating confidential result text."""
+    normalized = " ".join(str(value or "").split()).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_notification_time(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _cron_title(job: dict) -> str:
+    return str(job.get("name") or "").strip() or "定期タスクの実行結果"
+
+
+def _parse_legacy_cron_report(content: str) -> dict[str, str] | None:
+    """Parse the former five-line contract so delivery can progressively disclose it."""
+    prefixes = {
+        "title": "**何の報告**: ",
+        "status": "**判定**: ",
+        "problem": "**問題**: ",
+        "numbers": "**数値の解釈**: ",
+        "next": "**次に行うこと**: ",
+    }
+    lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
+    if len(lines) != len(prefixes):
+        return None
+    parsed: dict[str, str] = {}
+    for line, (key, prefix) in zip(lines, prefixes.items()):
+        if not line.startswith(prefix):
+            return None
+        parsed[key] = line[len(prefix):].strip()
+    return parsed
+
+
+def _compact_cron_content(job: dict, content: str) -> str:
+    """Add a scan-friendly heading while preserving the producer's full body."""
+    raw = str(content or "").strip()
+    if not raw or raw.startswith(_CRON_NOTIFICATION_PREFIXES):
+        return raw
+    legacy = _parse_legacy_cron_report(raw)
+    if legacy:
+        title = legacy["title"] or _cron_title(job)
+        body = [legacy["problem"]]
+        if legacy["numbers"] and legacy["numbers"] != "対象数値なし":
+            body.append(legacy["numbers"])
+        body.append(legacy["next"])
+        if _cron_action_required(job, raw):
+            body.append("未承認の操作は実行しません")
+            return f"🔐 **{title} — 承認が必要**\n" + "\n".join(body)
+        if legacy["status"].startswith("🔴"):
+            return f"🔴 **{title} — 対応が必要**\n" + "\n".join(body)
+        if legacy["status"].startswith("🟡"):
+            return f"🟡 **{title} — 確認が必要**\n" + "\n".join(body)
+        return f"✅ **{title}**\n" + "\n".join(body)
+    title = _cron_title(job)
+    if _cron_action_required(job, raw):
+        return f"🔐 **{title} — 承認が必要**\n{raw}\n未承認の操作は実行しません"
+    folded = " ".join(raw.casefold().split())
+    harmless = (
+        "no errors", "0 errors", "error 0", "エラー0件", "エラーはありません",
+        "失敗0件", "失敗はありません", "異常なし", "異常はありません",
+        "問題なし", "問題はありません",
+    )
+    failure_terms = (
+        "error", "failed", "failure", "exception", "blocked", "timeout",
+        "timed out", "エラー", "失敗", "ブロック", "タイムアウト",
+    )
+    if any(term in folded for term in failure_terms) and not any(term in folded for term in harmless):
+        return f"🔴 **{title} — 対応が必要**\n{raw}"
+    return f"ℹ️ **{title}**\n{raw}"
+
+
+def _plan_cron_notification(
+    job: dict,
+    *,
+    success: bool,
+    content: str,
+    error: str | None,
+    now: datetime | None = None,
+) -> dict:
+    """Plan one user-facing cron event and its persisted notification state.
+
+    First failures, changed failures, recoveries, approvals, and informational
+    reports are delivered. Identical failures are collapsed for six hours so a
+    fast recurring job cannot flood the channel. Only the fingerprint and
+    counters are persisted; raw result/error text never enters jobs.json.
+    """
+    now = now or _hermes_now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now_iso = now.isoformat()
+    previous = job.get("notification_state")
+    if not isinstance(previous, dict):
+        previous = {}
+    title = _cron_title(job)
+
+    if not success:
+        body = " ".join(str(error or content or "原因不明のエラー").split())
+        fingerprint = _notification_fingerprint(body)
+        same_failure = previous.get("kind") == "failure" and previous.get("fingerprint") == fingerprint
+        failure_count = int(previous.get("failure_count") or 0) + 1 if same_failure else 1
+        last_notified = _parse_notification_time(previous.get("last_notified_at"))
+        reminder_due = not last_notified or (now - last_notified).total_seconds() >= _FAILURE_REMINDER_SECONDS
+        deliver = not same_failure or reminder_due
+        first_seen = previous.get("first_seen_at") if same_failure else now_iso
+        state = {
+            "kind": "failure",
+            "fingerprint": fingerprint,
+            "failure_count": failure_count,
+            "first_seen_at": first_seen,
+            "last_notified_at": now_iso if deliver else previous.get("last_notified_at"),
+        }
+        suffix = "自動再試行を継続します" if failure_count == 1 else f"{failure_count}回連続失敗・自動再試行を継続します"
+        return {
+            "deliver": deliver,
+            "kind": "failure",
+            "content": f"🔴 **{title}が失敗**\n{body}\n{suffix}",
+            "state": state,
+        }
+
+    was_failure = previous.get("kind") == "failure" or job.get("last_status") == "error"
+    if was_failure:
+        failure_count = max(1, int(previous.get("failure_count") or 0))
+        recovery_lines = [
+            f"✅ **{title}が復旧**",
+            f"{failure_count}回の失敗後に正常へ戻りました",
+        ]
+        raw_success = str(content or "").strip()
+        if raw_success and SILENT_MARKER.casefold() not in raw_success.casefold():
+            recovery_lines.append(raw_success)
+        return {
+            "deliver": True,
+            "kind": "recovery",
+            "content": "\n".join(recovery_lines),
+            "state": {"kind": "ok", "recovered_at": now_iso},
+        }
+
+    raw = str(content or "").strip()
+    if not raw or SILENT_MARKER.casefold() in raw.casefold():
+        return {"deliver": False, "kind": "silent", "content": "", "state": {"kind": "ok"}}
+
+    kind = "approval" if _cron_action_required(job, raw) else "info"
+    fingerprint = _notification_fingerprint(raw)
+    if kind == "approval":
+        same_approval = previous.get("kind") == "approval" and previous.get("fingerprint") == fingerprint
+        last_notified = _parse_notification_time(previous.get("last_notified_at"))
+        reminder_due = not last_notified or (now - last_notified).total_seconds() >= _FAILURE_REMINDER_SECONDS
+        deliver = not same_approval or reminder_due
+        state = {
+            "kind": kind,
+            "fingerprint": fingerprint,
+            "last_notified_at": now_iso if deliver else previous.get("last_notified_at"),
+        }
+        return {
+            "deliver": deliver,
+            "kind": kind,
+            "content": _compact_cron_content(job, raw),
+            "state": state,
+        }
+    return {
+        "deliver": True,
+        "kind": kind,
+        "content": _compact_cron_content(job, raw),
+        "state": {
+            "kind": kind,
+            "fingerprint": fingerprint,
+            "last_notified_at": now_iso,
+        },
+    }
+
+
+def _finalize_notification_state(job: dict, plan: dict, delivery_error: str | None) -> dict:
+    """Persist a notification as sent only after the platform accepted it."""
+    state = dict(plan.get("state") or {})
+    if not plan.get("deliver") or not delivery_error:
+        return state
+    previous = job.get("notification_state")
+    previous_notified = previous.get("last_notified_at") if isinstance(previous, dict) else None
+    if previous_notified:
+        state["last_notified_at"] = previous_notified
+    else:
+        state.pop("last_notified_at", None)
+    return state
+
+
+def _wrap_cron_response(job: dict, content: str) -> str:
+    """Backward-compatible delivery formatter using the compact UX contract."""
+    return _compact_cron_content(job, content)
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -508,9 +886,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # Optionally wrap the content in the shared human-decision contract.
+    # Wrapping is on by default; set cron.wrap_response: false for raw output.
     wrap_response = True
     try:
         user_cfg = load_config()
@@ -519,15 +896,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         pass
 
     if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+        delivery_content = _format_actionable_delivery(content)
     else:
         delivery_content = content
 
@@ -608,15 +977,98 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
+            durable_action_id = None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
+                    # Inspect the class rather than the instance.  AsyncMock and
+                    # other dynamic proxies fabricate arbitrary attributes, which
+                    # previously made ordinary adapters look actionable and
+                    # silently bypassed their normal ``send`` method.
+                    class_action_sender = getattr(
+                        type(runtime_adapter), "send_cron_action", None
+                    )
+                    if (
+                        platform == Platform.DISCORD
+                        and callable(class_action_sender)
+                        and _cron_action_required(job, text_to_send)
+                    ):
+                        from cron.action_runtime import CronActionState, CronActionStore
+
+                        action_sender = getattr(runtime_adapter, "send_cron_action")
+                        action_id = str(uuid.uuid4())
+                        durable_action_id = action_id
+                        cron_session_id = str(job.get("_last_cron_session_id") or "")
+                        resume_instruction = str(job.get("resume_instruction") or "").strip()[:4000]
+                        action_store = CronActionStore()
+                        try:
+                            proposed = action_store.create(
+                                action_id=action_id,
+                                profile="default",
+                                payload={
+                                    "action_type": "continue_cron_run",
+                                    "job_id": str(job.get("id") or ""),
+                                    "job_name": str(job.get("name") or ""),
+                                    "cron_session_id": cron_session_id,
+                                    "run_id": cron_session_id,
+                                    "resume_instruction": resume_instruction,
+                                    "summary": text_to_send[:500],
+                                    "notification": text_to_send,
+                                    "target": {
+                                        "platform": "discord",
+                                        "chat_id": str(chat_id),
+                                        "thread_id": str(thread_id or ""),
+                                    },
+                                    # One-shot jobs are removed after delivery; retain
+                                    # the local execution snapshot for approved resume.
+                                    "job_snapshot": dict(job),
+                                    "verification_contract": "agent_outcome_and_readback",
+                                },
+                                expires_at=time.time() + (7 * 24 * 60 * 60),
+                                actor_id="cron_scheduler",
+                            )
+                            waiting = action_store.transition(
+                                action_id,
+                                CronActionState.AWAITING_DECISION,
+                                expected_version=proposed.version,
+                                actor_id="cron_scheduler",
+                            )
+                        finally:
+                            action_store.close()
+                        action_context = {
+                            "action_id": waiting.action_id,
+                            "version": waiting.version,
+                            "action_type": "continue_cron_run",
+                            "job_id": str(job.get("id") or ""),
+                            "job_name": str(job.get("name") or ""),
+                            "cron_session_id": cron_session_id,
+                            "run_id": cron_session_id,
+                            "resume_instruction": resume_instruction,
+                            "notification": text_to_send,
+                        }
+                        origin = job.get("origin")
+                        if isinstance(origin, dict) and origin.get("user_id"):
+                            action_context["origin_user_id"] = str(origin["user_id"])
+                        send_coro = action_sender(
+                            chat_id,
+                            text_to_send,
+                            action_context=action_context,
+                            metadata=send_metadata,
+                        )
+                    else:
+                        send_coro = runtime_adapter.send(
+                            chat_id,
+                            text_to_send,
+                            metadata=send_metadata,
+                        )
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        send_coro,
                         loop,
+                        logger=logger,
+                        log_message=f"Job '{job.get('id', '?')}': live adapter scheduling error",
                     )
                     if future is None:
                         adapter_ok = False
@@ -649,7 +1101,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                elif durable_action_id:
+                    _mark_cron_action_delivery_failed(durable_action_id)
             except Exception as e:
+                if durable_action_id:
+                    _mark_cron_action_delivery_failed(durable_action_id)
                 logger.warning(
                     "Job '%s': live adapter delivery to %s:%s failed (%s), falling back to standalone",
                     job["id"], platform_name, chat_id, e,
@@ -729,7 +1185,7 @@ def _get_script_timeout() -> int:
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
-    Scripts must reside within HERMES_HOME/scripts/.  Both relative and
+    Scripts must reside within the active Sinria home ``scripts/`` directory.
     absolute paths are resolved and validated against this directory to
     prevent arbitrary script execution via path traversal or absolute
     path injection.
@@ -753,8 +1209,6 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
-    from hermes_constants import get_hermes_home
-
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
@@ -949,20 +1403,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Context Share v2: scheduled jobs also need the same prior-correction
-    # resolver as chat/gateway sessions so stale prompts do not bypass newer
-    # Sinria policy.  The block is sanitized guidance only; raw/private context
-    # remains local and is not injected into cloud-visible job metadata.
-    try:
-        from agent.context_share.intent_resolver import build_context_resolver_prompt
-        resolver_block = build_context_resolver_prompt(prompt, platform="cron")
-        if resolver_block:
-            prompt = f"{resolver_block}\n\n{prompt}"
-    except Exception as exc:
-        from agent.context_share.intent_resolver import build_context_resolver_fallback_prompt
-        logger.warning("Cron job: Context Share Resolver failed; injecting fail-closed defaults: %s", exc)
-        prompt = f"{build_context_resolver_fallback_prompt(str(exc))}\n\n{prompt}"
-
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
     cron_hint = (
@@ -1056,7 +1496,39 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict) -> str:
     return assembled
 
 
-def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+def _merge_script_execution_outcome(
+    job: dict,
+    *,
+    agent_success: bool,
+    agent_error: Optional[str],
+    prerun_script: Optional[tuple[bool, str]],
+) -> tuple[bool, Optional[str]]:
+    """Keep script, agent, and overall cron outcomes distinct.
+
+    A notification agent can successfully explain a failed pre-run script. That
+    must not turn the underlying job execution into a success.
+    """
+    job["_last_agent_status"] = "ok" if agent_success else "error"
+    if prerun_script is None:
+        job["_last_script_status"] = "not_configured"
+        job["_last_script_error"] = None
+        return agent_success, agent_error
+
+    script_success, script_output = prerun_script
+    job["_last_script_status"] = "ok" if script_success else "error"
+    job["_last_script_error"] = None if script_success else script_output
+    if not script_success:
+        return False, script_output or "Pre-run script failed without output"
+    return agent_success, agent_error
+
+
+def run_job(
+    job: dict,
+    *,
+    resume_session_id: str | None = None,
+    continuation_prompt: str | None = None,
+    skip_delivery: bool = False,
+) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
     
@@ -1084,6 +1556,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
+    if job.get("no_agent") and continuation_prompt:
+        return False, "", "", "no_agent cron jobs cannot resume an agent session"
     if job.get("no_agent"):
         script_path = job.get("script")
         if not script_path:
@@ -1105,6 +1579,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         try:
             ok, output = _run_job_script(script_path)
+            job["_last_script_status"] = "ok" if ok else "error"
+            job["_last_script_error"] = None if ok else output
+            job["_last_agent_status"] = "skipped"
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1192,10 +1669,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the script is only executed once.
     prerun_script = None
     script_path = job.get("script")
-    if script_path:
+    if script_path and continuation_prompt is None:
         prerun_script = _run_job_script(script_path)
         _ran_ok, _script_output = prerun_script
+        job["_last_script_status"] = "ok" if _ran_ok else "error"
+        job["_last_script_error"] = None if _ran_ok else _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
+            job["_last_agent_status"] = "skipped"
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
                 job_name, job_id,
@@ -1209,7 +1689,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             return True, silent_doc, SILENT_MARKER, None
 
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        prompt = (
+            continuation_prompt
+            if continuation_prompt is not None
+            else _build_job_prompt(job, prerun_script=prerun_script)
+        )
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -1237,7 +1721,28 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = resume_session_id or f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # Bind any later human action to the exact cron conversation that proposed it.
+    job["_last_cron_session_id"] = _cron_session_id
+    _conversation_history: list[dict] = []
+    if resume_session_id:
+        if _session_db is None:
+            return False, "", "", "source cron session store is unavailable"
+        try:
+            _conversation_history = _session_db.get_messages_as_conversation(
+                resume_session_id,
+                include_ancestors=True,
+            )
+        except Exception as history_exc:
+            logger.warning(
+                "Job '%s': unable to load source cron session %s: %s",
+                job_id,
+                resume_session_id,
+                history_exc,
+            )
+            return False, "", "", "source cron session could not be loaded"
+        if not _conversation_history:
+            return False, "", "", "source cron session has no conversation history"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1330,10 +1835,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 else str(delivery_target["thread_id"])
             )
 
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
-
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
-        _cfg = {}
+        _cfg: dict = {}
         try:
             import yaml
             _cfg_path = str(_get_hermes_home() / "config.yaml")
@@ -1341,14 +1844,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
                 _cfg = _expand_env_vars(_cfg)
-                _model_cfg = _cfg.get("model", {})
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
+                if not isinstance(_cfg, dict):
+                    _cfg = {}
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+        model, requested_provider = _resolve_cron_model_provider(
+            job,
+            _cfg,
+            env_model=os.getenv("HERMES_CRON_MODEL") or os.getenv("HERMES_MODEL") or "",
+        )
 
         # Apply IPv4 preference if configured.
         try:
@@ -1399,7 +1904,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
             runtime_kwargs = {
-                "requested": job.get("provider"),
+                "requested": requested_provider,
             }
             if job.get("base_url"):
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
@@ -1501,6 +2006,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        # Stable, metadata-only cohort key: lets the architecture reviewer
+        # compare the same cron workload across old and future models without
+        # persisting the job name, prompt, or outputs.
+        setattr(agent, "_efficiency_workload_ref", f"cron:{job_id}")
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -1529,7 +2038,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        if resume_session_id:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+                conversation_history=_conversation_history,
+            )
+        else:
+            _cron_future = _cron_pool.submit(
+                _cron_context.run,
+                agent.run_conversation,
+                prompt,
+            )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -1603,7 +2124,25 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
-        if result.get("failed") is True or result.get("completed") is False:
+        #
+        # Exception: `completed=False` alone is NOT a failure marker. The
+        # conversation loop also sets it when the iteration budget runs out
+        # while the summary call succeeds — that path carries no failure
+        # marker (`failed`/`error`/`interrupted`) and a non-empty summary in
+        # `final_response`, which is the agent's legitimate reply and must be
+        # delivered as a success. (fp-cbdghbeebecfbebj)
+        _iteration_limit_summary = (
+            result.get("failed") is not True
+            and not result.get("error")
+            and result.get("interrupted") is not True
+            and bool((result.get("final_response") or "").strip())
+            and str(result.get("turn_exit_reason") or "").startswith(
+                "max_iterations_reached"
+            )
+        )
+        if not _iteration_limit_summary and (
+            result.get("failed") is True or result.get("completed") is False
+        ):
             _err_text = (
                 result.get("error")
                 or (result.get("final_response") or "").strip()
@@ -1634,10 +2173,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {logged_response}
 """
         
-        logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        logger.info("Job '%s' completed agent processing", job_name)
+        overall_success, overall_error = _merge_script_execution_outcome(
+            job,
+            agent_success=True,
+            agent_error=None,
+            prerun_script=prerun_script,
+        )
+        return overall_success, output, final_response, overall_error
         
     except Exception as e:
+        job["_last_agent_status"] = "error"
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
@@ -1784,23 +2330,6 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
-                # Deliver the final response to the origin/target chat.
-                # If the agent responded with [SILENT], skip delivery (but
-                # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
-                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                    should_deliver = False
-
-                delivery_error = None
-                if should_deliver:
-                    try:
-                        delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                    except Exception as de:
-                        delivery_error = str(de)
-                        logger.error("Delivery failed for job %s: %s", job["id"], de)
-
                 # Treat empty final_response as a soft failure so last_status
                 # is not "ok" — the agent ran but produced nothing useful.
                 # (issue #8585)
@@ -1808,7 +2337,39 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                notification = _plan_cron_notification(
+                    job,
+                    success=success,
+                    content=final_response,
+                    error=error,
+                )
+                delivery_error = None
+                if notification["deliver"]:
+                    try:
+                        delivery_error = _deliver_result(
+                            job,
+                            notification["content"],
+                            adapters=adapters,
+                            loop=loop,
+                        )
+                    except Exception as de:
+                        delivery_error = str(de)
+                        logger.error("Delivery failed for job %s: %s", job["id"], de)
+                elif notification["kind"] == "silent":
+                    logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                elif notification["kind"] == "failure":
+                    logger.info("Job '%s': duplicate failure collapsed", job["id"])
+
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    notification_state=_finalize_notification_state(job, notification, delivery_error),
+                    script_status=job.get("_last_script_status"),
+                    script_error=job.get("_last_script_error"),
+                    agent_status=job.get("_last_agent_status"),
+                )
                 return True
 
             except Exception as e:

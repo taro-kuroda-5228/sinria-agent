@@ -7,7 +7,7 @@ const config: Config = {
   tagline: "Medical Horizon's independent AI agent platform for healthcare institutions",
   favicon: 'img/favicon.ico',
 
-  url: 'https://medical-horizon.github.io',
+  url: 'https://taro-kuroda-5228.github.io',
   baseUrl: '/sinria-agent/docs/',
 
   organizationName: 'Medical-Horizon',

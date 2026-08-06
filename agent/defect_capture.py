@@ -2,7 +2,7 @@
 
 Runtime exceptions currently vanish into plain-text ``logs/errors.log`` where
 the self-improvement loop cannot see them. This module records sanitized,
-structured DefectRecord events into ``SINRIA_HOME/context_share/code_defects.jsonl``
+structured DefectRecord events into ``SINRIA_HOME/repair/code_defects.jsonl``
 — the same metadata-only surface as outcome_gap / routing_signals — so recurring
 code defects become measurable (and, in later phases, repairable).
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -27,23 +28,32 @@ from pathlib import Path
 from typing import Any, Literal
 
 from hermes_constants import get_sinria_home
+from agent.repair.storage import append_private_text
 
-from agent.context_share.safety import (
+from agent.privacy.sanitization import (
     assert_safe_identifier,
     assert_sanitized_text,
     contains_sensitive_text,
 )
 
-CODE_DEFECTS_RELATIVE_PATH = Path("context_share") / "code_defects.jsonl"
+CODE_DEFECTS_RELATIVE_PATH = Path("repair") / "code_defects.jsonl"
 
-DefectKind = Literal["unhandled_exception", "tool_error_result"]
+DefectKind = Literal["unhandled_exception", "tool_error_result", "app_signal", "workflow_gap"]
 Severity = Literal["high", "medium", "low"]
+
+_VALID_SEVERITIES = ("high", "medium", "low")
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Transient-looking exception classes: still recorded (the observation report
 # measures the noise ratio) but flagged so triage can discount them.
+# The aiohttp/socket family was added from live Phase 1 observation
+# (2026-07-07): gateway DNS blips dominated the first telemetry window and
+# must never become repair tickets.
 _TRANSIENT_EXC_NAMES = frozenset({
+    # User-initiated CLI cancellation is expected control flow, not a code
+    # repair candidate. Keep the event for observability but discount it.
+    "KeyboardInterrupt",
     "TimeoutError",
     "ConnectionError",
     "ConnectionResetError",
@@ -52,9 +62,28 @@ _TRANSIENT_EXC_NAMES = frozenset({
     "ReadTimeout",
     "ConnectTimeout",
     "RemoteDisconnected",
+    "ClientConnectorError",
+    "ClientConnectorDNSError",
+    "ClientConnectorSSLError",
+    "ClientConnectionError",
+    "ClientOSError",
+    "ServerDisconnectedError",
+    "ServerTimeoutError",
+    "gaierror",
 })
 
 _MESSAGE_MAX_CHARS = 300
+
+
+def is_transient_exc(exc_class: str) -> bool:
+    """True for exception classes classified as transient noise.
+
+    Exposed for the repair intake: stored events keep the flag they were
+    recorded with, so reclassifying a class as transient must also discount
+    the already-recorded events (belt and suspenders against mislabeled
+    history becoming repair tickets).
+    """
+    return exc_class in _TRANSIENT_EXC_NAMES
 
 
 def code_defects_path(home: Path | None = None) -> Path:
@@ -133,13 +162,16 @@ class DefectSummary:
     first_seen: str
     last_seen: str
     transient_likely: bool
+    redacted_message: str = ""
+    confirmation_required: bool = False
 
 
 def append_defect_record(record: DefectRecord, *, path: Path | None = None) -> Path:
     target = path or code_defects_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+    append_private_text(
+        target,
+        json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True) + "\n",
+    )
     return target
 
 
@@ -148,7 +180,7 @@ def load_defect_summaries(*, path: Path | None = None) -> list[DefectSummary]:
 
     The design schema's occurrence_count/first_seen/last_seen live at this
     aggregate level; the JSONL itself stays append-only like every other
-    context_share store (no upsert-in-place).
+    correction store (no upsert-in-place).
     """
     target = path or code_defects_path()
     if not target.exists():
@@ -180,6 +212,11 @@ def load_defect_summaries(*, path: Path | None = None) -> list[DefectSummary]:
                 first_seen=str(ordered[0].get("timestamp", "")),
                 last_seen=str(last.get("timestamp", "")),
                 transient_likely=bool(last.get("transient_likely", False)),
+                redacted_message=str(last.get("redacted_message", "")),
+                confirmation_required=any(
+                    str(event.get("session_kind", "")) == "user_evidence"
+                    for event in ordered
+                ),
             )
         )
     summaries.sort(key=lambda summary: summary.occurrence_count, reverse=True)
@@ -257,6 +294,175 @@ def record_exception_defect(
     )
     append_defect_record(record, path=path)
     return record
+
+
+def record_external_defect(
+    *,
+    repo: str,
+    exc_class: str,
+    message: str = "",
+    code_location: str = "external:0",
+    func_name: str = "external",
+    severity: str = "medium",
+    session_kind: str = "external_monitor",
+    transient_likely: bool = False,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> DefectRecord:
+    """Record a sanitized defect reported by an app-side monitor (Phase 2).
+
+    This is the cross-app intake of the self-repair loop: nightly eval
+    regressions, health-check failures, and similar external signals enter the
+    same ``code_defects.jsonl`` surface as in-process exceptions, keyed by a
+    stable per-(repo, location, exception-class) fingerprint so recurrence
+    thresholds work identically. Message sanitization is fail-closed; the
+    DefectRecord constructor re-asserts every field.
+    """
+    repo_clean = (repo or "unknown")[:60]
+    exc_clean = (exc_class or "AppSignal")[:80]
+    location = (code_location or "external:0")[:200]
+    ts = (now or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z")
+    # Fingerprint on the location *without* any trailing line/detail component
+    # so repeated reports of the same signal recur onto one fingerprint.
+    location_key = location.rsplit(":", 1)[0] if ":" in location else location
+    fingerprint = build_fingerprint(repo_clean, location_key, func_name or "external", exc_clean)
+    record = DefectRecord(
+        defect_id=f"defect-{_safe_digest(fingerprint + chr(10) + ts)}",
+        fingerprint=fingerprint,
+        timestamp=ts,
+        repo=repo_clean,
+        defect_kind="app_signal",
+        exc_class=exc_clean,
+        redacted_message=sanitize_defect_message(message),
+        code_location=location,
+        logger_name="external",
+        session_kind=(session_kind or "external_monitor")[:40],
+        severity=severity if severity in _VALID_SEVERITIES else "medium",
+        transient_likely=bool(transient_likely),
+    )
+    append_defect_record(record, path=path)
+    return record
+
+
+def record_turn_tool_error_defect(
+    *,
+    tool_name: str,
+    error_class: str,
+    ticket_eligible: bool,
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> DefectRecord:
+    """Record a turn-level tool failure as ``tool_error_result`` telemetry.
+
+    Bridge from the correction outcome loop: tool calls that fail by
+    returning an error result (no exception, no exc_info) were invisible to the
+    repair loop. The (tool, error-class) pair of a gap-detected turn lands here
+    with a stable fingerprint so real-use recurrence flows through the nightly
+    repair intake.
+
+    Fail-closed repo routing: ``ticket_eligible=False`` (default wiring) files
+    under the pseudo-repo ``sinria-turns`` which has no repair contract, so
+    intake can only emit issue proposals — the daily ticket cap and adapter
+    attempts are never consumed without the explicit ``repair.turn_signal_tickets``
+    opt-in.
+    """
+    tool_clean = (tool_name or "unknown")[:60]
+    exc_clean = (error_class or "toolerror")[:80]
+    # Generic tool failures and process exit codes are application/input outcomes,
+    # not evidence that a tool implementation is defective. Their sanitized
+    # signatures lack the exception or command context required for safe
+    # automatic repair, so they stay in the issue-proposal lane even when
+    # turn-signal tickets are enabled.
+    actionable_ticket = ticket_eligible and exc_clean not in {
+        "nonzero_exit",
+        "toolerror",
+    }
+    repo_clean = "sinria" if actionable_ticket else "sinria-turns"
+    location = f"tool:{tool_clean}"
+    ts = (now or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z")
+    fingerprint = build_fingerprint(repo_clean, location, tool_clean, exc_clean)
+    record = DefectRecord(
+        defect_id=f"defect-{_safe_digest(fingerprint + chr(10) + ts)}",
+        fingerprint=fingerprint,
+        timestamp=ts,
+        repo=repo_clean,
+        defect_kind="tool_error_result",
+        exc_class=exc_clean,
+        redacted_message="",
+        code_location=location,
+        logger_name="correction_loop.outcome_gap",
+        session_kind="turn_outcome",
+        severity="low",
+        transient_likely=is_transient_exc(exc_clean),
+    )
+    append_defect_record(record, path=path)
+    return record
+
+
+def record_turn_workflow_gap_defect(
+    *,
+    failure_signature: str,
+    ticket_eligible: bool,
+    repo: str = "sinria",
+    path: Path | None = None,
+    now: datetime | None = None,
+) -> DefectRecord:
+    """Bridge a sanitized non-tool turn exit into repair telemetry."""
+    signature = str(failure_signature or "").strip().lower()
+    if not signature.startswith("exit="):
+        raise ValueError("workflow repair telemetry requires an exit signature")
+    token = re.sub(r"[^a-z0-9_-]+", "_", signature.removeprefix("exit="))[:60].strip("_")
+    if not token:
+        raise ValueError("workflow exit signature is empty")
+    repo_clean = str(repo or "sinria").strip().lower() if ticket_eligible else "sinria-turns"
+    location = "run_agent.py:run_conversation"
+    exc_clean = f"exit_{token}"
+    ts = (now or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z")
+    fingerprint = build_fingerprint(repo_clean, location, "workflow_exit", exc_clean)
+    record = DefectRecord(
+        defect_id=f"defect-{_safe_digest(fingerprint + chr(10) + ts)}",
+        fingerprint=fingerprint,
+        timestamp=ts,
+        repo=repo_clean,
+        defect_kind="workflow_gap",
+        exc_class=exc_clean,
+        redacted_message="",
+        code_location=location,
+        logger_name="correction_loop.outcome_gap",
+        session_kind="turn_outcome",
+        severity="low",
+        transient_likely=False,
+    )
+    append_defect_record(record, path=path)
+    return record
+
+
+def turn_signal_tickets_enabled(config: dict | None = None) -> bool:
+    """``repair.turn_signal_tickets`` opt-in (default False = fail-closed).
+
+    When False, turn-level tool-error defects file under the contract-less
+    pseudo-repo ``sinria-turns`` (issue proposals only). When True, they file
+    under the configured discovery repo (default ``sinria``) and may become
+    repair tickets subject to every existing intake gate (recurrence, caps,
+    risk classes).
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            loaded = load_config()
+            config = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            config = {}
+    if not isinstance(config, dict):
+        return False
+    section = config.get("repair")
+    if not isinstance(section, dict):
+        return False
+    value = section.get("turn_signal_tickets", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 _capture_tls = threading.local()

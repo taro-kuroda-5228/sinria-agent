@@ -203,7 +203,7 @@ stdenv.mkDerivation {
 
   meta = with lib; {
     description = "Sinria confidential-organization AI Agent OS";
-    homepage = "https://github.com/taro-kuroda-5228/sinria-agent";
+    homepage = "https://github.com/taro-kuroda-5228/sinria";
     mainProgram = "sinria";
     license = licenses.mit;
     platforms = platforms.unix;

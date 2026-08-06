@@ -6,7 +6,7 @@ on *verified* failure, not on vibes". This module records the evidence that
 decision needs: whenever a small/medium-tier model ends a practical-action
 turn with a verification or execution gap, a sanitized recommendation row
 (model / provider / tier / cause metadata only — never conversation text)
-is appended to ``context_share/routing_signals.jsonl``.
+is appended to ``repair/routing_signals.jsonl``.
 
 This wave records recommendations only. Automatic mid-turn model switching
 deliberately stays out until the signal data justifies its design.
@@ -26,7 +26,7 @@ _ESCALATION_TIERS = ("small", "medium")
 
 
 def routing_signals_path(home: Optional[Path] = None) -> Path:
-    return (home or get_sinria_home()) / "context_share" / "routing_signals.jsonl"
+    return (home or get_sinria_home()) / "corrections" / "routing_signals.jsonl"
 
 
 def build_routing_signal(

@@ -34,10 +34,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+DELIVERY_FAILED_RESPONSE = "[clarify prompt could not be delivered]"
 
 
 # =========================================================================
@@ -51,6 +54,7 @@ class _ClarifyEntry:
     session_key: str
     question: str
     choices: Optional[List[str]]
+    requester_user_id: Optional[str] = None
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
@@ -80,6 +84,7 @@ def register(
     session_key: str,
     question: str,
     choices: Optional[List[str]],
+    requester_user_id: Optional[str] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -91,6 +96,7 @@ def register(
         session_key=session_key,
         question=question,
         choices=list(choices) if choices else None,
+        requester_user_id=requester_user_id,
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
     )
@@ -98,6 +104,41 @@ def register(
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
     return entry
+
+
+def accept_delivery_or_watch_failure(
+    delivery_future: Future[Any],
+    *,
+    clarify_id: str,
+    observation_timeout: float = 15.0,
+) -> bool:
+    """Preserve a slow clarify interaction and report only definite failure."""
+    def _resolve_late_failure(done: Future[Any]) -> None:
+        try:
+            result = done.result()
+            delivered = bool(getattr(result, "success", False))
+            error = getattr(result, "error", None)
+        except Exception as exc:
+            delivered = False
+            error = exc
+        if delivered:
+            logger.info("Clarify delivery completed after observation timeout (clarify_id=%s)", clarify_id)
+            return
+        logger.warning("Clarify delivery failed after observation timeout (clarify_id=%s): %s", clarify_id, error or "unknown delivery error")
+        resolve_gateway_clarify(clarify_id, DELIVERY_FAILED_RESPONSE)
+
+    try:
+        result = delivery_future.result(timeout=observation_timeout)
+    except FutureTimeoutError:
+        delivery_future.add_done_callback(_resolve_late_failure)
+        return True
+    except Exception as exc:
+        logger.warning("Clarify delivery failed before prompt presentation (clarify_id=%s): %s", clarify_id, exc)
+        return False
+    delivered = bool(getattr(result, "success", False))
+    if not delivered:
+        logger.warning("Clarify delivery rejected before prompt presentation (clarify_id=%s): %s", clarify_id, getattr(result, "error", None) or "unknown delivery error")
+    return delivered
 
 
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
@@ -147,47 +188,68 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 # Public API — gateway / adapter side
 # =========================================================================
 
-def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
+def resolve_gateway_clarify(
+    clarify_id: str,
+    response: str,
+    requester_user_id: Optional[str] = None,
+) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
-    Returns True if an entry was found and resolved, False otherwise
-    (already resolved, expired, or never existed).
+    Returns True if an entry was found, owned by the requester, and resolved.
+    Legacy entries without an owner remain compatible with existing callers.
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set():
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
+        if entry.requester_user_id is not None and (
+            not entry.requester_user_id or entry.requester_user_id != requester_user_id
+        ):
+            return False
+        entry.response = str(response) if response is not None else ""
+        entry.awaiting_text = False
+        entry.event.set()
     return True
 
 
-def get_pending_for_session(session_key: str) -> Optional[_ClarifyEntry]:
-    """Return the OLDEST pending clarify entry for a session, or None.
+def get_pending_for_session(
+    session_key: str,
+    requester_user_id: Optional[str] = None,
+) -> Optional[_ClarifyEntry]:
+    """Return the oldest pending clarify owned by this user, or None.
 
-    Used by the text-fallback intercept in ``_handle_message`` — when a
-    clarify is awaiting a free-form text response, the next user message
-    in that session is captured as the answer.
+    Choice prompts accept direct typed replies too. Requiring the user to
+    click ``Other`` first can strand the agent thread for the full timeout
+    when a natural-language approval arrives through a messaging gateway.
+    In shared sessions, an entry bound to a requester cannot be resolved by
+    another participant's natural-language message.
     """
     with _lock:
         ids = _session_index.get(session_key) or []
         for cid in ids:
             entry = _entries.get(cid)
-            if entry is None:
+            if entry is None or entry.event.is_set():
                 continue
-            if entry.awaiting_text:
-                return entry
+            if entry.requester_user_id is not None and (
+                not entry.requester_user_id or entry.requester_user_id != requester_user_id
+            ):
+                continue
+            return entry
         return None
 
 
-def mark_awaiting_text(clarify_id: str) -> bool:
-    """Flip an entry into text-capture mode (user picked the 'Other' button).
-
-    Returns True if the entry exists and was flipped, False otherwise.
-    """
+def mark_awaiting_text(
+    clarify_id: str,
+    requester_user_id: Optional[str] = None,
+) -> bool:
+    """Switch an entry into free-text capture mode after "Other" is picked."""
     with _lock:
         entry = _entries.get(clarify_id)
         if entry is None:
+            return False
+        if entry.requester_user_id is not None and (
+            not entry.requester_user_id or entry.requester_user_id != requester_user_id
+        ):
             return False
         entry.awaiting_text = True
         return True

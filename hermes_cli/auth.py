@@ -26,6 +26,7 @@ import sys
 import base64
 import hashlib
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -792,25 +793,89 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # Auth Store — persistence layer for the runtime auth store
 # =============================================================================
 
+def _protected_default_auth_paths(home_dir: Path) -> tuple[Path, ...]:
+    """Real-user default auth stores the pytest seat belt must never touch.
+
+    Covers every default-root generation: the legacy ``~/.hermes`` and the
+    Sinria-era ``~/.sinria``, plus whatever ``_default_home_dir_name()``
+    currently resolves to (it is env-dependent via SINRIA_CLI_NAME /
+    HERMES_CLI_NAME). The 2026-07-11 incident wiped ``providers`` from the
+    real ``~/.sinria/auth.json`` because only the legacy ``.hermes`` path was
+    guarded here — a product rename must never silently narrow this guard
+    again.
+    """
+    names = {".hermes", ".sinria"}
+    try:
+        from hermes_constants import _default_home_dir_name
+        names.add(_default_home_dir_name())
+    except Exception:
+        pass
+    return tuple(home_dir / name / "auth.json" for name in sorted(names))
+
+
+def _native_account_homes(*, include_runtime_home: bool = True) -> tuple[Path, ...]:
+    """Return account homes used to identify protected auth stores.
+
+    The OS account database closes the escape where a late test thread sees a
+    monkeypatched ``Path.home``. Write paths also include ``Path.home()`` so
+    synthetic-home regression tests exercise the same protection. Read-only
+    profile fallback can exclude it to keep fixture-owned auth stores visible.
+    """
+    homes = {Path.home()} if include_runtime_home else set()
+    if os.name == "posix":
+        try:
+            import pwd
+
+            getuid = getattr(os, "getuid", None)
+            if getuid is not None:
+                homes.add(Path(pwd.getpwuid(getuid()).pw_dir))
+        except Exception:
+            pass
+    else:
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            homes.add(Path(user_profile))
+    if not homes:
+        homes.add(Path.home())
+    return tuple(homes)
+
+
+def _test_auth_sandbox_path() -> Optional[Path]:
+    """Return the process-isolated auth path for a pytest process, if any."""
+    sandbox = os.environ.get("SINRIA_TEST_AUTH_SANDBOX")
+    if not sandbox and not os.environ.get("PYTEST_CURRENT_TEST"):
+        return None
+    root = Path(sandbox) if sandbox else Path(tempfile.gettempdir()) / "sinria-pytest-auth"
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    return root / f"{worker}-{os.getpid()}" / "auth.json"
+
+
+def _is_real_account_auth_path(
+    path: Path, *, include_runtime_home: bool = True
+) -> bool:
+    """Whether *path* is a default auth store under a protected account home."""
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    protected = set()
+    for home_dir in _native_account_homes(include_runtime_home=include_runtime_home):
+        for candidate in _protected_default_auth_paths(home_dir):
+            try:
+                protected.add(candidate.resolve(strict=False))
+            except Exception:
+                protected.add(candidate)
+    return resolved in protected
+
+
 def _auth_file_path() -> Path:
     path = get_hermes_home() / "auth.json"
-    # Seat belt: if pytest is running and HERMES_HOME resolves to the real
-    # user's auth store, refuse rather than silently corrupt it. This catches
-    # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
-    # hermetic conftest, or sandbox escapes via threads/subprocesses. In
-    # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+    # Process-lifetime pytest seat belt. PYTEST_CURRENT_TEST disappears during
+    # fixture teardown, so tests/conftest.py supplies a durable sandbox marker.
+    # Redirect instead of raising so late background work remains harmless.
+    sandbox_path = _test_auth_sandbox_path()
+    if sandbox_path is not None and _is_real_account_auth_path(path):
+        return sandbox_path
     return path
 
 
@@ -864,15 +929,10 @@ def _load_global_auth_store() -> Dict[str, Any]:
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return {}
-            except Exception:
-                pass
+    if _test_auth_sandbox_path() is not None and _is_real_account_auth_path(
+        global_path, include_runtime_home=False
+    ):
+        return {}
     try:
         return _load_auth_store(global_path)
     except Exception:
@@ -1016,8 +1076,150 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
+_SECRET_ARGV_MARKERS = ("token", "key", "secret", "password", "credential")
+
+
+def _redact_argv(argv: List[str]) -> List[str]:
+    """Mask secret-shaped argv values while keeping the command legible."""
+    redacted: List[str] = []
+    mask_next = False
+    for arg in argv:
+        if mask_next:
+            redacted.append("***")
+            mask_next = False
+            continue
+        lowered = arg.lower()
+        if arg.startswith("-") and "=" in arg:
+            flag = lowered.split("=", 1)[0]
+            if any(marker in flag for marker in _SECRET_ARGV_MARKERS):
+                redacted.append(arg.split("=", 1)[0] + "=***")
+                continue
+        if arg.startswith("-") and any(m in lowered for m in _SECRET_ARGV_MARKERS):
+            redacted.append(arg)
+            mask_next = True
+            continue
+        redacted.append(arg if len(arg) <= 120 else arg[:117] + "...")
+    return redacted
+
+
+def _build_wipe_attribution(
+    disappearing: List[str], backup: Path
+) -> Dict[str, Any]:
+    """Collect writer forensics for a provider-dropping save.
+
+    The 2026-07-12 22:40 wipe showed that ``logger.warning`` alone is not
+    durable evidence: the writer was a short-lived non-gateway process whose
+    stderr was never captured, so the attribution died with it. This record
+    is persisted to a sidecar file next to the guard backup so it survives
+    the writer process. It must contain no secrets — argv is redacted and
+    env is limited to home-resolution paths (wrong-home writers are a known
+    failure class for this store).
+    """
+    import inspect
+
+    caller = "?"
+    stack: List[str] = []
+    auth_suffix = os.path.join("hermes_cli", "auth.py")
+    for frame in inspect.stack()[1:]:
+        if frame.filename.endswith(auth_suffix):
+            continue
+        entry = f"{frame.filename}:{frame.lineno} {frame.function}"
+        if caller == "?":
+            caller = entry
+        stack.append(entry)
+        if len(stack) >= 15:
+            break
+    return {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "argv": _redact_argv(list(sys.argv)),
+        "executable": sys.executable,
+        "cwd": os.getcwd(),
+        "dropped_providers": list(disappearing),
+        "caller": caller,
+        "stack": stack,
+        "env": {
+            name: os.environ.get(name)
+            for name in ("SINRIA_HOME", "HERMES_HOME", "HOME")
+        },
+        "backup": backup.name,
+    }
+
+
+def _guard_provider_wipe(auth_file: Path, incoming: Dict[str, Any]) -> None:
+    """Snapshot + attribute any save that would drop provider entries.
+
+    The runtime auth store's ``providers`` section was wiped repeatedly
+    (2026-07-11, 2026-07-12 morning, 2026-07-12 22:40) by unidentified
+    writers while ``credential_pool`` survived, silently dropping the
+    primary provider to fallback chains. This guard never blocks the save —
+    logout and ``auth remove`` legitimately delete entries — but it
+    preserves a timestamped backup of the previous store, persists writer
+    attribution to a sidecar file (durable even when the writer's stderr is
+    never captured), and logs a warning so the next wipe is recoverable and
+    traceable.
+    """
+    try:
+        if not auth_file.exists():
+            return
+        raw = json.loads(auth_file.read_text(encoding="utf-8"))
+        on_disk = raw.get("providers") if isinstance(raw, dict) else None
+        if not isinstance(on_disk, dict) or not on_disk:
+            return
+        incoming_providers = incoming.get("providers")
+        incoming_keys = (
+            set(incoming_providers.keys())
+            if isinstance(incoming_providers, dict)
+            else set()
+        )
+        disappearing = sorted(set(on_disk.keys()) - incoming_keys)
+        if not disappearing:
+            return
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = auth_file.with_name(
+            f"{auth_file.name}.bak-guard-{timestamp}-{os.getpid()}"
+        )
+        shutil.copy2(auth_file, backup)
+        try:
+            backup.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        caller = "?"
+        sidecar: Optional[Path] = None
+        try:
+            attribution = _build_wipe_attribution(disappearing, backup)
+            caller = attribution["caller"]
+            sidecar = auth_file.with_name(
+                f"{auth_file.name}.guard-attribution-{timestamp}-{os.getpid()}.json"
+            )
+            sidecar.write_text(
+                json.dumps(attribution, indent=2) + "\n", encoding="utf-8"
+            )
+            sidecar.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            sidecar = None
+            logger.debug(
+                "auth: provider-wipe attribution sidecar failed", exc_info=True
+            )
+        logger.warning(
+            "auth: save drops provider entries %s (pid=%s argv0=%s caller=%s) — "
+            "previous store preserved at %s, attribution at %s",
+            disappearing,
+            os.getpid(),
+            sys.argv[0] if sys.argv else "?",
+            caller,
+            backup,
+            sidecar or "<unavailable>",
+        )
+    except Exception:
+        # The guard must never break credential saves.
+        logger.debug("auth: provider-wipe guard failed", exc_info=True)
+
+
 def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     auth_file = _auth_file_path()
+    _guard_provider_wipe(auth_file, auth_store)
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1869,6 +2071,7 @@ def _spotify_client_id(
 
     candidates = (
         explicit,
+        get_env_value("SINRIA_SPOTIFY_CLIENT_ID"),
         get_env_value("HERMES_SPOTIFY_CLIENT_ID"),
         get_env_value("SPOTIFY_CLIENT_ID"),
         state.get("client_id") if isinstance(state, dict) else None,
@@ -1878,7 +2081,7 @@ def _spotify_client_id(
         if cleaned:
             return cleaned
     raise AuthError(
-        "Spotify client_id is required. Set HERMES_SPOTIFY_CLIENT_ID or pass --client-id.",
+        "Spotify client_id is required. Set SINRIA_SPOTIFY_CLIENT_ID or pass --client-id.",
         provider="spotify",
         code="spotify_client_id_missing",
     )
@@ -1892,6 +2095,7 @@ def _spotify_redirect_uri(
 
     candidates = (
         explicit,
+        get_env_value("SINRIA_SPOTIFY_REDIRECT_URI"),
         get_env_value("HERMES_SPOTIFY_REDIRECT_URI"),
         get_env_value("SPOTIFY_REDIRECT_URI"),
         state.get("redirect_uri") if isinstance(state, dict) else None,
@@ -1908,6 +2112,7 @@ def _spotify_api_base_url(state: Optional[Dict[str, Any]] = None) -> str:
     from hermes_cli.config import get_env_value
 
     candidates = (
+        get_env_value("SINRIA_SPOTIFY_API_BASE_URL"),
         get_env_value("HERMES_SPOTIFY_API_BASE_URL"),
         state.get("api_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_API_BASE_URL,
@@ -1923,6 +2128,7 @@ def _spotify_accounts_base_url(state: Optional[Dict[str, Any]] = None) -> str:
     from hermes_cli.config import get_env_value
 
     candidates = (
+        get_env_value("SINRIA_SPOTIFY_ACCOUNTS_BASE_URL"),
         get_env_value("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
         state.get("accounts_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL,
@@ -2491,14 +2697,14 @@ def _spotify_interactive_setup(redirect_uri_hint: str) -> str:
         raise SystemExit("Spotify setup cancelled: empty Client ID.")
 
     # Persist so subsequent auth spotify runs skip the wizard.
-    save_env_value("HERMES_SPOTIFY_CLIENT_ID", raw)
+    save_env_value("SINRIA_SPOTIFY_CLIENT_ID", raw)
     # Only persist the redirect URI if it's non-default, to avoid pinning
     # users to a value the default might later change to.
     if redirect_uri_hint and redirect_uri_hint != DEFAULT_SPOTIFY_REDIRECT_URI:
-        save_env_value("HERMES_SPOTIFY_REDIRECT_URI", redirect_uri_hint)
+        save_env_value("SINRIA_SPOTIFY_REDIRECT_URI", redirect_uri_hint)
 
     print()
-    print(f"Saved HERMES_SPOTIFY_CLIENT_ID to {_display_home()}/.env")
+    print(f"Saved SINRIA_SPOTIFY_CLIENT_ID to {_display_home()}/.env")
     print()
     return raw
 
@@ -2508,7 +2714,7 @@ def login_spotify_command(args) -> None:
 
     # Interactive wizard: if no client_id is configured anywhere, walk the
     # user through creating the Spotify developer app instead of crashing
-    # with "HERMES_SPOTIFY_CLIENT_ID is required".
+    # with a missing-client-id error.
     explicit_client_id = getattr(args, "client_id", None)
     try:
         client_id = _spotify_client_id(explicit_client_id, existing_state)
@@ -2911,6 +3117,55 @@ def _resolve_codex_runtime_credentials_from_pool() -> Optional[Dict[str, Any]]:
     }
 
 
+def _format_quota_reset_timestamp(reset_at: Any) -> str:
+    """Render an epoch reset time in the operator's local timezone."""
+    try:
+        local = datetime.fromtimestamp(float(reset_at)).astimezone()
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(reset_at)
+
+
+def _codex_pool_quota_exhaustion_error() -> Optional["AuthError"]:
+    """Accurate error when pooled Codex credentials exist but are all quota-exhausted.
+
+    The legacy fallthrough raised "No Codex credentials stored. Run `sinria
+    auth`" in this state, which sends the operator to a re-login that cannot
+    restore an account-level usage limit. Surface the real condition and the
+    earliest known reset time instead.
+    """
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool("openai-codex")
+        if not pool.has_credentials():
+            return None
+        status_fn = getattr(pool, "exhaustion_status", None)
+        if not callable(status_fn):
+            return None
+        status = status_fn()
+        if status.get("available"):
+            return None
+        total = status.get("total") or 0
+        reset_at = status.get("earliest_reset_at")
+        reset_hint = (
+            f" Earliest quota reset: {_format_quota_reset_timestamp(reset_at)}."
+            if reset_at
+            else ""
+        )
+        return AuthError(
+            f"All {total} stored openai-codex credentials are currently "
+            f"quota-exhausted (usage limit reached).{reset_hint} "
+            f"Re-authenticating will not restore quota; wait for the reset "
+            f"or route requests through a fallback provider.",
+            provider="openai-codex",
+            code="codex_quota_exhausted",
+            relogin_required=False,
+        )
+    except Exception:
+        return None
+
+
 def resolve_codex_runtime_credentials(
     *,
     force_refresh: bool = False,
@@ -2929,6 +3184,9 @@ def resolve_codex_runtime_credentials(
             pooled = _resolve_codex_runtime_credentials_from_pool()
             if pooled is not None:
                 return pooled
+            quota_error = _codex_pool_quota_exhaustion_error()
+            if quota_error is not None:
+                raise quota_error from exc
         raise
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()

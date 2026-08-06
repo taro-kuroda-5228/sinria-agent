@@ -23,6 +23,28 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 logger = logging.getLogger(__name__)
 
 
+def _classify_responses_issuer(
+    *,
+    is_xai_responses: bool = False,
+    is_github_responses: bool = False,
+    is_codex_backend: bool = False,
+    base_url: Optional[str] = None,
+) -> str:
+    """Return a stable identity for the endpoint minting encrypted reasoning."""
+    if is_xai_responses:
+        return "xai_responses"
+    if is_github_responses:
+        return "github_responses"
+    if is_codex_backend:
+        return "codex_backend"
+    if base_url:
+        return f"other:{str(base_url).rstrip('/')}"
+    return "other"
+
+
+_CROSS_ISSUER_WARN_EMITTED = False
+
+
 # Matches Codex/Harmony tool-call serialization that occasionally leaks into
 # assistant-message content when the model fails to emit a structured
 # ``function_call`` item.  Accepts the common forms:
@@ -248,6 +270,8 @@ def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
     is_xai_responses: bool = False,
+    replay_encrypted_reasoning: bool = True,
+    current_issuer_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -257,7 +281,10 @@ def _chat_messages_to_responses_input(
     streams an ``error`` SSE frame before ``response.created`` and the
     OpenAI SDK collapses it into a generic stream-ordering error.  Native
     Codex (chatgpt.com backend-api) DOES accept replayed encrypted_content
-    — keep the default off.
+    — keep the default off. ``replay_encrypted_reasoning=False`` is a
+    non-destructive wire-level kill switch used after a provider rejects a
+    cached blob. ``current_issuer_kind`` drops stamped blobs minted by another
+    Responses endpoint while preserving ordinary assistant content and tools.
     """
     items: List[Dict[str, Any]] = []
     seen_item_ids: set = set()
@@ -294,17 +321,40 @@ def _chat_messages_to_responses_input(
                 # blob back in.
                 codex_reasoning = msg.get("codex_reasoning_items")
                 has_codex_reasoning = False
-                if isinstance(codex_reasoning, list) and not is_xai_responses:
+                if (
+                    isinstance(codex_reasoning, list)
+                    and not is_xai_responses
+                    and replay_encrypted_reasoning
+                ):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
                             item_id = ri.get("id")
                             if item_id and item_id in seen_item_ids:
                                 continue
+                            item_issuer = ri.get("_issuer_kind")
+                            if (
+                                current_issuer_kind is not None
+                                and item_issuer is not None
+                                and item_issuer != current_issuer_kind
+                            ):
+                                global _CROSS_ISSUER_WARN_EMITTED
+                                if not _CROSS_ISSUER_WARN_EMITTED:
+                                    logger.warning(
+                                        "Dropping encrypted reasoning minted by %s while calling %s",
+                                        item_issuer,
+                                        current_issuer_kind,
+                                    )
+                                    _CROSS_ISSUER_WARN_EMITTED = True
+                                continue
                             # Strip the "id" field — with store=False the
                             # Responses API cannot look up items by ID and
                             # returns 404.  The encrypted_content blob is
                             # self-contained for reasoning chain continuity.
-                            replay_item = {k: v for k, v in ri.items() if k != "id"}
+                            replay_item = {
+                                k: v
+                                for k, v in ri.items()
+                                if k not in {"id", "_issuer_kind"}
+                            }
                             items.append(replay_item)
                             if item_id:
                                 seen_item_ids.add(item_id)
@@ -709,7 +759,14 @@ def _preflight_codex_api_kwargs(
         for idx, tool in enumerate(tools):
             if not isinstance(tool, dict):
                 raise ValueError(f"Codex Responses tools[{idx}] must be an object.")
-            if tool.get("type") != "function":
+            tool_type = tool.get("type")
+            if tool_type == "programmatic_tool_calling":
+                # GPT-5.6 Programmatic Tool Calling is opt-in per request.  It
+                # does not grant any local capability by itself; eligible tools
+                # must also opt in via allowed_callers=["programmatic"].
+                normalized_tools.append({"type": "programmatic_tool_calling"})
+                continue
+            if tool_type != "function":
                 raise ValueError(f"Codex Responses tools[{idx}] has unsupported type {tool.get('type')!r}.")
 
             name = tool.get("name")
@@ -729,15 +786,31 @@ def _preflight_codex_api_kwargs(
             if not isinstance(strict, bool):
                 strict = bool(strict)
 
-            normalized_tools.append(
-                {
-                    "type": "function",
-                    "name": name.strip(),
-                    "description": description,
-                    "strict": strict,
-                    "parameters": parameters,
-                }
-            )
+            normalized_tool = {
+                "type": "function",
+                "name": name.strip(),
+                "description": description,
+                "strict": strict,
+                "parameters": parameters,
+            }
+            output_schema = tool.get("output_schema")
+            if output_schema is not None:
+                if not isinstance(output_schema, dict):
+                    raise ValueError(f"Codex Responses tools[{idx}] output_schema must be an object when provided.")
+                normalized_tool["output_schema"] = output_schema
+            allowed_callers = tool.get("allowed_callers")
+            if allowed_callers is not None:
+                if not isinstance(allowed_callers, list) or not all(isinstance(c, str) and c for c in allowed_callers):
+                    raise ValueError(f"Codex Responses tools[{idx}] allowed_callers must be a list of non-empty strings.")
+                allowed = {"direct", "programmatic"}
+                unexpected_callers = sorted(set(allowed_callers) - allowed)
+                if unexpected_callers:
+                    raise ValueError(
+                        f"Codex Responses tools[{idx}] allowed_callers has unsupported value(s): {', '.join(unexpected_callers)}."
+                    )
+                normalized_tool["allowed_callers"] = list(allowed_callers)
+
+            normalized_tools.append(normalized_tool)
 
     store = api_kwargs.get("store", False)
     if store is not False:
@@ -745,7 +818,7 @@ def _preflight_codex_api_kwargs(
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
-        "reasoning", "include", "max_output_tokens", "temperature",
+        "reasoning", "text", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
         "extra_headers", "extra_body",
     }
@@ -758,10 +831,23 @@ def _preflight_codex_api_kwargs(
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
 
-    # Pass through reasoning config
+    # Pass through reasoning config.  GPT-5.6 adds optional fields such as
+    # reasoning.context and reasoning.mode="pro"; keep them explicit in
+    # request overrides rather than enabling persisted reasoning or Pro mode by
+    # default.
     reasoning = api_kwargs.get("reasoning")
     if isinstance(reasoning, dict):
         normalized["reasoning"] = reasoning
+
+    text = api_kwargs.get("text")
+    if text is not None:
+        if not isinstance(text, dict):
+            raise ValueError("Codex Responses request 'text' must be an object.")
+        verbosity = text.get("verbosity")
+        if verbosity is not None:
+            if not isinstance(verbosity, str) or verbosity not in {"low", "medium", "high"}:
+                raise ValueError("Codex Responses request 'text.verbosity' must be one of: low, medium, high.")
+        normalized["text"] = dict(text)
     include = api_kwargs.get("include")
     if isinstance(include, list):
         normalized["include"] = include
@@ -871,8 +957,12 @@ def _extract_responses_reasoning_text(item: Any) -> str:
 # Full response normalization
 # ---------------------------------------------------------------------------
 
-def _normalize_codex_response(response: Any) -> tuple[Any, str]:
-    """Normalize a Responses API object to an assistant_message-like object."""
+def _normalize_codex_response(
+    response: Any,
+    *,
+    issuer_kind: Optional[str] = None,
+) -> tuple[Any, str]:
+    """Normalize a Responses response and stamp replay state with its issuer."""
     output = getattr(response, "output", None)
     if not isinstance(output, list) or not output:
         # The Codex backend can return empty output when the answer was
@@ -914,6 +1004,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
     has_incomplete_items = response_status in {"queued", "in_progress", "incomplete"}
     saw_commentary_phase = False
     saw_final_answer_phase = False
+    saw_reasoning_item = False
 
     for item in output:
         item_type = getattr(item, "type", None)
@@ -951,6 +1042,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
                     raw_message_item["phase"] = normalized_phase
                 message_items_raw.append(raw_message_item)
         elif item_type == "reasoning":
+            saw_reasoning_item = True
             reasoning_text = _extract_responses_reasoning_text(item)
             if reasoning_text:
                 reasoning_parts.append(reasoning_text)
@@ -960,7 +1052,12 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
             encrypted = getattr(item, "encrypted_content", None)
             if isinstance(encrypted, str) and encrypted:
                 raw_item = {"type": "reasoning", "encrypted_content": encrypted}
+                if issuer_kind:
+                    raw_item["_issuer_kind"] = issuer_kind
                 item_id = getattr(item, "id", None)
+                if isinstance(item_id, str) and item_id.startswith("rs_tmp_"):
+                    logger.debug("Skipping transient Codex reasoning item during normalization")
+                    continue
                 if isinstance(item_id, str) and item_id:
                     raw_item["id"] = item_id
                 # Capture summary — required by the API when replaying reasoning items.
@@ -1076,7 +1173,7 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
         finish_reason = "incomplete"
     elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
         finish_reason = "incomplete"
-    elif reasoning_items_raw and not final_text:
+    elif (reasoning_items_raw or reasoning_parts or saw_reasoning_item) and not final_text:
         # Response contains only reasoning (encrypted thinking state) with
         # no visible content or tool calls.  The model is still thinking and
         # needs another turn to produce the actual answer.  Marking this as

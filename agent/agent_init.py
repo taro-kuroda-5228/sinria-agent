@@ -49,6 +49,7 @@ from agent.tool_guardrails import (
     ToolCallGuardrailController,
     ToolGuardrailDecision,
 )
+from agent.dynamic_tool_selector import DynamicToolSelectionConfig
 from hermes_cli.config import cfg_get
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
@@ -935,6 +936,13 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
     try:
+        agent._dynamic_tool_selection_config = DynamicToolSelectionConfig.from_mapping(
+            _agent_cfg.get("dynamic_tool_selection", {})
+        )
+    except Exception as _dts_err:
+        agent._dynamic_tool_selection_config = DynamicToolSelectionConfig(mode="off")
+        _ra().logger.warning("Dynamic tool selection config ignored: %s", _dts_err)
+    try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
                 _agent_cfg.get("tool_loop_guardrails", {})
@@ -965,6 +973,10 @@ def init_agent(
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    vault_primary=mem_config.get("vault_primary", False),
+                    vault_path=mem_config.get("vault_path"),
+                    hot_cache_entry_limit=mem_config.get("hot_cache_entry_limit", 200),
+                    hot_cache_soft_limit=mem_config.get("hot_cache_soft_limit", 1500),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:
@@ -1382,7 +1394,10 @@ def init_agent(
     )
     if _ctx_warning:
         _ra().logger.warning("%s", _ctx_warning)
-    agent.capability_profile = resolve_capability_profile(_ctx or None)
+    # Pass the model name so explicit parameter counts ("qwen3.5:9b") clamp
+    # the tier to real capability — big-context small-param local models must
+    # not resolve to frontier ("large") scaffolding/routing behavior.
+    agent.capability_profile = resolve_capability_profile(_ctx or None, model=agent.model)
     # Scale the iteration budget to the model tier, but only when the
     # caller left the defaults — explicit max_iterations / iteration_budget
     # arguments always win.
@@ -1433,8 +1448,10 @@ def init_agent(
         except Exception as _ce_err:
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
+    from gateway.session_context import get_session_env as _get_session_env
+
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=_get_session_env("TERMINAL_CWD", "") or None,
     )
     agent._user_turn_count = 0
 

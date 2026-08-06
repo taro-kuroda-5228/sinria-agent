@@ -236,7 +236,8 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_content TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
-    codex_message_items TEXT
+    codex_message_items TEXT,
+    injected_user_context TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -248,6 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_role_timestamp ON messages(role, timestamp, id);
 """
 
 FTS_SQL = """
@@ -1159,6 +1161,39 @@ class SessionDB:
             current = row["id"]
         return current
 
+    def audit_user_turns(self, start_ts: float, end_ts: float) -> List[Dict[str, Any]]:
+        """Return every user turn in an epoch range without relevance filtering.
+
+        Session start time is deliberately not used as the boundary: a long-lived
+        session may receive a new user task on a later day.  Parent and child
+        sessions remain separate so delegated or compressed continuations cannot
+        hide distinct requests.
+        """
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                raise RuntimeError("Session database is not initialized")
+            rows = conn.execute(
+                """
+                SELECT s.id AS session_id,
+                       s.parent_session_id,
+                       s.source,
+                       s.title,
+                       s.started_at AS session_started_at,
+                       m.id AS message_id,
+                       m.timestamp AS message_timestamp,
+                       m.content
+                FROM messages AS m
+                JOIN sessions AS s ON s.id = m.session_id
+                WHERE m.role = 'user'
+                  AND m.timestamp >= ?
+                  AND m.timestamp < ?
+                ORDER BY m.timestamp ASC, m.id ASC
+                """,
+                (start_ts, end_ts),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -1445,6 +1480,7 @@ class SessionDB:
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
         codex_message_items: Any = None,
+        injected_user_context: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1466,6 +1502,12 @@ class SessionDB:
             if codex_message_items else None
         )
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+        # Per-turn user-message injections (memory
+        # recall, plugin context). Persisted so the exact bytes re-attach on
+        # resumed turns and the provider prompt-cache prefix stays stable.
+        injected_user_context_json = (
+            json.dumps(injected_user_context) if injected_user_context else None
+        )
         # Multimodal content (list of parts) must be JSON-encoded: sqlite3
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
@@ -1480,8 +1522,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, injected_user_context)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -1497,6 +1539,7 @@ class SessionDB:
                     reasoning_details_json,
                     codex_items_json,
                     codex_message_items_json,
+                    injected_user_context_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -1558,13 +1601,19 @@ class SessionDB:
                     json.dumps(codex_message_items) if codex_message_items else None
                 )
                 tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+                injected_user_context = (
+                    msg.get("_injected_user_context") if role == "user" else None
+                )
+                injected_user_context_json = (
+                    json.dumps(injected_user_context) if injected_user_context else None
+                )
 
                 conn.execute(
                     """INSERT INTO messages (session_id, role, content, tool_call_id,
                        tool_calls, tool_name, timestamp, token_count, finish_reason,
                        reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                       codex_message_items)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       codex_message_items, injected_user_context)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         session_id,
                         role,
@@ -1580,6 +1629,7 @@ class SessionDB:
                         reasoning_details_json,
                         codex_items_json,
                         codex_message_items_json,
+                        injected_user_context_json,
                     ),
                 )
                 total_messages += 1
@@ -1699,7 +1749,7 @@ class SessionDB:
             rows = self._conn.execute(
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items "
+                "codex_reasoning_items, codex_message_items, injected_user_context "
                 f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
@@ -1710,6 +1760,19 @@ class SessionDB:
             if row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            # Restore per-turn user-message injections so resumed turns
+            # re-send historical user messages byte-identically (prompt-cache
+            # prefix stability). Deliberately NOT restored in get_messages()
+            # — search/UI/extraction consumers keep seeing pure content.
+            if row["role"] == "user" and row["injected_user_context"]:
+                try:
+                    _iuc = json.loads(row["injected_user_context"])
+                    if isinstance(_iuc, list) and _iuc:
+                        msg["_injected_user_context"] = _iuc
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize injected_user_context in conversation replay, dropping"
+                    )
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:

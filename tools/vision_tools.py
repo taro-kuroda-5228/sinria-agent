@@ -106,7 +106,7 @@ def _validate_image_url(url: str) -> bool:
 
 
 def _detect_image_mime_type(image_path: Path) -> Optional[str]:
-    """Return a MIME type when the file looks like a supported image."""
+    """Return a MIME type when the file has a supported image signature."""
     with image_path.open("rb") as f:
         header = f.read(64)
 
@@ -125,6 +125,42 @@ def _detect_image_mime_type(image_path: Path) -> Optional[str]:
         if "<svg" in head:
             return "image/svg+xml"
     return None
+
+
+_NATIVE_IMAGE_FORMAT_MIME = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+
+def _validate_decodable_native_image(image_path: Path) -> Optional[str]:
+    """Return the actual MIME type only for a fully decodable native image.
+
+    A magic header is not enough: truncated cache placeholders can begin with a
+    valid PNG signature while containing no image. Passing such bytes to the
+    main model poisons the next request with a provider-level ``invalid image``
+    400. Pillow's ``verify`` checks the complete container before the image is
+    added to conversation history.
+    """
+    if _detect_image_mime_type(image_path) is None:
+        return None
+
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            image.verify()
+            image_format = (image.format or "").upper()
+            width, height = image.size
+    except Exception as exc:
+        logger.info("Rejecting non-decodable native image %s: %s", image_path, exc)
+        return None
+
+    if width <= 0 or height <= 0:
+        return None
+    return _NATIVE_IMAGE_FORMAT_MIME.get(image_format)
 
 
 async def _download_image(image_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -583,10 +619,10 @@ async def _vision_analyze_native(
             )
 
         image_size_bytes = temp_image_path.stat().st_size
-        detected_mime_type = _detect_image_mime_type(temp_image_path)
+        detected_mime_type = _validate_decodable_native_image(temp_image_path)
         if not detected_mime_type:
             return tool_error(
-                "Only real image files are supported for vision analysis.",
+                "Image source is not a valid decodable image supported by native vision.",
                 success=False,
             )
 

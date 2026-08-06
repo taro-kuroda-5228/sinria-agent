@@ -51,7 +51,7 @@ import threading
 from types import SimpleNamespace
 import urllib.request
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Callable, Optional
 from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -791,15 +791,54 @@ class AIAgent:
         )
 
     def _emit_auxiliary_failure(self, task: str, exc: BaseException) -> None:
-        """Surface a compact warning for failed auxiliary work."""
+        """Surface a compact warning once per provider/task/failure state."""
+        from agent.failure_events import WarningDeduplicator
+
+        deduplicator = getattr(self, "_auxiliary_warning_deduplicator", None)
+        if deduplicator is None:
+            deduplicator = WarningDeduplicator(window_seconds=300.0)
+            self._auxiliary_warning_deduplicator = deduplicator
+        decision = deduplicator.observe(
+            provider=getattr(self, "provider", "unknown"),
+            failure_class=exc.__class__.__name__,
+            state="failed",
+            dimensions={"task": task},
+        )
+        if not decision.emit:
+            return
+
         try:
             detail = self._summarize_api_error(exc)
         except Exception:
-            detail = str(exc)
+            detail = exc.__class__.__name__
         detail = (detail or exc.__class__.__name__).strip()
         if len(detail) > 220:
             detail = detail[:217].rstrip() + "..."
-        self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
+        repeated = (
+            f" ({decision.suppressed_count} repeated warnings suppressed)"
+            if decision.suppressed_count
+            else ""
+        )
+        self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}{repeated}")
+
+    def _mark_auxiliary_recovered(self, task: str, failure_class: str) -> None:
+        """Emit a recovery transition only when the matching failure was seen."""
+        deduplicator = getattr(self, "_auxiliary_warning_deduplicator", None)
+        if deduplicator is None:
+            return
+        decision = deduplicator.observe(
+            provider=getattr(self, "provider", "unknown"),
+            failure_class=failure_class,
+            state="recovered",
+            dimensions={"task": task},
+        )
+        if decision.emit and decision.transition:
+            repeated = (
+                f"; {decision.suppressed_count} repeated warnings suppressed"
+                if decision.suppressed_count
+                else ""
+            )
+            self._emit_status(f"✓ Auxiliary {task} recovered{repeated}")
 
     def _current_main_runtime(self) -> Dict[str, str]:
         """Return the live main runtime for session-scoped auxiliary routing."""
@@ -1283,6 +1322,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    injected_user_context=msg.get("_injected_user_context") if role == "user" else None,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -2549,15 +2589,37 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: Optional[Callable[[], None]] = None,
+        on_progress: Optional[Callable[[], None]] = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            on_progress,
+        )
 
-    def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
+    def _run_codex_create_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_progress: Optional[Callable[[], None]] = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
         from agent.codex_runtime import run_codex_create_stream_fallback
-        return run_codex_create_stream_fallback(self, api_kwargs, client)
+        return run_codex_create_stream_fallback(
+            self,
+            api_kwargs,
+            client,
+            on_progress,
+        )
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
@@ -2834,10 +2896,18 @@ class AIAgent:
         has_retried_429: bool,
         classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
+        auth_refresh_attempted_ids: Optional[set[str]] = None,
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(self, status_code=status_code, has_retried_429=has_retried_429, classified_reason=classified_reason, error_context=error_context)
+        return recover_with_credential_pool(
+            self,
+            status_code=status_code,
+            has_retried_429=has_retried_429,
+            classified_reason=classified_reason,
+            error_context=error_context,
+            auth_refresh_attempted_ids=auth_refresh_attempted_ids,
+        )
 
     def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""
@@ -3853,11 +3923,158 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        source_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Run one turn and persist local metadata-only efficiency telemetry."""
+        from agent.correction_loop.efficiency_metrics import (
+            RequestFootprint,
+            UsageSnapshot,
+            append_turn_efficiency_record,
+            build_turn_efficiency_record,
+        )
         from agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
+        usage_before = UsageSnapshot.from_agent(self)
+        tracker = RequestFootprint()
+        turn_started_at = time.monotonic()
+        tracker_attr = "_turn_efficiency_request_footprint"
+        missing = object()
+        previous_tracker = getattr(self, tracker_attr, missing)
+        setattr(self, tracker_attr, tracker)
+        selection_attr = "_turn_tool_selection_observation"
+        previous_selection = getattr(self, selection_attr, missing)
+        setattr(self, selection_attr, {})
+        source_user_message = (
+            source_user_message
+            if source_user_message is not None
+            else persist_user_message
+            if persist_user_message is not None
+            else user_message
+        )
 
+        def _persist_efficiency(
+            turn_result: Dict[str, Any] | None,
+            *,
+            outcome: Dict[str, Any] | None = None,
+            exit_reason: str,
+        ) -> None:
+            try:
+                metadata = outcome if isinstance(outcome, dict) else {}
+                if metadata:
+                    goal_kind = str(metadata.get("goal_kind") or "unknown")
+                    actual_kind = str(metadata.get("actual_kind") or "unknown")
+                    gap_detected = bool(metadata.get("gap_detected", False))
+                else:
+                    from agent.correction_loop.outcome_gap import classify_goal
+
+                    goal_kind = classify_goal(source_user_message)
+                    completed = bool((turn_result or {}).get("completed", False))
+                    actual_kind = "unknown" if completed else "failed_or_interrupted"
+                    gap_detected = goal_kind == "practical_action" and not completed
+                base_variant = str(
+                    getattr(self, "_efficiency_policy_variant", "baseline")
+                )
+                base_interventions = tuple(
+                    getattr(self, "_efficiency_interventions", ()) or ()
+                )
+                selection = getattr(self, selection_attr, {})
+                if not isinstance(selection, dict):
+                    selection = {}
+                selection_mode = str(selection.get("mode") or "off")
+                selection_requests = int(selection.get("request_count") or 0)
+                selection_applied = int(selection.get("applied_request_count") or 0)
+                dynamic_interventions: tuple[str, ...] = ()
+                if selection_requests and selection_mode == "shadow":
+                    dynamic_interventions = ("dynamic_tools_shadow",)
+                elif selection_applied:
+                    dynamic_interventions = ("dynamic_tools_active",)
+                    if base_variant == "baseline":
+                        base_variant = "dynamic_tools_active"
+                interventions = tuple(
+                    dict.fromkeys(base_interventions + dynamic_interventions)
+                )
+                tracker.wall_duration_ms = max(
+                    tracker.wall_duration_ms,
+                    round((time.monotonic() - turn_started_at) * 1000),
+                )
+                record = build_turn_efficiency_record(
+                    agent=self,
+                    usage_before=usage_before,
+                    request_footprint=tracker,
+                    result=turn_result,
+                    outcome_record_id=str(metadata.get("record_id") or ""),
+                    goal_kind=goal_kind,
+                    actual_kind=actual_kind,
+                    gap_detected=gap_detected,
+                    failure_signature=str(metadata.get("failure_signature") or ""),
+                    turn_exit_reason=exit_reason,
+                    source_user_message=source_user_message,
+                    policy_variant=base_variant,
+                    interventions=interventions,
+                )
+                metrics_path = getattr(self, "_efficiency_metrics_path", None)
+                append_turn_efficiency_record(record, path=metrics_path)
+            except Exception as exc:
+                logger.warning("Sinria turn-efficiency telemetry failed: %s", exc)
+
+        try:
+            result = run_conversation(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                task_id,
+                stream_callback,
+                persist_user_message,
+                source_user_message,
+            )
+        except BaseException:
+            failed_result: Dict[str, Any] = {
+                "completed": False,
+                "api_calls": tracker.request_count,
+                "messages": list(conversation_history or []),
+            }
+            _persist_efficiency(failed_result, exit_reason="exception")
+            raise
+        else:
+            outcome = result.pop("_sinria_outcome", None) if isinstance(result, dict) else None
+            if not isinstance(outcome, dict):
+                transient_outcome = getattr(self, "_last_turn_outcome_metadata", None)
+                outcome = transient_outcome if isinstance(transient_outcome, dict) else None
+            self._last_turn_outcome_metadata = None
+            internal_reason = (
+                result.pop("_sinria_turn_exit_reason", None)
+                if isinstance(result, dict)
+                else None
+            )
+            if not internal_reason and isinstance(result, dict):
+                internal_reason = result.get("turn_exit_reason")
+            if internal_reason:
+                exit_reason = str(internal_reason)
+            elif isinstance(result, dict) and result.get("interrupted"):
+                exit_reason = "interrupted"
+            elif isinstance(result, dict) and result.get("completed"):
+                exit_reason = "completed"
+            elif isinstance(result, dict) and (result.get("failed") or result.get("error")):
+                exit_reason = "failed"
+            else:
+                exit_reason = "incomplete"
+            _persist_efficiency(result, outcome=outcome, exit_reason=exit_reason)
+            return result
+        finally:
+            if previous_tracker is missing:
+                try:
+                    delattr(self, tracker_attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self, tracker_attr, previous_tracker)
+            if previous_selection is missing:
+                try:
+                    delattr(self, selection_attr)
+                except AttributeError:
+                    pass
+            else:
+                setattr(self, selection_attr, previous_selection)
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
         Simple chat interface that returns just the final response.

@@ -20,7 +20,7 @@ import json
 import logging
 import os
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -175,12 +175,49 @@ def run_codex_app_server_turn(
 
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta: Optional[Callable[[], None]] = None,
+    on_progress: Optional[Callable[[], None]] = None,
+):
     """Execute one streaming Responses API request and return the final response."""
     import httpx as _httpx
+    from agent.request_efficiency import (
+        VERY_LARGE_REQUEST_CHAR_THRESHOLD,
+        approximate_request_chars,
+        resolve_stream_retry_budget,
+    )
+    from agent.sinria_egress import prepare_model_provider_payload
 
+    api_kwargs = prepare_model_provider_payload(agent, api_kwargs)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    max_stream_retries = 1
+    max_stream_retries = resolve_stream_retry_budget(
+        api_kwargs,
+        default_retries=1,
+        large_retries=0,
+        very_large_retries=0,
+    )
+    # responses.create(stream=True) uploads the complete request again. For a
+    # very large prompt that turns one timeout into two long waits and may
+    # duplicate a partially processed request. Keep the compatibility fallback
+    # for normal requests, but fail after the first very-large upload.
+    allow_create_fallback = (
+        approximate_request_chars(api_kwargs)
+        < VERY_LARGE_REQUEST_CHAR_THRESHOLD
+    )
+
+    def _run_create_fallback():
+        fallback_kwargs = {"client": active_client}
+        # Preserve old mock/provider call signatures unless a watchdog
+        # callback is actually active.
+        if on_progress is not None:
+            fallback_kwargs["on_progress"] = on_progress
+        return agent._run_codex_create_stream_fallback(
+            api_kwargs, **fallback_kwargs
+        )
+
     has_tool_calls = False
     first_delta_fired = False
     # Accumulate streamed text so we can recover if get_final_response()
@@ -195,6 +232,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             with active_client.responses.stream(**api_kwargs) as stream:
                 for event in stream:
                     agent._touch_activity("receiving stream response")
+                    if on_progress:
+                        try:
+                            on_progress()
+                        except Exception:
+                            pass
                     if agent._interrupt_requested:
                         break
                     event_type = getattr(event, "type", "")
@@ -275,12 +317,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                 )
                 continue
+            if not allow_create_fallback:
+                raise
             logger.debug(
                 "Codex Responses stream transport failed; falling back to create(stream=True). %s error=%s",
                 agent._client_log_context(),
                 exc,
             )
-            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            return _run_create_fallback()
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
@@ -321,23 +365,33 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             if missing_completed or prelude_error:
+                if not allow_create_fallback:
+                    raise
                 logger.debug(
                     "Responses stream %s; falling back to create(stream=True). %s err=%s",
                     "rejected before response.created" if prelude_error else "did not emit response.completed",
                     agent._client_log_context(),
                     err_text,
                 )
-                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+                return _run_create_fallback()
             raise
 
 
 
-def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
+def run_codex_create_stream_fallback(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_progress: Optional[Callable[[], None]] = None,
+):
     """Fallback path for stream completion edge cases on Codex-style Responses backends."""
     active_client = client or agent._ensure_primary_openai_client(reason="codex_create_stream_fallback")
     fallback_kwargs = dict(api_kwargs)
     fallback_kwargs["stream"] = True
     fallback_kwargs = agent._get_transport().preflight_kwargs(fallback_kwargs, allow_stream=True)
+    from agent.sinria_egress import prepare_model_provider_payload
+
+    fallback_kwargs = prepare_model_provider_payload(agent, fallback_kwargs)
     stream_or_response = active_client.responses.create(**fallback_kwargs)
 
     # Compatibility shim for mocks or providers that still return a concrete response.
@@ -352,6 +406,11 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
     try:
         for event in stream_or_response:
             agent._touch_activity("receiving stream response")
+            if on_progress:
+                try:
+                    on_progress()
+                except Exception:
+                    pass
             event_type = getattr(event, "type", None)
             if not event_type and isinstance(event, dict):
                 event_type = event.get("type")

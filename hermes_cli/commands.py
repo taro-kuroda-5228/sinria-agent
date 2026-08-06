@@ -74,6 +74,7 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+    native_menu: bool = True           # expose in platform-native command menus
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +99,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("undo", "Remove the last user/assistant exchange", "Session"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
-    CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
-               args_hint="<platform>", cli_only=True),
+    CommandDef("handoff", "Hand off a session or shared task", "Session",
+               args_hint="<platform>|<user-id>|<G2-code>|accept|reject|cancel",
+               native_menu=False),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
     CommandDef("compress", "Manually compress conversation context", "Session",
@@ -113,6 +115,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[session|always]"),
     CommandDef("deny", "Deny a pending dangerous command", "Session",
                gateway_only=True),
+    CommandDef("team", "Show or finish the shared Sinria work item", "Session",
+               gateway_only=True, args_hint="[complete|cancel|release]"),
+    CommandDef("claim", "Claim an unowned shared Sinria work item", "Session",
+               gateway_only=True),
+
+    CommandDef("proposal", "Accept or reject a teammate proposal", "Session",
+               gateway_only=True, args_hint="<accept|reject> <id>"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
@@ -161,7 +170,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration"),
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide]",
-               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "show", "hide", "on", "off")),
+               subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "show", "hide", "on", "off")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
@@ -177,6 +186,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("queue", "steer", "interrupt", "status")),
 
     # Tools & Skills
+    CommandDef("repair-report", "Diagnose an error locally and queue a safe Sinria repair", "Tools & Skills",
+               aliases=("diagnose-error",), args_hint="[error text]", gateway_only=True),
     CommandDef("tools", "Manage tools: /tools [list|disable|enable] [name...]", "Tools & Skills",
                args_hint="[list|disable|enable] [name...]", cli_only=True),
     CommandDef("toolsets", "List available toolsets", "Tools & Skills",
@@ -506,7 +517,7 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     overrides = _resolve_config_gates()
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not cmd.native_menu or not _is_gateway_available(cmd, overrides):
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1020,15 +1031,33 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
+    # Reserve established high-frequency native aliases before canonical names
+    # consume Slack's hard 50-command budget.  Any command displaced by the
+    # clamp remains available through /hermes <command>.
+    priority_aliases = ("btw", "bg", "reset", "q")
+    for priority_alias in priority_aliases:
+        for cmd in COMMAND_REGISTRY:
+            if (
+                cmd.native_menu
+                and priority_alias in cmd.aliases
+                and _is_gateway_available(cmd, overrides)
+            ):
+                _add(
+                    priority_alias,
+                    f"Alias for /{cmd.name} — {cmd.description}",
+                    cmd.args_hint or "",
+                )
+                break
+
+    # First pass: canonical names (so they win remaining slots if we hit the cap).
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not cmd.native_menu or not _is_gateway_available(cmd, overrides):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
     # Second pass: aliases.
     for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
+        if not cmd.native_menu or not _is_gateway_available(cmd, overrides):
             continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation

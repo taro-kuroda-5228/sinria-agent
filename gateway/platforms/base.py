@@ -17,6 +17,7 @@ import subprocess
 import sys
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
@@ -971,6 +972,13 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Which synthesizer produced an ``internal`` event.  Only set by producers
+    # whose events need distinguishing downstream; the gateway must not infer
+    # provenance from event *shape* (an empty-text internal event is not
+    # necessarily a startup auto-resume probe — a rendered webhook template
+    # can legitimately come out empty too).
+    internal_kind: Optional[str] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -1295,6 +1303,10 @@ class BasePlatformAdapter(ABC):
         # a newer task's guard, leaving stale busy state.
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Explicit queue mode and anchored notification replies are independent
+        # actions.  Keep them FIFO instead of collapsing them into the single
+        # interrupt/steering slot above.
+        self._pending_message_queues: Dict[str, deque[MessageEvent]] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
@@ -2640,6 +2652,7 @@ class BasePlatformAdapter(ABC):
         )
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        self._pending_message_queues.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         return True
 
@@ -2722,6 +2735,7 @@ class BasePlatformAdapter(ABC):
                 )
         if discard_pending:
             self._pending_messages.pop(session_key, None)
+            self._pending_message_queues.pop(session_key, None)
         if release_guard:
             self._release_session_guard(session_key)
 
@@ -2736,7 +2750,7 @@ class BasePlatformAdapter(ABC):
         command-scoped guard, then — if a follow-up message landed while the
         command was running — spawns a fresh processing task for it.
         """
-        pending_event = self._pending_messages.pop(session_key, None)
+        pending_event = self.get_pending_message(session_key)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
             return
@@ -2904,9 +2918,10 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
-            # Clarify text-capture bypass: if the agent is blocked on a
-            # clarify_tool call awaiting a free-form text response (open-
-            # ended clarify, or user picked "Other"), the next non-command
+            # Clarify reply bypass: if the agent is blocked on a clarify_tool
+            # call, the next non-command message must reach the runner. This
+            # includes direct typed replies to multiple-choice prompts; users
+            # do not need to click "Other" first. The next non-command
             # message in this session MUST reach the runner so the
             # clarify-intercept can resolve it and unblock the agent.
             #
@@ -2920,7 +2935,10 @@ class BasePlatformAdapter(ABC):
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
-                        _clarify_mod.get_pending_for_session(session_key) is not None
+                        _clarify_mod.get_pending_for_session(
+                            session_key,
+                            requester_user_id=str(event.source.user_id or ""),
+                        ) is not None
                     )
                 except Exception:
                     _has_text_clarify = False
@@ -3331,9 +3349,10 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
 
-            # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            # Check if there's a pending message that was queued during our processing.
+            # This also drains explicit FIFO actions, not only interrupt steering.
+            pending_event = self.get_pending_message(session_key)
+            if pending_event is not None:
                 logger.debug("[%s] Processing queued message from interrupt", self.name)
                 # Keep the _active_sessions entry live across the turn chain
                 # and only CLEAR the interrupt Event — do NOT delete the entry.
@@ -3443,7 +3462,7 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = self.get_pending_message(session_key)
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -3561,8 +3580,26 @@ class BasePlatformAdapter(ABC):
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
-        """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        """Return the next pending event without losing queued actions.
+
+        Interrupt/steering input takes precedence because its interrupt event
+        is already active.  Explicitly queued actions then drain in FIFO order.
+        """
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            return pending
+
+        queue = self._pending_message_queues.get(session_key)
+        if not queue:
+            return None
+        pending = queue.popleft()
+        if not queue:
+            self._pending_message_queues.pop(session_key, None)
+        return pending
+
+    def enqueue_pending_message(self, session_key: str, event: MessageEvent) -> None:
+        """Append an independent follow-up for ordered, exactly-once draining."""
+        self._pending_message_queues.setdefault(session_key, deque()).append(event)
     
     def build_source(
         self,

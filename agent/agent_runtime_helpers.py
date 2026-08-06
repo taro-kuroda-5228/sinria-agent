@@ -15,7 +15,7 @@ Methods covered:
 * ``drop_thinking_only_and_merge_users`` — Anthropic-style cleanup
 * ``restore_primary_runtime`` — un-do fallback activation
 * ``extract_reasoning`` — pull reasoning fields out of API responses
-* ``dump_api_request_debug`` — write request body for post-mortem
+* ``dump_api_request_debug`` — write metadata-only request diagnostics
 * ``anthropic_prompt_cache_policy`` — compute cache_control breakpoints
 * ``create_openai_client`` — build the per-agent OpenAI SDK client
 """
@@ -23,6 +23,7 @@ Methods covered:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -541,6 +542,7 @@ def recover_with_credential_pool(
     has_retried_429: bool,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
+    auth_refresh_attempted_ids: Optional[set[str]] = None,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation.
 
@@ -556,8 +558,24 @@ def recover_with_credential_pool(
     different status code, such as Anthropic returning HTTP 400 for
     "out of extra usage".
     """
-    pool = agent._credential_pool
+    pool = getattr(agent, "_credential_pool", None)
     if pool is None:
+        return False, has_retried_429
+
+    # Provider and credential pool form one runtime unit. Fail closed rather
+    # than ever injecting a primary-provider token into an active fallback.
+    pool_provider = str(getattr(pool, "provider", "") or "").strip().lower()
+    runtime_provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    aliases = {"codex": "openai-codex"}
+    pool_provider = aliases.get(pool_provider, pool_provider)
+    runtime_provider = aliases.get(runtime_provider, runtime_provider)
+    if pool_provider and runtime_provider and pool_provider != runtime_provider:
+        _ra().logger.error(
+            "Credential pool/runtime provider mismatch; refusing recovery "
+            "(pool=%s runtime=%s)",
+            pool_provider,
+            runtime_provider,
+        )
         return False, has_retried_429
 
     effective_reason = classified_reason
@@ -615,6 +633,29 @@ def recover_with_credential_pool(
                 agent.provider or "provider",
             )
             return False, has_retried_429
+        current_entry = pool.current() if auth_refresh_attempted_ids is not None else None
+        current_id = str(getattr(current_entry, "id", "") or "")
+        if (
+            auth_refresh_attempted_ids is not None
+            and current_id
+            and current_id in auth_refresh_attempted_ids
+        ):
+            next_entry = pool.mark_exhausted_and_rotate(
+                status_code=status_code or 401,
+                error_context=error_context,
+            )
+            if next_entry is not None:
+                _ra().logger.info(
+                    "Credential auth failure persisted after refresh — "
+                    "rotated to pool entry %s",
+                    getattr(next_entry, "id", "?"),
+                )
+                agent._swap_credential(next_entry)
+                return True, has_retried_429
+            return False, has_retried_429
+
+        if auth_refresh_attempted_ids is not None and current_id:
+            auth_refresh_attempted_ids.add(current_id)
         refreshed = pool.try_refresh_current()
         if refreshed is not None:
             _ra().logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
@@ -837,6 +878,7 @@ def restore_primary_runtime(agent) -> bool:
         # ── Core runtime state ──
         agent.model = rt["model"]
         agent.provider = rt["provider"]
+        agent._credential_pool = rt.get("credential_pool")
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
         if hasattr(agent, "_transport_cache"):
@@ -991,81 +1033,160 @@ def dump_api_request_debug(
     reason: str,
     error: Optional[Exception] = None,
 ) -> Optional[Path]:
-    """
-    Dump a debug-friendly HTTP request record for the active inference API.
+    """Write a bounded, metadata-only inference request diagnostic.
 
-    Captures the request body from api_kwargs (excluding transport-only keys
-    like timeout). Intended for debugging provider-side 4xx failures where
-    retries are not useful.
+    Request bodies, headers, endpoint hosts, error messages, response bodies,
+    and raw session identifiers may contain PHI/PII or credentials and are
+    therefore never persisted. The diagnostic keeps only the dimensions and
+    status needed to investigate provider failures. Files are created with
+    owner-only permissions regardless of the process umask.
+
+    ``HERMES_DUMP_REQUEST_STDOUT`` remains an intentional compatibility alias;
+    Sinria operators should use ``SINRIA_DUMP_REQUEST_STDOUT``.
     """
     try:
-        body = copy.deepcopy(api_kwargs)
-        body.pop("timeout", None)
-        body = {k: v for k, v in body.items() if v is not None}
+        def _approx_chars(value: Any, seen: Optional[set[int]] = None) -> int:
+            """Estimate payload size without serializing or retaining its body."""
+            if value is None:
+                return 0
+            if isinstance(value, str):
+                return len(value)
+            if isinstance(value, (bytes, bytearray)):
+                return len(value)
+            if isinstance(value, (bool, int, float)):
+                return len(str(value))
+            if seen is None:
+                seen = set()
+            value_id = id(value)
+            if value_id in seen:
+                return 0
+            seen.add(value_id)
+            try:
+                if isinstance(value, dict):
+                    return sum(
+                        len(str(key)) + _approx_chars(item, seen)
+                        for key, item in value.items()
+                    )
+                if isinstance(value, (list, tuple, set)):
+                    return sum(_approx_chars(item, seen) for item in value)
+                return len(str(value))
+            finally:
+                seen.discard(value_id)
 
-        api_key = None
-        try:
-            api_key = getattr(agent.client, "api_key", None)
-        except Exception as e:
-            _ra().logger.debug("Could not extract API key for debug dump: %s", e)
+        def _count_sequence(value: Any) -> int:
+            return len(value) if isinstance(value, (list, tuple)) else 0
 
+        def _safe_label(
+            value: Any,
+            *,
+            default: str = "",
+            max_chars: int = 160,
+        ) -> str:
+            rendered = str(value or default)
+            rendered = re.sub(r"[^A-Za-z0-9_.:/@+\-]", "_", rendered)
+            return rendered[:max_chars]
+
+        session_id = str(getattr(agent, "session_id", "") or "")
+        session_digest = hashlib.sha256(
+            session_id.encode("utf-8", errors="replace")
+        ).hexdigest()
+        api_mode = str(getattr(agent, "api_mode", "") or "")
+        endpoint = (
+            "/responses"
+            if api_mode == "codex_responses"
+            else "/chat/completions"
+        )
+        messages = api_kwargs.get("messages")
+        input_items = api_kwargs.get("input")
+        tools = api_kwargs.get("tools")
         dump_payload: Dict[str, Any] = {
+            "schema_version": 2,
             "timestamp": datetime.now().isoformat(),
-            "session_id": agent.session_id,
-            "reason": reason,
+            "session_id_sha256": session_digest,
+            "reason": _safe_label(reason, default="unspecified", max_chars=80),
+            "raw_content_included": False,
             "request": {
                 "method": "POST",
-                "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
-                "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
-                    "Content-Type": "application/json",
-                },
-                "body": body,
+                "endpoint": endpoint,
+                "provider": _safe_label(getattr(agent, "provider", "")),
+                "model": _safe_label(
+                    api_kwargs.get("model") or getattr(agent, "model", "")
+                ),
+                "api_mode": _safe_label(api_mode),
+                "message_count": _count_sequence(messages),
+                "input_item_count": _count_sequence(input_items),
+                "tool_count": _count_sequence(tools),
+                "top_level_field_count": len(api_kwargs),
+                "approx_payload_chars": _approx_chars(api_kwargs),
+                "timeout_configured": api_kwargs.get("timeout") is not None,
             },
         }
 
         if error is not None:
             error_info: Dict[str, Any] = {
-                "type": type(error).__name__,
-                "message": str(error),
+                "exception_type": _safe_label(
+                    type(error).__name__, default="Exception"
+                ),
             }
-            for attr_name in ("status_code", "request_id", "code", "param", "type"):
-                attr_value = getattr(error, attr_name, None)
-                if attr_value is not None:
-                    error_info[attr_name] = attr_value
-
-            body_attr = getattr(error, "body", None)
-            if body_attr is not None:
-                error_info["body"] = body_attr
-
+            status_code = getattr(error, "status_code", None)
+            if isinstance(status_code, int):
+                error_info["status_code"] = status_code
             response_obj = getattr(error, "response", None)
             if response_obj is not None:
-                try:
-                    error_info["response_status"] = getattr(response_obj, "status_code", None)
-                    error_info["response_text"] = response_obj.text
-                except Exception as e:
-                    _ra().logger.debug("Could not extract error response details: %s", e)
-
+                response_status = getattr(response_obj, "status_code", None)
+                if isinstance(response_status, int):
+                    error_info["response_status"] = response_status
+            error_info["has_provider_body"] = (
+                getattr(error, "body", None) is not None
+            )
+            error_info["has_response_text"] = bool(
+                response_obj is not None
+                and getattr(response_obj, "text", None)
+            )
             dump_payload["error"] = error_info
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        dump_file = agent.logs_dir / f"request_dump_{agent.session_id}_{timestamp}.json"
-        dump_file.write_text(
-            json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
+        logs_dir = Path(agent.logs_dir)
+        logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        dump_file = (
+            logs_dir
+            / f"request_dump_{session_digest[:16]}_{timestamp}.json"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        file_descriptor = os.open(dump_file, flags, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                dump_payload,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+        os.chmod(dump_file, 0o600)
+
+        agent._vprint(
+            f"{agent.log_prefix}🧾 Request metadata written to: {dump_file}"
         )
 
-        agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
-
-        if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
-            print(json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str))
+        if (
+            env_var_enabled("SINRIA_DUMP_REQUEST_STDOUT")
+            or env_var_enabled("HERMES_DUMP_REQUEST_STDOUT")
+        ):
+            print(
+                json.dumps(
+                    dump_payload,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
 
         return dump_file
     except Exception as dump_error:
-        if agent.verbose_logging:
-            logging.warning(f"Failed to dump API request debug payload: {dump_error}")
+        if getattr(agent, "verbose_logging", False):
+            logging.warning("Failed to write request metadata: %s", dump_error)
         return None
-
 
 
 def anthropic_prompt_cache_policy(
@@ -1699,17 +1820,41 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
 
 
+def _text_from_message_content(content: Any) -> str:
+    """Return only textual payloads from string or multipart message content.
+
+    Image URLs, base64 payloads, and unknown structured blocks are deliberately
+    ignored so lightweight text classifiers never inspect or log media data.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        return "\n".join(
+            text for part in content if (text := _text_from_message_content(part))
+        )
+    if isinstance(content, dict):
+        part_type = content.get("type")
+        if part_type in {"text", "input_text", "output_text"}:
+            text = content.get("text")
+            return text if isinstance(text, str) else ""
+        return ""
+    return str(content)
+
+
 def looks_like_codex_intermediate_ack(
     agent,
-    user_message: str,
-    assistant_content: str,
+    user_message: Any,
+    assistant_content: Any,
     messages: List[Dict[str, Any]],
 ) -> bool:
     """Detect a planning/ack message that should continue instead of ending the turn."""
     if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
         return False
 
-    assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
+    assistant_text = _text_from_message_content(assistant_content)
+    assistant_text = agent._strip_think_blocks(assistant_text).strip().lower()
     if not assistant_text:
         return False
     if len(assistant_text) > 1200:
@@ -1758,7 +1903,7 @@ def looks_like_codex_intermediate_ack(
         "path",
     )
 
-    user_text = (user_message or "").strip().lower()
+    user_text = _text_from_message_content(user_message).strip().lower()
     user_targets_workspace = (
         any(marker in user_text for marker in workspace_markers)
         or "~/" in user_text
@@ -1934,11 +2079,15 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             context["message"] = message.strip()
         for key in ("resets_at", "reset_at"):
             value = payload.get(key)
-            if value not in {None, ""}:
+            if isinstance(value, (str, int, float)) and value != "":
                 context["reset_at"] = value
                 break
         retry_after = payload.get("retry_after")
-        if retry_after not in {None, ""} and "reset_at" not in context:
+        if (
+            isinstance(retry_after, (str, int, float))
+            and retry_after != ""
+            and "reset_at" not in context
+        ):
             try:
                 context["reset_at"] = time.time() + float(retry_after)
             except (TypeError, ValueError):

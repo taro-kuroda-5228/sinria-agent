@@ -1452,7 +1452,14 @@ def execute_code(
 
 def _kill_process_group(proc, escalate: bool = False):
     """Kill the child and its entire process tree (cross-platform via psutil)."""
-    import psutil
+    try:
+        import psutil
+    except ImportError:
+        # psutil is declared in pyproject but can be absent at runtime
+        # (standalone builds, foreign venvs). The kill path must still work
+        # or the child tree leaks on timeout/interrupt.
+        _kill_process_group_fallback(proc, escalate=escalate)
+        return
     try:
         parent = psutil.Process(proc.pid)
         children = parent.children(recursive=True)
@@ -1498,6 +1505,40 @@ def _kill_process_group(proc, escalate: bool = False):
                     proc.kill()
                 except Exception as e2:
                     logger.debug("Could not kill process: %s", e2, exc_info=True)
+
+
+def _kill_process_group_fallback(proc, escalate: bool = False):
+    """Best-effort tree kill for runtimes without psutil.
+
+    execute_code children are session leaders on POSIX (preexec_fn=os.setsid),
+    so signalling their process group reaches the whole tree. Children that
+    share our own group (e.g. test sleepers) must never be group-signalled —
+    that would take down the caller — so those get a plain terminate/kill.
+    """
+    def _signal_tree(hard: bool):
+        if not _IS_WINDOWS:
+            try:
+                pgid = os.getpgid(proc.pid)
+                # Never signal our own process group (would kill the gateway/pytest).
+                killpg = getattr(os, "killpg", None)
+                if pgid != os.getpgid(0) and killpg is not None:
+                    hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                    killpg(pgid, hard_signal if hard else signal.SIGTERM)
+                    return
+            except (ProcessLookupError, PermissionError, OSError) as e:
+                logger.debug("Fallback group signal failed: %s", e, exc_info=True)
+        try:
+            proc.kill() if hard else proc.terminate()
+        except Exception as e:
+            logger.debug("Fallback kill failed: %s", e, exc_info=True)
+
+    _signal_tree(hard=False)
+    if escalate:
+        # Mirror the psutil path: give the tree 5s after SIGTERM, then SIGKILL.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _signal_tree(hard=True)
 
 
 def _load_config() -> dict:
@@ -1630,7 +1671,9 @@ def _resolve_child_cwd(mode: str, staging_dir: str) -> str:
     """
     if mode != "project":
         return staging_dir
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    from gateway.session_context import get_session_env
+
+    raw = get_session_env("TERMINAL_CWD", "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):

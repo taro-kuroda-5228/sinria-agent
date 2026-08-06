@@ -5,10 +5,31 @@ This transport owns format conversion and normalization — NOT client lifecycle
 streaming, or the _run_codex_stream() call path.
 """
 
+import logging
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
-from agent.transports.base import ProviderTransport
+from agent.transports.base import (
+    ProviderTransport,
+    validate_extra_headers,
+    validate_request_overrides,
+)
 from agent.transports.types import NormalizedResponse, ToolCall
+
+logger = logging.getLogger(__name__)
+
+
+def _normalize_openai_responses_model(model: str) -> str:
+    """Normalize documented GPT-5.6 aliases before sending Responses calls.
+
+    OpenAI documents ``gpt-5.6`` as an alias for ``gpt-5.6-sol``. Some
+    Responses-compatible OAuth backends accept the concrete model slug before
+    they accept the alias, so keep the user-facing default as ``gpt-5.6`` while
+    making the wire request use the verified flagship slug.
+    """
+    if model == "gpt-5.6":
+        return "gpt-5.6-sol"
+    return model
 
 
 class ResponsesApiTransport(ProviderTransport):
@@ -17,6 +38,18 @@ class ResponsesApiTransport(ProviderTransport):
     Wraps the functions extracted into codex_responses_adapter.py (PR 1).
     """
 
+    _last_issuer_kind: Optional[str] = None
+
+    def _resolve_issuer_kind(self, params: Dict[str, Any]) -> str:
+        from agent.codex_responses_adapter import _classify_responses_issuer
+
+        return _classify_responses_issuer(
+            is_xai_responses=bool(params.get("is_xai_responses")),
+            is_github_responses=bool(params.get("is_github_responses")),
+            is_codex_backend=bool(params.get("is_codex_backend")),
+            base_url=params.get("base_url"),
+        )
+
     @property
     def api_mode(self) -> str:
         return "codex_responses"
@@ -24,9 +57,15 @@ class ResponsesApiTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        issuer_kind = self._resolve_issuer_kind(kwargs)
+        self._last_issuer_kind = issuer_kind
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=bool(kwargs.get("is_xai_responses")),
+            replay_encrypted_reasoning=bool(
+                kwargs.get("replay_encrypted_reasoning", True)
+            ),
+            current_issuer_kind=issuer_kind,
         )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
@@ -78,6 +117,11 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)
         is_xai_responses = params.get("is_xai_responses", False)
+        replay_encrypted_reasoning = bool(
+            params.get("replay_encrypted_reasoning", True)
+        )
+        issuer_kind = self._resolve_issuer_kind(params)
+        self._last_issuer_kind = issuer_kind
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -91,10 +135,47 @@ class ResponsesApiTransport(ProviderTransport):
 
         _effort_clamp = {"minimal": "low"}
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
+        # Very-large inputs drive long silent server-side reasoning — the
+        # dominant first-token latency that trips the stream watchdog. Step
+        # effort down one level for very-large requests so the backend starts
+        # responding sooner (paired with the more generous first-token
+        # watchdog budget). Tunable via HERMES_ADAPTIVE_REASONING.
+        from agent.request_efficiency import (
+            approximate_request_chars,
+            clamp_reasoning_effort_for_request_size,
+        )
+        reasoning_effort = clamp_reasoning_effort_for_request_size(
+            reasoning_effort, approximate_request_chars(messages)
+        )
+
+        raw_request_overrides = params.get("request_overrides")
+        validate_request_overrides(raw_request_overrides)
+        request_overrides = dict(raw_request_overrides or {})
+        programmatic_tool_calling = bool(request_overrides.pop("programmatic_tool_calling", False))
+        mark_all_tools_programmatic = bool(
+            request_overrides.pop("programmatic_tool_calling_mark_all_tools_eligible", False)
+        )
 
         response_tools = _responses_tools(tools)
+        # Programmatic Tool Calling is a direct-OpenAI Responses feature.  The
+        # ChatGPT Codex OAuth backend (chatgpt.com/backend-api/codex) rejects
+        # the hosted coordinator tool with HTTP 400 ("Unsupported tool type:
+        # programmatic_tool_calling"), which would 400 every call.  Gate it off
+        # the Codex backend so a config-level default_enabled can't take the
+        # whole provider down; leave it intact for backends that support it.
+        if programmatic_tool_calling and is_codex_backend:
+            logger.debug(
+                "programmatic_tool_calling requested but unsupported on the "
+                "ChatGPT Codex backend; skipping the coordinator tool."
+            )
+        elif response_tools and programmatic_tool_calling:
+            for tool in response_tools:
+                if tool.get("type") == "function" and mark_all_tools_programmatic:
+                    tool.setdefault("allowed_callers", ["direct", "programmatic"])
+            if not any(tool.get("type") == "programmatic_tool_calling" for tool in response_tools):
+                response_tools.append({"type": "programmatic_tool_calling"})
         kwargs = {
-            "model": model,
+            "model": _normalize_openai_responses_model(model),
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,
@@ -142,8 +223,28 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
-        request_overrides = params.get("request_overrides")
         if request_overrides:
+            reasoning_override = request_overrides.pop("reasoning", None)
+            if isinstance(reasoning_override, dict):
+                reasoning_override = dict(reasoning_override)
+                if is_codex_backend and "mode" in reasoning_override:
+                    # The ChatGPT Codex OAuth backend rejects reasoning.mode
+                    # with HTTP 400 ("reasoning.mode is not supported with this
+                    # model").  Drop it here so a config-level reasoning_mode
+                    # default can't 400 every call.  (reasoning.context and
+                    # reasoning.effort are accepted and survive.)
+                    logger.debug(
+                        "reasoning.mode unsupported on the ChatGPT Codex "
+                        "backend; dropping it from the request."
+                    )
+                    reasoning_override.pop("mode", None)
+                base_reasoning = kwargs.get("reasoning")
+                if isinstance(base_reasoning, dict):
+                    merged_reasoning = dict(base_reasoning)
+                    merged_reasoning.update(reasoning_override)
+                    kwargs["reasoning"] = merged_reasoning
+                else:
+                    kwargs["reasoning"] = dict(reasoning_override)
             kwargs.update(request_overrides)
 
         if is_codex_backend:
@@ -152,7 +253,7 @@ class ResponsesApiTransport(ProviderTransport):
             if cache_scope_id:
                 existing_extra_headers = kwargs.get("extra_headers")
                 merged_extra_headers: Dict[str, str] = {}
-                if isinstance(existing_extra_headers, dict):
+                if isinstance(existing_extra_headers, Mapping):
                     merged_extra_headers.update(
                         {
                             str(key): str(value)
@@ -171,7 +272,7 @@ class ResponsesApiTransport(ProviderTransport):
         if is_xai_responses and session_id:
             existing_extra_headers = kwargs.get("extra_headers")
             merged_extra_headers: Dict[str, str] = {}
-            if isinstance(existing_extra_headers, dict):
+            if isinstance(existing_extra_headers, Mapping):
                 merged_extra_headers.update(
                     {
                         str(key): str(value)
@@ -192,6 +293,9 @@ class ResponsesApiTransport(ProviderTransport):
                 merged_extra_body.update(existing_extra_body)
             merged_extra_body.setdefault("prompt_cache_key", session_id)
             kwargs["extra_body"] = merged_extra_body
+
+        if "extra_headers" in kwargs:
+            validate_extra_headers(kwargs["extra_headers"], source="api_kwargs")
 
         return kwargs
 

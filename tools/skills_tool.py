@@ -979,13 +979,16 @@ def skill_view(
             candidates.append((sd, smd))
 
         for search_dir in all_dirs:
+            exact_match_in_root = False
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
             if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
                 _record(direct_path, direct_path / "SKILL.md")
+                exact_match_in_root = True
             elif direct_path.with_suffix(".md").exists():
                 _record(None, direct_path.with_suffix(".md"))
+                exact_match_in_root = True
 
             # Strategy 1b: categorized form for plugin namespace fall-through
             # (e.g., a "myplugin:explore" name with no plugin registered also
@@ -994,8 +997,16 @@ def skill_view(
                 categorized_path = search_dir / local_category_name
                 if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
                     _record(categorized_path, categorized_path / "SKILL.md")
+                    exact_match_in_root = True
                 elif categorized_path.with_suffix(".md").exists():
                     _record(None, categorized_path.with_suffix(".md"))
+                    exact_match_in_root = True
+
+            # Recursive lookup is a compatibility fallback for bare names. An
+            # exact path in this root is canonical; nested copies remain
+            # available through their qualified category/skill path.
+            if exact_match_in_root:
+                continue
 
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name).

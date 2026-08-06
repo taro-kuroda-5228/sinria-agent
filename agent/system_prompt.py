@@ -248,7 +248,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None, 
         # mode).  The gateway process runs from the sinria-agent install
         # dir, so os.getcwd() would pick up the repo's AGENTS.md and
         # other dev files — inflating token usage by ~10k for no benefit.
-        _context_cwd = os.getenv("TERMINAL_CWD") or None
+        from gateway.session_context import get_session_env
+
+        _context_cwd = get_session_env("TERMINAL_CWD", "") or None
         context_files_prompt = _r.build_context_files_prompt(
             cwd=_context_cwd, skip_soul=_soul_loaded)
         if context_files_prompt:
@@ -274,39 +276,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None, 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # Context Share v2 volatile guidance: the current turn should be resolved
-    # against prior corrections, memory/profile, and organization-safe policy
-    # before action. This block is intentionally compact and sanitized.
-    try:
-        from agent.context_share.intent_resolver import build_context_resolver_fallback_prompt, build_context_resolver_prompt
-        # Resolve Context Share from the *current request* only.  The cached
-        # system_message can contain prior gateway/session overlays from a
-        # different Discord channel (or a prior Context Share block); feeding
-        # that back into the resolver makes old channel/project context
-        # self-reinforce into unrelated channels.  Fall back to system_message
-        # only for non-gateway callers that do not provide a current message.
-        resolver_request = current_user_message if current_user_message else system_message
-        resolver_seed = "\n".join(
-            str(part) for part in (resolver_request, getattr(agent, "platform", "")) if part
-        )
-        resolver_block = "" if "Context Share Resolver" in resolver_seed else build_context_resolver_prompt(
-            resolver_seed,
-            platform=getattr(agent, "platform", None),
-        )
-        if resolver_block:
-            volatile_parts.append(
-                _budgeted(resolver_block, "resolver_char_budget", "Context Share resolver")
-            )
-    except Exception as exc:
-        volatile_parts.append(
-            "## Context Share Resolver\n\n"
-            "Context resolver failed during system-prompt assembly; applying fail-closed Sinria defaults.\n"
-            f"- Recoverable cause: {str(exc)[:160]}\n"
-            "- Applicable fail-closed constraints:\n"
-            "  - Use Sinria-native paths/labels and avoid Hermes residue in user-facing artifacts unless discussing legacy internals.\n"
-            "  - Team Mode shares metadata-only Company OS control-plane rows; raw/private context stays local/on-prem.\n"
-            "  - Self-improvement must convert repeated prior corrections into memory, skills, tests, and runbooks instead of one-off apologies."
-        )
+    # Correction advice is intentionally NOT assembled into the cached system
+    # prompt. The conversation loop resolves it once per turn and attaches it
+    # to that turn's user-message context. Building it here as well used to
+    # perform duplicate durable lookups, inflate the SQLite prompt snapshot,
+    # and then discard the block at the API boundary to preserve prefix-cache
+    # stability. ``current_user_message`` remains in this public helper's
+    # signature for compatibility with callers from older releases.
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:

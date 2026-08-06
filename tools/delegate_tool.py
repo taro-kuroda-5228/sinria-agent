@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -504,6 +505,122 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
+_TASK_TOOLSET_HINTS = {
+    "file": re.compile(
+        r"\b(file|files|directory|folder|repository|repo|code|codebase|source code|"
+        r"implement|implementation|patch|refactor|code review|logs?)\b|"
+        r"ファイル|ディレクトリ|フォルダ|リポジトリ|コード|実装|修正|編集|ログ"
+    ),
+    "terminal": re.compile(
+        r"\b(terminal|shell|command|git|build|compile|install|dependency|"
+        r"debug|pytest|lint|typecheck|type-check|npm|pnpm|yarn|pip|process)\b|"
+        r"\b(?:run|execute)(?:\s+(?:the|targeted|relevant|regression|full|complete|unit|"
+        r"integration|end-to-end|e2e))*\s+(?:tests?|test\s+suite)\b|"
+        r"ターミナル|シェル|コマンド|ビルド|実行|テスト|デバッグ|依存関係|インストール"
+    ),
+    "web": re.compile(
+        r"https?://|\b(current|latest|recent|news|online|internet|web search|"
+        r"search the web|research|release notes?|public sources?)\b|"
+        r"ウェブ|web検索|検索|調査|最新|現在|ニュース|公開情報"
+    ),
+    "browser": re.compile(
+        r"\b(browser|website|web page|click|log[ -]?in|sign[ -]?in|form|"
+        r"navigate|captcha|browser console|page screenshot)\b|"
+        r"ブラウザ|ウェブサイト|クリック|ログイン|フォーム|画面操作|captcha"
+    ),
+    "vision": re.compile(
+        r"\b(image|photo|picture|visual|local screenshot)\b|画像|写真|視覚|ローカル.*スクリーンショット"
+    ),
+    "image_gen": re.compile(
+        r"\b(generate|create|draw|render) (an? )?(image|illustration|picture)\b|"
+        r"画像生成|イラスト生成"
+    ),
+    "video": re.compile(r"\b(analy[sz]e|inspect) (a )?video\b|動画.*(解析|分析)"),
+    "video_gen": re.compile(r"\b(generate|create) (a )?video\b|動画生成"),
+    "tts": re.compile(r"\b(text[ -]?to[ -]?speech|speech audio|voice memo)\b|音声合成|読み上げ"),
+    "session_search": re.compile(
+        r"\b(previous|past|earlier) (conversation|session|chat)\b|過去の会話|前回の会話|セッション検索"
+    ),
+    "sinria_integrations": re.compile(
+        r"\b(ehr|emr|fhir|hl7|medevidence|connector)\b|電子カルテ|メドエビデンス|コネクタ"
+    ),
+    "x_search": re.compile(r"\b(twitter|x posts?|x threads?)\b|twitter検索|x検索"),
+    "ml_training": re.compile(
+        r"\b(fine[ -]?tun(e|ing)|lora|training dataset|train (an? )?(llm|model))\b|"
+        r"ファインチューニング|モデル学習"
+    ),
+    "computer_use": re.compile(
+        r"\b(mac(os)? desktop|desktop app|mouse|keyboard automation)\b|mac.*デスクトップ|マウス操作"
+    ),
+}
+
+_TASK_TOOLSET_ORDER = (
+    "file",
+    "terminal",
+    "web",
+    "browser",
+    "vision",
+    "image_gen",
+    "video",
+    "video_gen",
+    "tts",
+    "session_search",
+    "sinria_integrations",
+    "x_search",
+    "ml_training",
+    "computer_use",
+)
+
+
+def _infer_task_toolsets(
+    goal: str,
+    context: Optional[str],
+    available_toolsets: set[str],
+) -> List[str]:
+    """Select the smallest parent-authorized toolset set for one child task.
+
+    The classifier is deliberately deterministic and conservative: it never
+    adds a toolset the parent cannot provide, and no hint means no tools. The
+    caller can always bypass inference by passing an explicit ``toolsets``
+    list (including ``[]`` for a reasoning-only child).
+    """
+    available = set(available_toolsets or set())
+    raw_text = f"{goal or ''}\n{context or ''}".lower()
+    normalized_text = re.sub(r"[_-]+", " ", raw_text)
+    selected: List[str] = []
+
+    def _add(name: str) -> None:
+        if name in available and name not in selected:
+            selected.append(name)
+
+    # Exact mentions cover specialized/plugin/MCP toolsets without maintaining
+    # an ever-growing platform map. Core names use richer hints below to avoid
+    # false positives such as "website" accidentally matching "web".
+    core_names = set(_TASK_TOOLSET_HINTS)
+    for name in sorted(available):
+        if name in core_names or name in _EXCLUDED_TOOLSET_NAMES:
+            continue
+        normalized_name = re.sub(r"[_-]+", " ", str(name).lower()).strip()
+        if normalized_name and re.search(
+            rf"(?<!\w){re.escape(normalized_name)}(?!\w)", normalized_text
+        ):
+            _add(name)
+
+    for name in _TASK_TOOLSET_ORDER:
+        pattern = _TASK_TOOLSET_HINTS[name]
+        if pattern.search(raw_text):
+            _add(name)
+
+    # Browser automation already includes web_search; sending both schemas is
+    # redundant. A search-only parent still receives its lighter toolset.
+    if "browser" in selected and "web" in selected:
+        selected.remove("web")
+    elif "web" not in selected and _TASK_TOOLSET_HINTS["web"].search(raw_text):
+        _add("search")
+
+    return _strip_blocked_tools(selected)
+
+
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_CHILD_TIMEOUT = 600  # seconds before a child agent is considered stuck
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
@@ -644,8 +761,10 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     teaching subagents a fake container path while still helping them avoid
     guessing `/workspace/...` for local repo tasks.
     """
+    from gateway.session_context import get_session_env
+
     candidates = [
-        os.getenv("TERMINAL_CWD"),
+        get_session_env("TERMINAL_CWD", ""),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
         ),
@@ -937,18 +1056,21 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
-        # Intersect with parent — subagent must not gain tools the parent lacks.
-        # Expand composite toolsets (e.g. hermes-cli) so that individual
-        # toolset names (e.g. web, terminal) are recognised during intersection.
-        expanded_parent = _expand_parent_toolsets(parent_toolsets)
+    expanded_parent = _expand_parent_toolsets(parent_toolsets)
+    if toolsets is not None:
+        # Explicit input is authoritative, including [] for a reasoning-only
+        # child. Intersect with parent so delegation never adds capability.
         child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        if toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
         child_toolsets = _strip_blocked_tools(child_toolsets)
+    elif is_truthy_value(delegation_cfg.get("auto_toolsets"), default=True):
+        child_toolsets = _infer_task_toolsets(goal, context, expanded_parent)
     elif parent_agent and parent_enabled is not None:
+        # Compatibility escape hatch: delegation.auto_toolsets=false restores
+        # broad parent inheritance for installations with custom workflows.
         child_toolsets = _strip_blocked_tools(parent_enabled)
     elif parent_toolsets:
         child_toolsets = _strip_blocked_tools(sorted(parent_toolsets))
@@ -1324,6 +1446,9 @@ def _run_single_child(
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    if child is None:
+        raise ValueError("_run_single_child requires a pre-built child agent")
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -1531,11 +1656,39 @@ def _run_single_child(
             # See #14726 — without this, 0-API-call hangs are black boxes.
             diagnostic_path: Optional[str] = None
             child_api_calls = 0
+            child_activity: Dict[str, Any] = {}
             try:
-                _summary = child.get_activity_summary()
-                child_api_calls = int(_summary.get("api_call_count", 0) or 0)
+                child_activity = child.get_activity_summary() or {}
+                child_api_calls = int(child_activity.get("api_call_count", 0) or 0)
             except Exception:
-                pass
+                child_activity = {}
+
+            def _safe_activity_text(value: Any, limit: int) -> Optional[str]:
+                if value is None:
+                    return None
+                text = " ".join(str(value).split())
+                return text[:limit] or None
+
+            timeout_context: Dict[str, Any] = {}
+            last_activity = _safe_activity_text(
+                child_activity.get("last_activity_desc"), 160
+            )
+            current_tool = _safe_activity_text(
+                child_activity.get("current_tool"), 80
+            )
+            try:
+                inactive_seconds = round(
+                    max(0.0, float(child_activity.get("seconds_since_activity", 0))),
+                    2,
+                )
+            except (TypeError, ValueError):
+                inactive_seconds = 0.0
+            if last_activity:
+                timeout_context["last_activity"] = last_activity
+            if current_tool:
+                timeout_context["current_tool"] = current_tool
+            if inactive_seconds:
+                timeout_context["inactive_seconds"] = inactive_seconds
             if is_timeout and child_api_calls == 0:
                 diagnostic_path = _dump_subagent_timeout_diagnostic(
                     child=child,
@@ -1587,6 +1740,17 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            if is_timeout and timeout_context:
+                detail_parts = []
+                if last_activity:
+                    detail_parts.append(f"last activity: {last_activity}")
+                if current_tool:
+                    detail_parts.append(f"current tool: {current_tool}")
+                if inactive_seconds:
+                    detail_parts.append(f"inactive for {inactive_seconds}s")
+                if detail_parts:
+                    _err += " Timeout context: " + "; ".join(detail_parts) + "."
+
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
@@ -1597,6 +1761,7 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "timeout_context": timeout_context if is_timeout else {},
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2057,7 +2222,7 @@ def delegate_task(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
+                toolsets=t["toolsets"] if "toolsets" in t else None,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,

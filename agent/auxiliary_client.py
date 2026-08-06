@@ -130,7 +130,11 @@ _stale_base_url_warned = False
 
 
 def _cli_cmd(command: str) -> str:
-    cli_name = (os.getenv("HERMES_CLI_NAME") or "hermes").strip().lower() or "hermes"
+    cli_name = (
+        os.getenv("SINRIA_CLI_NAME")
+        or os.getenv("HERMES_CLI_NAME")  # legacy compatibility alias
+        or "sinria"
+    ).strip().lower() or "sinria"
     return f"{cli_name} {command}".strip()
 
 
@@ -2148,6 +2152,14 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return False
 
 
+def _is_not_found_error(exc: Exception) -> bool:
+    """Detect a missing model/resource that warrants auto-provider fallback."""
+    return (
+        getattr(exc, "status_code", None) == 404
+        or type(exc).__name__ == "NotFoundError"
+    )
+
+
 def _is_connection_error(exc: Exception) -> bool:
     """Detect connection/network errors that warrant provider fallback.
 
@@ -2323,6 +2335,46 @@ def _pool_error_context(exc: Exception) -> Dict[str, Any]:
     return payload
 
 
+def _is_model_scoped_usage_limit(exc: Exception, model: Optional[str]) -> bool:
+    """Return whether a 429 exhausts only the requested model's plan bucket.
+
+    ChatGPT's Codex Spark entitlement has an independent Pro usage bucket.  Its
+    ``usage_limit_reached`` response must not poison the shared Codex OAuth
+    credential, which may still serve Luna and the primary conversation model.
+    Keep this deliberately narrow: generic rate limits and other models retain
+    the existing credential-pool exhaustion behavior.
+    """
+    if getattr(exc, "status_code", None) != 429:
+        return False
+    normalized_model = str(model or "").strip().lower().replace("_", "-")
+    if normalized_model != "gpt-5.3-codex-spark":
+        return False
+    message = str(exc).lower()
+    return "usage_limit_reached" in message and "plan_type" in message
+
+
+def _task_fallback_routes(task: Optional[str], primary_provider: str) -> list[tuple[str, str]]:
+    """Resolve an ordered, task-local auxiliary fallback chain from config."""
+    if not task:
+        return []
+    raw = _get_auxiliary_task_config(task).get("fallback_models")
+    if not isinstance(raw, list):
+        return []
+    routes: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or primary_provider or "").strip()
+        model = str(item.get("model") or "").strip()
+        route = (provider, model)
+        if not provider or not model or route in seen:
+            continue
+        routes.append(route)
+        seen.add(route)
+    return routes
+
+
 def _recoverable_pool_provider(resolved_provider: str, client: Any) -> Optional[str]:
     """Infer which provider pool can recover the current auxiliary client."""
     normalized = _normalize_aux_provider(resolved_provider)
@@ -2437,6 +2489,13 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    retry_kwargs = _prepare_auxiliary_llm_payload(
+        task=task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        client=retry_client,
+        payload=retry_kwargs,
+    )
     return _validate_llm_response(
         retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -2494,6 +2553,13 @@ async def _retry_same_provider_async(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
+    retry_kwargs = _prepare_auxiliary_llm_payload(
+        task=task,
+        provider=resolved_provider,
+        model=retry_model or final_model,
+        client=retry_client,
+        payload=retry_kwargs,
+    )
     return _validate_llm_response(
         await retry_client.chat.completions.create(**retry_kwargs), task,
     )
@@ -4128,6 +4194,105 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
 
 
 
+def _configured_boundary_provider_key(
+    *, provider: Optional[str], base_url: str
+) -> str:
+    """Resolve an explicit trust-registry identity for a named custom endpoint.
+
+    Arbitrary custom endpoints remain untrusted.  The identity is accepted only
+    from the config entry whose normalized URL matches the actual client URL.
+    """
+
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider != "custom" and not normalized_provider.startswith("custom:"):
+        return ""
+    normalized_url = str(base_url or "").strip().rstrip("/")
+    if not normalized_url:
+        return ""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config() or {}
+    except Exception:
+        return ""
+
+    candidates = []
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        candidates.extend(entry for entry in providers.values() if isinstance(entry, dict))
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        candidates.extend(entry for entry in custom_providers if isinstance(entry, dict))
+
+    for entry in candidates:
+        entry_url = str(entry.get("base_url") or entry.get("url") or "").strip().rstrip("/")
+        if entry_url != normalized_url:
+            continue
+        provider_key = str(entry.get("boundary_provider_key") or "").strip()
+        if provider_key:
+            return provider_key
+    return ""
+
+
+def _auxiliary_boundary_agent(
+    *, provider: Optional[str], model: Optional[str], client: Any
+) -> SimpleNamespace:
+    base_url = str(getattr(client, "base_url", "") or "")
+    return SimpleNamespace(
+        provider=str(provider or ""),
+        model=str(model or ""),
+        base_url=base_url,
+        sinria_provider_key=_configured_boundary_provider_key(
+            provider=provider,
+            base_url=base_url,
+        ),
+        session_id="auxiliary-compression",
+    )
+
+
+def _prepare_auxiliary_llm_payload(
+    *,
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    client: Any,
+    payload: dict,
+) -> dict:
+    """Redact and guard the exact compression-provider transport kwargs."""
+
+    if task != "compression":
+        return payload
+
+    from agent.sinria_egress import prepare_model_provider_payload
+
+    boundary_agent = _auxiliary_boundary_agent(
+        provider=provider,
+        model=model,
+        client=client,
+    )
+    return prepare_model_provider_payload(boundary_agent, payload)
+
+
+def _prepare_auxiliary_llm_egress(
+    *,
+    task: Optional[str],
+    provider: Optional[str],
+    model: Optional[str],
+    client: Any,
+    messages: list,
+) -> list:
+    """Compatibility wrapper for callers that only prepare message lists."""
+
+    prepared = _prepare_auxiliary_llm_payload(
+        task=task,
+        provider=provider,
+        model=model,
+        client=client,
+        payload={"messages": messages},
+    )
+    return prepared["messages"]
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -4262,6 +4427,7 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    _task_fallback_allowed: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -4372,6 +4538,14 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    kwargs = _prepare_auxiliary_llm_payload(
+        task=task,
+        provider=resolved_provider,
+        model=final_model,
+        client=client,
+        payload=kwargs,
+    )
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
@@ -4484,9 +4658,52 @@ def call_llm(
                     effective_extra_body=effective_extra_body,
                 )
 
+        # ── Task-scoped model fallback ─────────────────────────────────
+        # Explicit auxiliary routes are normally hard constraints.  A declared
+        # fallback_models chain is the one exception: it stays within the task
+        # and runs before credential-pool rotation or global provider fallback.
+        task_routes = (
+            _task_fallback_routes(task, resolved_provider)
+            if _task_fallback_allowed else []
+        )
+        task_fallback_error = first_err
+        if task_routes and (
+            _is_payment_error(first_err)
+            or _is_connection_error(first_err)
+            or _is_rate_limit_error(first_err)
+            or _is_not_found_error(first_err)
+        ):
+            for fallback_provider, fallback_model in task_routes:
+                if fallback_provider == resolved_provider and fallback_model == final_model:
+                    continue
+                logger.info(
+                    "Auxiliary %s: primary route %s/%s unavailable; trying task-local fallback %s/%s",
+                    task, resolved_provider, final_model, fallback_provider, fallback_model,
+                )
+                try:
+                    return call_llm(
+                        task=task,
+                        provider=fallback_provider,
+                        model=fallback_model,
+                        main_runtime=main_runtime,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        timeout=timeout,
+                        extra_body=extra_body,
+                        _task_fallback_allowed=False,
+                    )
+                except Exception as fallback_err:
+                    task_fallback_error = fallback_err
+            setattr(task_fallback_error, "task_fallback_exhausted", True)
+            raise task_fallback_error
+
         # ── Same-provider credential-pool recovery ─────────────────────
         pool_provider = _recoverable_pool_provider(resolved_provider, client)
-        if pool_provider and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err)):
+        model_scoped_limit = _is_model_scoped_usage_limit(first_err, final_model)
+        if (pool_provider and not model_scoped_limit
+                and (_is_auth_error(first_err) or _is_payment_error(first_err) or _is_rate_limit_error(first_err))):
             recovery_err = first_err
             if _is_rate_limit_error(first_err):
                 try:
@@ -4539,6 +4756,7 @@ def call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_not_found_error(first_err)
         )
         # Only try alternative providers when the user didn't explicitly
         # configure this task's provider.  Explicit provider = hard constraint;
@@ -4556,6 +4774,8 @@ def call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_not_found_error(first_err):
+                reason = "model or resource not found"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -4569,6 +4789,13 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
+                fb_kwargs = _prepare_auxiliary_llm_payload(
+                    task=task,
+                    provider=fb_label,
+                    model=fb_model,
+                    client=fb_client,
+                    payload=fb_kwargs,
+                )
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
         # Connection/timeout errors leave the cached client poisoned (closed
@@ -4730,6 +4957,14 @@ async def async_call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    kwargs = _prepare_auxiliary_llm_payload(
+        task=task,
+        provider=resolved_provider,
+        model=final_model,
+        client=client,
+        payload=kwargs,
+    )
+
     try:
         return _validate_llm_response(
             await client.chat.completions.create(**kwargs), task)
@@ -4871,6 +5106,7 @@ async def async_call_llm(
             _is_payment_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
+            or _is_not_found_error(first_err)
         )
         is_auto = resolved_provider in {"auto", "", None}
         if should_fallback and is_auto:
@@ -4881,6 +5117,8 @@ async def async_call_llm(
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"
+            elif _is_not_found_error(first_err):
+                reason = "model or resource not found"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",
@@ -4900,6 +5138,13 @@ async def async_call_llm(
                 )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
+                fb_kwargs = _prepare_auxiliary_llm_payload(
+                    task=task,
+                    provider=fb_label,
+                    model=async_fb_model or fb_model,
+                    client=async_fb,
+                    payload=fb_kwargs,
+                )
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
         # Mirror the sync path: drop poisoned clients on connection/timeout

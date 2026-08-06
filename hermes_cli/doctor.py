@@ -984,26 +984,18 @@ def run_doctor(args):
         # Determine the venv entry point location
         _cli_name = _cli_command_name()
         _venv_bin = None
+        # Wheel/uv installs can live outside the source checkout. In that case
+        # the console script is next to the active Python executable.
+        _runtime_candidate = Path(sys.executable).parent / _cli_name
+        if _runtime_candidate.exists():
+            _venv_bin = _runtime_candidate
         for _venv_name in ("venv", ".venv"):
+            if _venv_bin is not None:
+                break
             _candidate = PROJECT_ROOT / _venv_name / "bin" / _cli_name
             if _candidate.exists():
                 _venv_bin = _candidate
                 break
-
-        # A wheel/uvx install has no source checkout venv under PROJECT_ROOT;
-        # its valid console script lives beside the active Python executable.
-        # Restrict this path to an imported package tree with no .git directory
-        # so source checkouts and doctor tests keep using the managed symlink
-        # checks below.
-        _module_root = Path(__file__).resolve().parents[1]
-        _packaged_install = (
-            not (PROJECT_ROOT / ".git").exists()
-            and _module_root == PROJECT_ROOT.resolve()
-        )
-        if _venv_bin is None and _packaged_install:
-            _active_entrypoint = Path(sys.executable).parent / _cli_name
-            if _active_entrypoint.exists():
-                _venv_bin = _active_entrypoint
 
         # Determine the expected command link directory (mirrors install.sh logic)
         _prefix = os.environ.get("PREFIX", "")
@@ -1015,9 +1007,6 @@ def run_doctor(args):
             _cmd_link_dir = Path.home() / ".local" / "bin"
             _cmd_link_display = "~/.local/bin"
         _cli_name = _cli_command_name()
-        if _packaged_install and _venv_bin is not None:
-            _cmd_link_dir = _venv_bin.parent
-            _cmd_link_display = str(_cmd_link_dir)
         _cmd_link = _cmd_link_dir / _cli_name
 
         if _venv_bin is None:
@@ -1030,10 +1019,10 @@ def run_doctor(args):
             )
         else:
             try:
-                _venv_display = str(_venv_bin.relative_to(PROJECT_ROOT))
+                _entry_display = _venv_bin.relative_to(PROJECT_ROOT)
             except ValueError:
-                _venv_display = str(_venv_bin)
-            check_ok(f"Venv entry point exists ({_venv_display})")
+                _entry_display = _venv_bin
+            check_ok(f"Venv entry point exists ({_entry_display})")
 
             # Check the symlink at the command link location
             if _cmd_link.is_symlink():

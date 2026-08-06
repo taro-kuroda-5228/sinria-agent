@@ -25,7 +25,11 @@ import ssl
 import threading
 import time
 import uuid
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import yaml
 
 from agent.anthropic_adapter import _is_oauth_token
 from agent.auxiliary_client import set_runtime_main
@@ -34,6 +38,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.correction_loop.advice import format_correction_advice
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -59,10 +64,21 @@ from agent.nous_rate_guard import (
     nous_rate_limit_remaining,
     record_nous_rate_limit,
 )
+from agent.provider_quota_guard import (
+    get_hard_usage_limit,
+    record_hard_usage_limit,
+)
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.dynamic_tool_selector import apply_dynamic_tool_selection
+from agent.request_efficiency import (
+    VERY_LARGE_REQUEST_CHAR_THRESHOLD,
+    approximate_request_chars,
+)
 from agent.retry_utils import jittered_backoff
+from agent.sinria_egress import SinriaEgressBlocked, SinriaEgressGuardFailure
 from agent.trajectory import has_incomplete_scratchpad
+from agent.transports.base import RequestConfigurationError
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn
 from hermes_logging import set_session_context
@@ -73,28 +89,39 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-_CONTEXT_SHARE_SECTION_RE = re.compile(
-    r"(?:\n{2,}|^)## Context Share Resolver\n\n.*?(?=\n{2,}## |\Z)",
-    re.DOTALL,
-)
+def _build_effective_system(active_system_prompt: str, ephemeral_system_prompt: str) -> str:
+    """Build the per-call system string from session-stable inputs."""
+    effective = (active_system_prompt or "").strip()
+    ephemeral = (ephemeral_system_prompt or "").strip()
+    if ephemeral:
+        effective = (effective + "\n\n" + ephemeral).strip() if effective else ephemeral
+    return effective
 
 
-def _strip_context_share_sections(text: str) -> str:
-    """Remove any Context Share resolver sections from text."""
-    return _CONTEXT_SHARE_SECTION_RE.sub("\n\n", text or "").strip()
+def _current_turn_user_injections(*blocks: str) -> list:
+    """Order and deduplicate current-turn advisory injections."""
+    result = []
+    seen = set()
+    for block in blocks:
+        if not block or block in seen:
+            continue
+        seen.add(block)
+        result.append(block)
+    return result
 
 
-def _append_single_context_share_overlay(system_prompt: str, context_share_block: str) -> str:
-    """Return system_prompt with exactly one current Context Share overlay.
+def _format_quota_reset_for_report(reset_at) -> str:
+    """Render a provider quota reset time in the operator's local timezone."""
+    try:
+        epoch = float(reset_at)
+    except (TypeError, ValueError):
+        return str(reset_at)
+    try:
+        from datetime import datetime
 
-    Context Share v2 is current-turn state: it must not accumulate stale
-    resolver blocks across cached prompts, gateway pre-injection, or retries.
-    """
-    base = _strip_context_share_sections(system_prompt)
-    block = (context_share_block or "").strip()
-    if not block:
-        return base
-    return (base + "\n\n" + block).strip() if base else block
+        return datetime.fromtimestamp(epoch).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    except (OSError, OverflowError, ValueError):
+        return str(reset_at)
 
 
 def _build_api_retry_exhausted_final_response(
@@ -105,6 +132,9 @@ def _build_api_retry_exhausted_final_response(
     model: str,
     is_rate_limited: bool = False,
     is_stream_drop: bool = False,
+    very_large_replay_suppressed: bool = False,
+    quota_reset_at=None,
+    is_billing_exhausted: bool = False,
 ) -> str:
     """Return user-actionable text for exhausted model API retries.
 
@@ -144,8 +174,20 @@ def _build_api_retry_exhausted_final_response(
             "- This is a recoverable request-level safety stop, not an intentional shutdown or session reset.",
         ])
     elif is_rate_limited:
+        if quota_reset_at:
+            lines.extend([
+                "- The provider reports an account/plan usage limit has been reached (a period quota, not a transient rate spike).",
+                f"- Quota resets at {_format_quota_reset_for_report(quota_reset_at)}.",
+                f"- Target was {provider_label} / {model_label}.",
+            ])
+        else:
+            lines.extend([
+                "- The model provider rejected or delayed the request due to rate limiting or quota pressure.",
+                f"- Target was {provider_label} / {model_label}.",
+            ])
+    elif is_billing_exhausted:
         lines.extend([
-            "- The model provider rejected or delayed the request due to rate limiting or quota pressure.",
+            "- The provider reports the account's usage allowance/credits are exhausted (billing), not a malformed request.",
             f"- Target was {provider_label} / {model_label}.",
         ])
     elif is_stream_drop:
@@ -163,8 +205,18 @@ def _build_api_retry_exhausted_final_response(
     lines.extend([
         "",
         "What I already tried:",
-        f"- Retried the API call {max_retries} times with backoff.",
-        "- Checked the configured fallback path before giving up on this request.",
+    ])
+    if very_large_replay_suppressed:
+        lines.extend([
+            "- Sent the very-large request once; the identical payload was not re-uploaded to the same stalling provider.",
+            "- Checked the configured fallback provider path as a route-around; it did not yield a usable response either.",
+        ])
+    else:
+        lines.extend([
+            f"- Retried the API call {max_retries} times with backoff.",
+            "- Checked the configured fallback path before giving up on this request.",
+        ])
+    lines.extend([
         "- Kept the session/gateway alive; this is a recoverable request failure, not an intentional shutdown.",
         "",
         "What you can do next:",
@@ -179,10 +231,22 @@ def _build_api_retry_exhausted_final_response(
             "- The gateway is still running; you can choose one of the alternatives above in the next message.",
         ])
     elif is_rate_limited:
+        if quota_reset_at:
+            lines.extend([
+                f"- Wait for the quota reset at {_format_quota_reset_for_report(quota_reset_at)}, or switch to another configured provider/model.",
+                "- Re-authenticating or retrying sooner will not restore an account-level usage limit.",
+                "- Ask me to continue with local-only work while the provider recovers.",
+            ])
+        else:
+            lines.extend([
+                "- Wait and retry later, or switch to another configured provider/model.",
+                "- Check provider quota/billing/rate-limit status if this persists.",
+                "- Ask me to continue with local-only work while the provider recovers.",
+            ])
+    elif is_billing_exhausted:
         lines.extend([
-            "- Wait and retry later, or switch to another configured provider/model.",
-            "- Check provider quota/billing/rate-limit status if this persists.",
-            "- Ask me to continue with local-only work while the provider recovers.",
+            "- Add usage/credits on the provider's billing page (for Anthropic subscriptions: claude.ai/settings/usage), or wait for the allowance to reset.",
+            "- Switch to another configured provider/model, or ask me to continue with local-only work.",
         ])
     elif is_stream_drop:
         lines.extend([
@@ -216,6 +280,7 @@ def run_conversation(
     task_id: str = None,
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[str] = None,
+    source_user_message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -282,6 +347,8 @@ def run_conversation(
         user_message = _sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = _sanitize_surrogates(persist_user_message)
+    if isinstance(source_user_message, str):
+        source_user_message = _sanitize_surrogates(source_user_message)
 
     # Store stream callback for _interruptible_api_call to pick up
     agent._stream_callback = stream_callback
@@ -402,8 +469,19 @@ def run_conversation(
     if think_scrubber is not None:
         think_scrubber.reset()
 
-    # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Intent/memory/correction paths must see only the user-authored request.
+    # ``user_message`` may contain auto-loaded skill payloads whose synthetic
+    # "do not" / "instead" phrases would otherwise suppress durable rules.
+    # Persistence is separate so the model can retain the skill payload.
+    original_user_message = (
+        source_user_message
+        if source_user_message is not None
+        else persist_user_message
+        if persist_user_message is not None
+        else user_message
+    )
+    # One-turn metadata handoff to the AIAgent boundary. Never carries raw text.
+    agent._last_turn_outcome_metadata = None
 
     # Track memory nudge trigger (turn-based, checked here).
     # Skill trigger is checked AFTER the agent loop completes, based on
@@ -522,7 +600,7 @@ def run_conversation(
             tools=agent.tools or None,
         )
 
-        if _preflight_tokens >= agent.context_compressor.threshold_tokens:
+        if agent.context_compressor.should_compress(_preflight_tokens):
             logger.info(
                 "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
                 f"{_preflight_tokens:,}",
@@ -614,6 +692,7 @@ def run_conversation(
     # nudge per turn — reset here so a nudge in a prior turn of the same
     # session does not suppress this turn's actuator.
     agent._verify_after_act_retried = False
+
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -667,6 +746,15 @@ def run_conversation(
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
+    # Attach correction, memory, and plugin advice. Correction retrieval is
+    # fail-open and has no execution-policy authority.
+    _turn_injections = _current_turn_user_injections(
+        format_correction_advice(user_message),
+        build_memory_context_block(_ext_prefetch_cache) if _ext_prefetch_cache else "",
+        _plugin_user_context,
+    )
+    if _turn_injections:
+        user_msg["_injected_user_context"] = _turn_injections
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -683,6 +771,46 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # A hard account/weekly quota is shared by every gateway lane. Once
+        # one lane observes it, later lanes must not replay the same expensive
+        # request before the provider reset. Prefer a genuinely different
+        # configured fallback; otherwise fail locally with zero provider calls.
+        _quota_reset = get_hard_usage_limit(
+            getattr(agent, "provider", None),
+            getattr(agent, "model", None),
+        )
+        if _quota_reset is not None:
+            _before_fallback = (
+                getattr(agent, "provider", None),
+                getattr(agent, "model", None),
+                getattr(agent, "api_mode", None),
+            )
+            _activated = bool(agent._try_activate_fallback())
+            _after_fallback = (
+                getattr(agent, "provider", None),
+                getattr(agent, "model", None),
+                getattr(agent, "api_mode", None),
+            )
+            if _activated and _after_fallback != _before_fallback:
+                continue
+
+            _reset_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_quota_reset))
+            _quota_message = (
+                "Provider usage limit is active; no duplicate request was sent. "
+                f"Expected reset: {_reset_utc}. Configure an available fallback "
+                "or retry after the reset."
+            )
+            messages.append({"role": "assistant", "content": _quota_message})
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": _quota_message,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": "provider_usage_limit_active",
+            }
+
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -830,23 +958,24 @@ def run_conversation(
         for idx, msg in enumerate(messages):
             api_msg = msg.copy()
 
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated, so nothing leaks into session persistence.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                _injections = []
-                if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
-                if _plugin_user_context:
-                    _injections.append(_plugin_user_context)
-                if _injections:
-                    _base = api_msg.get("content", "")
-                    if isinstance(_base, str):
-                        api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
+            # Re-attach persisted per-turn injections (memory recall and
+            # plugin context, plugin context) for EVERY user message carrying
+            # them — not just the current turn. The field holds fixed bytes
+            # stamped at that turn's start, so each past user message re-sends
+            # byte-identically across turns (prompt-cache prefix survives turn
+            # boundaries) while stored ``content`` stays byte-pure. Histories
+            # from before this field existed simply have nothing to re-attach.
+            _stored_injections = api_msg.pop("_injected_user_context", None)
+            if (
+                msg.get("role") == "user"
+                and isinstance(_stored_injections, list)
+                and isinstance(api_msg.get("content"), str)
+            ):
+                _blocks = [b for b in _stored_injections if isinstance(b, str) and b]
+                if _blocks:
+                    api_msg["content"] = (
+                        api_msg["content"] + "\n\n" + "\n\n".join(_blocks)
+                    )
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -886,27 +1015,13 @@ def run_conversation(
         # every turn.  We send it as a single content string so the
         # bytes are byte-stable across turns and upstream prompt caches
         # stay warm.
-        effective_system = active_system_prompt or ""
-        # Context Share v2 current-turn overlay is API-call-time only. The
-        # cached session prompt stays byte-stable, while every CLI/gateway turn
-        # is still resolved against the actual user request before action.
-        try:
-            from agent.context_share.intent_resolver import build_context_resolver_fallback_prompt, build_context_resolver_prompt
-            # Keep the per-call Context Share overlay scoped to the current
-            # request.  system_message may already include session/channel
-            # context or an older resolver block; using it as resolver input
-            # can leak an old Discord channel/project into the next channel.
-            _ctx_request = user_message if user_message else system_message
-            _ctx_seed = "\n".join(str(part) for part in (_ctx_request, getattr(agent, "platform", "")) if part)
-            _ctx_block = build_context_resolver_prompt(_ctx_seed, platform=getattr(agent, "platform", None)) if _ctx_seed.strip() else ""
-        except Exception as exc:
-            _ctx_block = build_context_resolver_fallback_prompt(str(exc)[:160])
-        if _ctx_block:
-            effective_system = _append_single_context_share_overlay(effective_system, _ctx_block)
-        if agent.ephemeral_system_prompt:
-            _ephemeral_system = _strip_context_share_sections(agent.ephemeral_system_prompt)
-            if _ephemeral_system:
-                effective_system = (effective_system + "\n\n" + _ephemeral_system).strip()
+        # The per-turn Advisory context rides in the current turn's user
+        # message (see the injection block above) — never here. Any per-turn
+        # system mutation would invalidate the provider prompt-cache prefix
+        # for the entire request (tool schemas + transcript).
+        effective_system = _build_effective_system(
+            active_system_prompt, agent.ephemeral_system_prompt
+        )
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -1019,6 +1134,24 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
+        _request_is_very_large = (
+            approximate_request_chars(
+                {
+                    "messages": api_messages,
+                    "tools": getattr(agent, "tools", None),
+                }
+            )
+            >= VERY_LARGE_REQUEST_CHAR_THRESHOLD
+        )
+        # Very-large requests keep the normal retry budget. The single-attempt
+        # cap is applied later and ONLY for an *ambiguous stall* — a retryable
+        # failure with no HTTP status — via `_suppress_very_large_transport_reupload`
+        # below. A definitive transient error that carries a status code (e.g. a
+        # codex 520 / any 5xx) is not a stall: the provider responded, so the
+        # re-upload is cheap and the healthy primary must be retried before we
+        # abandon it for a (possibly billing-dead) fallback. Collapsing to one
+        # attempt on *any* very-large failure used to dump a transient 5xx
+        # straight into an out-of-usage fallback and hard-stop.
         max_retries = agent._api_max_retries
         primary_recovery_attempted = False
         max_compression_attempts = 3
@@ -1026,6 +1159,7 @@ def run_conversation(
         anthropic_auth_retry_attempted=False
         nous_auth_retry_attempted=False
         copilot_auth_retry_attempted=False
+        hard_quota_credential_rotated = False
         thinking_sig_retry_attempted = False
         image_shrink_retry_attempted = False
         oauth_1m_beta_retry_attempted = False
@@ -1093,6 +1227,22 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+
+                try:
+                    apply_dynamic_tool_selection(
+                        agent,
+                        api_kwargs,
+                        user_message=original_user_message,
+                        messages=messages,
+                    )
+                except Exception as _tool_selection_error:
+                    # Fail open: selector faults must never hide tools or block
+                    # the primary workflow. Log only the exception class so a
+                    # future error cannot reflect request content.
+                    logger.warning(
+                        "Dynamic tool selection skipped after %s",
+                        type(_tool_selection_error).__name__,
+                    )
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -1174,6 +1324,15 @@ def run_conversation(
                     from unittest.mock import Mock
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
+
+                _efficiency_tracker = getattr(
+                    agent, "_turn_efficiency_request_footprint", None
+                )
+                if _efficiency_tracker is not None:
+                    try:
+                        _efficiency_tracker.observe(api_kwargs)
+                    except Exception:
+                        pass  # Telemetry must never block the model request.
 
                 if _use_streaming:
                     response = agent._interruptible_streaming_api_call(
@@ -1796,6 +1955,117 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                # Request configuration errors are deterministic local failures.
+                # The provider has not received the request, and retry/failover
+                # would rebuild the same malformed kwargs.
+                if isinstance(api_error, RequestConfigurationError):
+                    safe_error = str(api_error)
+                    logger.error(
+                        "Stopped malformed model request before transmission: %s",
+                        safe_error,
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Invalid model request configuration; "
+                        "stopped before transmission (no retry or failover).",
+                        force=True,
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": (
+                            "Sinria stopped this model-provider request before "
+                            f"transmission: {safe_error}. "
+                            "No retry or provider failover was attempted."
+                        ),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": safe_error,
+                        "request_sent": False,
+                        "retry_attempted": False,
+                        "provider_failover_attempted": False,
+                    }
+
+                # A Sinria egress boundary stop is a terminal safety decision
+                # for this turn, not a transient provider failure. Retrying the
+                # same payload or failing over to another external provider
+                # would repeat the unsafe egress attempt and waste latency/tokens.
+                # Keep the canonical local message history untouched so the user
+                # can redact, explicitly approve an ``ask`` decision, or continue
+                # via a local/internal model. A hard ``block`` decision and a
+                # guard failure are not approval-gated states, so their recovery
+                # copy must not suggest that approval can override them.
+                if isinstance(
+                    api_error, (SinriaEgressBlocked, SinriaEgressGuardFailure)
+                ):
+                    if isinstance(api_error, SinriaEgressGuardFailure):
+                        safe_error = (
+                            "Sinria model-provider egress guard failed closed"
+                        )
+                        cause = (
+                            "the egress guard could not complete its safety check"
+                        )
+                        recovery = (
+                            "Retry after you restore the egress guard, or switch to "
+                            "a local/internal model."
+                        )
+                    elif api_error.decision.action == "ask":
+                        safe_error = (
+                            "Sinria model-provider egress requires approval"
+                        )
+                        cause = (
+                            "the outbound request requires explicit human approval"
+                        )
+                        recovery = (
+                            "Approve or redact the outbound content, or switch to "
+                            "a local/internal model, then retry."
+                        )
+                    else:
+                        safe_error = (
+                            "Sinria model-provider egress was stopped by policy"
+                        )
+                        cause = (
+                            "the active policy prohibits this outbound request "
+                            "even after the refused content was withheld"
+                        )
+                        # Reaching here means redaction and withholding both ran
+                        # and the route was still refused, so asking the operator
+                        # to redact again — or to switch to a local model route
+                        # that may not be configured at all — sends them after a
+                        # cause that is not there.
+                        recovery = (
+                            "This policy decision cannot be approved for external "
+                            "model egress. The refused content was already "
+                            "withheld from the request, so what remains is the "
+                            "route itself: review the provider trust registry and "
+                            "deployment mode under `sinria.boundary_control`."
+                        )
+                    logger.warning(
+                        "Model-provider boundary stop; no retry/failover "
+                        "error_type=%s %s",
+                        type(api_error).__name__,
+                        agent._client_log_context(),
+                    )
+                    agent._emit_status(
+                        "🛡️ Sinria stopped model-provider egress before "
+                        "transmission; no retry or provider failover was attempted."
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": (
+                            "Sinria stopped this model-provider request before "
+                            f"transmission because {cause}.\n\n"
+                            "The conversation history is preserved locally. "
+                            f"{recovery}"
+                        ),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": safe_error,
+                        "boundary_stop": True,
+                    }
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste
@@ -2062,15 +2332,45 @@ def run_conversation(
                     classified.retryable, classified.should_compress,
                     classified.should_rotate_credential, classified.should_fallback,
                 )
-
-                recovered_with_pool, has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
+                _hard_usage_limit = (
+                    status_code == 429
+                    and classified.reason == FailoverReason.rate_limit
+                    and not classified.retryable
                 )
+
+                _suppress_very_large_transport_reupload = (
+                    _request_is_very_large
+                    and classified.retryable
+                    and classified.reason
+                    in {FailoverReason.timeout, FailoverReason.unknown}
+                    and status_code is None
+                    and not classified.should_compress
+                )
+                if _suppress_very_large_transport_reupload or (
+                    _hard_usage_limit and hard_quota_credential_rotated
+                ):
+                    recovered_with_pool = False
+                else:
+                    recovered_with_pool, has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                    )
                 if recovered_with_pool:
+                    if _hard_usage_limit:
+                        hard_quota_credential_rotated = True
                     continue
+
+                # Record only after all distinct configured credentials are
+                # exhausted. This avoids blocking an independent subscription
+                # while still preventing same-account quota retries.
+                if _hard_usage_limit:
+                    record_hard_usage_limit(
+                        getattr(agent, "provider", None),
+                        getattr(agent, "model", None),
+                        error_context,
+                    )
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -2422,7 +2722,7 @@ def run_conversation(
                     # still recover.  See _pool_may_recover_from_rate_limit
                     # for the single-credential-pool and CloudCode-quota
                     # exceptions.  Fixes #11314 and #13636.
-                    pool_may_recover = _pool_may_recover_from_rate_limit(
+                    pool_may_recover = _ra()._pool_may_recover_from_rate_limit(
                         agent._credential_pool,
                         provider=agent.provider,
                         base_url=getattr(agent, "base_url", None),
@@ -2848,26 +3148,67 @@ def run_conversation(
                         "error": str(api_error),
                     }
 
-                if retry_count >= max_retries:
+                # Route to fallback without spending the remaining budget when:
+                #  (a) retries are genuinely exhausted, or
+                #  (b) a very-large request stalled ambiguously — replaying the
+                #      huge payload against the backend that just stalled is the
+                #      dominant latency source (see the max_retries note above), or
+                #  (c) the error is non-retryable (e.g. billing / "out of extra
+                #      usage"): re-hitting the same exhausted credential with
+                #      backoff cannot succeed, so go straight to the fallback.
+                if (
+                    retry_count >= max_retries
+                    or _suppress_very_large_transport_reupload
+                    or not classified.retryable
+                ):
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not primary_recovery_attempted and agent._try_recover_primary_transport(
-                        api_error, retry_count=retry_count, max_retries=max_retries,
+                    if (
+                        not _suppress_very_large_transport_reupload
+                        and classified.retryable
+                        and not primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
+                            api_error,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                        )
                     ):
                         primary_recovery_attempted = True
                         retry_count = 0
                         continue
-                    # Try fallback before giving up entirely
-                    agent._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                    # Provider fallback targets a *different* provider, so it is
+                    # not a same-payload re-upload to the backend that just
+                    # stalled — it is the route-around that lets a very-large
+                    # request recover instead of hard-stopping. Attempt it in
+                    # both the suppressed and normal cases. (Same-provider replay
+                    # via _try_recover_primary_transport above stays gated off
+                    # for very-large timeouts so we never duplicate the dominant
+                    # upload against the provider that just stalled.)
+                    if _suppress_very_large_transport_reupload:
+                        agent._emit_status(
+                            "⚠️ Very-large request stalled on the primary provider — "
+                            "not replaying the same payload; routing to a fallback provider..."
+                        )
+                    elif not classified.retryable:
+                        agent._emit_status(
+                            "⚠️ Provider quota/error is not retryable on this account — "
+                            "routing directly to a fallback provider..."
+                        )
+                    else:
+                        agent._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
                         continue
                     _final_summary = agent._summarize_api_error(api_error)
-                    if is_rate_limited:
+                    if is_rate_limited and not classified.retryable:
+                        agent._emit_status(
+                            f"❌ Provider usage quota unavailable; same-account retries skipped — {_final_summary}"
+                        )
+                    elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
                     else:
                         agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
@@ -2919,6 +3260,13 @@ def run_conversation(
                         model=_model,
                         is_rate_limited=is_rate_limited,
                         is_stream_drop=_is_stream_drop,
+                        very_large_replay_suppressed=(
+                            _suppress_very_large_transport_reupload
+                        ),
+                        quota_reset_at=(error_context or {}).get("reset_at"),
+                        is_billing_exhausted=(
+                            classified.reason == FailoverReason.billing
+                        ),
                     )
                     return {
                         "final_response": _final_response,
@@ -3848,6 +4196,7 @@ def run_conversation(
                 ):
                     messages.pop()
 
+
                 # Verify-after-act actuator (architecture-centric P1): a
                 # practical-action turn that claims completion without citing
                 # verification gets ONE nudge turn to actually verify before
@@ -3865,7 +4214,7 @@ def run_conversation(
                         if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
                     )
                     try:
-                        from agent.context_share.outcome_gap import should_nudge_verification
+                        from agent.correction_loop.outcome_gap import should_nudge_verification
                         _needs_verification = _seam_tool_turns > 0 and should_nudge_verification(
                             user_message=original_user_message,
                             final_response=final_response,
@@ -3883,7 +4232,7 @@ def run_conversation(
                         # Sanitized telemetry for the 運用観察 measurement
                         # cron — best-effort, never breaks the turn.
                         try:
-                            from agent.context_share.outcome_gap import record_verify_nudge_event
+                            from agent.correction_loop.outcome_gap import record_verify_nudge_event
                             record_verify_nudge_event(
                                 session_id=agent.session_id,
                                 model=agent.model,
@@ -4053,10 +4402,19 @@ def run_conversation(
 
     # Determine if conversation completed successfully
     completed = final_response is not None and api_call_count < agent.max_iterations
+    # Preserve the "a final response was produced" signal separately from the
+    # receipt-backed completion decision below.  The self-improvement outcome
+    # recorder classifies actual-vs-goal from this raw signal so a recoverable
+    # receipt gap is recorded as its true category (verification/execution gap),
+    # not mislabeled as a hard failed/interrupted turn.
+    _response_produced = completed
+    # A produced response remains completion. Verification gaps are captured by
+    # the advisory outcome loop and can trigger repair, never refusal.
+    from agent.correction_loop.completion_evidence import CompletionStage as _CompletionStage
+    _completion_reason = None
+    _required_completion_stage = None
+    _observed_completion_stage = _CompletionStage.IMPLEMENTED
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
 
     # Clean up VM and browser for this task after conversation completes
     agent._cleanup_task_resources(effective_task_id)
@@ -4157,25 +4515,8 @@ def run_conversation(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+    _pre_guard_response = final_response
 
-    # Sinria execution-side completion guard: prevent a practical-action final
-    # response from reaching the user as "done" when it claims completion but
-    # cites no visible real-workflow verification.  Run after transform hooks so
-    # plugins cannot accidentally reintroduce an unverified completion claim, and
-    # before post_llm_call/outcome-gap recording so downstream observers see the
-    # guarded final response.
-    if final_response and not interrupted:
-        try:
-            from agent.context_share.outcome_gap import apply_practical_completion_guard as _apply_practical_completion_guard
-            final_response = _apply_practical_completion_guard(
-                user_message=original_user_message,
-                final_response=final_response,
-                completed=completed,
-                interrupted=interrupted,
-                tool_turn_count=_turn_tool_count,
-            ) or final_response
-        except Exception as exc:
-            logger.warning("Sinria practical-completion guard failed: %s", exc)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -4200,20 +4541,30 @@ def run_conversation(
     # metadata for every completed or interrupted turn, and queue a review-gated
     # improvement candidate when practical work ends without real-workflow evidence.
     # This is intentionally best-effort and never stores raw conversation text.
+    _outcome_record = None
     if final_response or interrupted:
         try:
-            from agent.context_share.outcome_gap import record_practical_outcome_and_candidates as _record_practical_outcome
+            from agent.correction_loop.outcome_gap import record_practical_outcome_and_candidates as _record_practical_outcome
             _outcome_record = _record_practical_outcome(
                 session_id=agent.session_id,
                 user_message=original_user_message,
-                final_response=final_response,
-                completed=completed,
+                final_response=_pre_guard_response,
+                completed=_response_produced,
                 interrupted=interrupted,
                 model=agent.model,
                 provider=agent.provider,
                 platform=getattr(agent, "platform", None) or "",
                 tool_turn_count=_turn_tool_count,
+                messages=messages,
+                turn_exit_reason=_turn_exit_reason,
             )
+            agent._last_turn_outcome_metadata = {
+                "record_id": getattr(_outcome_record, "record_id", ""),
+                "goal_kind": getattr(_outcome_record, "goal_kind", "unknown"),
+                "actual_kind": getattr(_outcome_record, "actual_kind", "unknown"),
+                "gap_detected": bool(getattr(_outcome_record, "gap_detected", False)),
+                "failure_signature": getattr(_outcome_record, "failure_signature", ""),
+            }
             # Routing signal (architecture-centric P1): when a small/medium-
             # tier model ends a practical turn with a verification/execution
             # gap, record a sanitized escalation recommendation — the
@@ -4287,7 +4638,14 @@ def run_conversation(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "completion_stage": _observed_completion_stage.value,
+        "required_completion_stage": (
+            _required_completion_stage.value
+            if _required_completion_stage is not None
+            else None
+        ),
         "turn_exit_reason": _turn_exit_reason,
+        "completion_reason": _completion_reason,
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_previewed": getattr(agent, "_response_was_previewed", False),

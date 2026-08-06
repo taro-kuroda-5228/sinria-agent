@@ -9,8 +9,11 @@ touched.
 
 The fork inherits the parent's live runtime (provider, model, base_url,
 credentials, cached system prompt) so it hits the same prefix cache and
-uses the same auth.  It runs with a tool whitelist limited to memory and
-skill management tools; everything else is denied at runtime.
+uses the same auth.  Optionally, ``auxiliary.background_review.{provider,
+model}`` reroutes the fork to a cheaper model — same contract as every
+other auxiliary task slot (see :func:`_resolve_review_routing`).  It runs
+with a tool whitelist limited to memory and skill management tools;
+everything else is denied at runtime.
 
 See the ``sinria-agent-dev`` skill (``references/self-improvement-loop.md``)
 for invariants and PR review criteria.
@@ -306,6 +309,60 @@ def build_memory_write_metadata(
     return {k: v for k, v in metadata.items() if v not in {None, ""}}
 
 
+def _resolve_review_routing() -> Optional[Dict[str, Any]]:
+    """Resolve optional ``auxiliary.background_review`` routing for the fork.
+
+    Mirrors the curator's aux-slot idiom (``agent/curator.py``,
+    ``_resolve_review_runtime`` + ``resolve_runtime_provider``): the slot
+    only takes effect when BOTH ``provider`` (non-empty, non-``auto``) AND
+    ``model`` are configured. Returns a dict of AIAgent constructor
+    overrides (``model``/``provider``/``base_url``/``api_key``/``api_mode``)
+    when routed, or ``None`` meaning "inherit the parent's live runtime" —
+    the default, byte-identical to the historical behavior.
+
+    Fail-open: ANY exception returns ``None``. The background review must
+    never break because of a bad config or an unavailable resolver — it
+    already runs on a daemon thread, and a setup crash here would silently
+    kill the self-improvement loop.
+    """
+    try:
+        from agent.auxiliary_client import _resolve_task_provider_model
+
+        provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+            "background_review"
+        )
+        if not model or not provider or provider == "auto":
+            return None
+        # Resolve per-slot credentials the same way the curator review fork
+        # does, so OAuth-only / env-keyed providers get a usable key and the
+        # routed slot never silently reuses the main chat credential chain.
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        rp = resolve_runtime_provider(
+            requested=provider,
+            target_model=model,
+            explicit_api_key=api_key or None,
+            explicit_base_url=base_url or None,
+        )
+        return {
+            "model": model,
+            "provider": rp.get("provider") or provider,
+            "base_url": rp.get("base_url") or None,
+            "api_key": rp.get("api_key") or None,
+            # An explicit per-slot api_mode wins (same contract as every
+            # other aux task); otherwise use what the resolver derived.
+            "api_mode": api_mode or rp.get("api_mode") or None,
+        }
+    except Exception as e:
+        logger.debug(
+            "auxiliary.background_review resolution failed; "
+            "inheriting parent runtime: %s",
+            e,
+            exc_info=True,
+        )
+        return None
+
+
 def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
@@ -363,6 +420,39 @@ def _run_review_in_thread(
             # owns the loop and the agent-loop tools dispatch.
             if _parent_api_mode == "codex_app_server":
                 _parent_api_mode = "codex_responses"
+            # Optional cheap-model routing: when auxiliary.background_review
+            # sets provider (non-"auto") + model, this 16-iteration fork is
+            # rerouted off the main model so it stops burning main-provider
+            # quota (e.g. the shared codex pool) every few turns. Unset /
+            # "auto" keeps the exact inherit-parent behavior above.
+            # Resolution is fail-open: any error → inherit parent.
+            _routing = _resolve_review_routing()
+            if _routing is not None:
+                _review_api_mode = _routing.get("api_mode") or None
+                # Same agent-loop constraint as the inherit path: the fork
+                # needs Hermes-owned dispatch for memory/skill tools, which
+                # the codex_app_server runtime bypasses.
+                if _review_api_mode == "codex_app_server":
+                    _review_api_mode = "codex_responses"
+                _fork_runtime_kwargs = dict(
+                    model=_routing.get("model"),
+                    provider=_routing.get("provider"),
+                    api_mode=_review_api_mode,
+                    base_url=_routing.get("base_url") or None,
+                    api_key=_routing.get("api_key") or None,
+                    # The parent's credential pool is bound to the parent's
+                    # provider; a routed slot brings its own credentials.
+                    credential_pool=None,
+                )
+            else:
+                _fork_runtime_kwargs = dict(
+                    model=agent.model,
+                    provider=agent.provider,
+                    api_mode=_parent_api_mode,
+                    base_url=_parent_runtime.get("base_url") or None,
+                    api_key=_parent_runtime.get("api_key") or None,
+                    credential_pool=getattr(agent, "_credential_pool", None),
+                )
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -379,17 +469,12 @@ def _run_review_in_thread(
             # the review still land on disk; the review just
             # has zero side effects on external providers.
             review_agent = AIAgent(
-                model=agent.model,
                 max_iterations=16,
                 quiet_mode=True,
                 platform=agent.platform,
-                provider=agent.provider,
-                api_mode=_parent_api_mode,
-                base_url=_parent_runtime.get("base_url") or None,
-                api_key=_parent_runtime.get("api_key") or None,
-                credential_pool=getattr(agent, "_credential_pool", None),
                 parent_session_id=agent.session_id,
                 skip_memory=True,
+                **_fork_runtime_kwargs,
             )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"

@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from sinria_clinical_workflow import run_synthetic_clinical_workflow_demo
 from sinria_integrations import (
     ApprovalRole,
     DataSensitivity,
@@ -29,6 +30,15 @@ from sinria_integrations import (
     plan_medevidence_skill_operation,
     registry_from_config,
     runtime_policy_from_config,
+)
+from sinria_medevidence_gcp_runtime import (
+    MEDEVIDENCE_GCP_PROJECT,
+    MEDEVIDENCE_GCP_REGION,
+    MEDEVIDENCE_GCP_SERVICE,
+    MedEvidenceGcpRuntimeTarget,
+    build_dogfood_result_record,
+    gcloud_proxy_command,
+    write_dogfood_result_to_vault,
 )
 from tools.registry import registry
 
@@ -258,6 +268,19 @@ def _integration_readiness_report(
     }
 
 
+def _medevidence_gcp_target_from_payload(payload_summary: Mapping[str, Any] | None) -> MedEvidenceGcpRuntimeTarget:
+    payload = payload_summary or {}
+    raw_target = payload.get("runtime_target")
+    target: Mapping[str, Any] = raw_target if isinstance(raw_target, Mapping) else payload
+    return MedEvidenceGcpRuntimeTarget(
+        project=str(target.get("project") or MEDEVIDENCE_GCP_PROJECT),
+        region=str(target.get("region") or MEDEVIDENCE_GCP_REGION),
+        service=str(target.get("service") or MEDEVIDENCE_GCP_SERVICE),
+        url=target.get("url"),
+        revision=target.get("revision"),
+    )
+
+
 def sinria_integrations(
     mode: str,
     connector_id: str | None = None,
@@ -271,6 +294,7 @@ def sinria_integrations(
     config: Mapping[str, Any] | None = None,
     medevidence_root: str | None = None,
     export_dir: str | None = None,
+    clinical_document_kind: str | None = None,
     task_id: str | None = None,
 ) -> str:
     """List or plan Sinria SaaS/clinical/MedEvidence integration operations."""
@@ -339,6 +363,70 @@ def sinria_integrations(
 
         if normalized_mode == "integration_readiness_report":
             return json.dumps(_integration_readiness_report(config, medevidence_root), ensure_ascii=False)
+
+        if normalized_mode == "medevidence_gcp_runtime_plan":
+            target = _medevidence_gcp_target_from_payload(payload_summary)
+            command = gcloud_proxy_command(target, port=int((payload_summary or {}).get("port", 18081)))
+            return json.dumps(
+                {
+                    "success": True,
+                    "mode": "medevidence_gcp_runtime_plan",
+                    "runtime_target": asdict(target),
+                    "proxy_command": command,
+                    "safety_note": (
+                        "GCP版MedEvidence runtime target locked before execution. "
+                        "No network call was made by this planning mode; run the returned proxy command only for non-PHI smoke/execution."
+                    ),
+                },
+                ensure_ascii=False,
+                default=_json_default,
+            )
+
+        if normalized_mode == "record_medevidence_dogfood_result":
+            payload = payload_summary or {}
+            target = _medevidence_gcp_target_from_payload(payload)
+            record = build_dogfood_result_record(
+                target=target,
+                title=str(payload.get("title") or "MedEvidence GCP dogfood result"),
+                findings=list(payload.get("findings") or []),
+                verified_commands=list(payload.get("verified_commands") or []),
+            )
+            result: dict[str, Any] = {
+                "success": True,
+                "mode": "record_medevidence_dogfood_result",
+                "record": record,
+                "written_path": None,
+                "safety_note": (
+                    "Dogfood result is sanitized and Sinria-centered. Raw PHI, tokens, and MedEvidence runtime bodies are not stored."
+                ),
+            }
+            vault_root = payload.get("vault_root")
+            if vault_root:
+                path = write_dogfood_result_to_vault(record, vault_root=vault_root)
+                result["written_path"] = str(path)
+            else:
+                result["next_action"] = "Pass payload_summary.vault_root to write under public knowledge base."
+            return json.dumps(result, ensure_ascii=False, default=_json_default)
+
+        if normalized_mode == "run_clinical_workflow_demo":
+            if not action:
+                raise ValueError("action is required for run_clinical_workflow_demo")
+            if payload_summary is not None and not isinstance(payload_summary, Mapping):
+                raise ValueError("payload_summary must be a mapping")
+            payload = payload_summary or {}
+            unknown_fields = set(payload) - {"document_kind"}
+            if unknown_fields:
+                raise ValueError("payload_summary contains unsupported clinical demo metadata")
+            document_kind = clinical_document_kind or payload.get("document_kind") or "discharge_summary"
+            return json.dumps(
+                run_synthetic_clinical_workflow_demo(
+                    action=action,
+                    document_kind=str(document_kind),
+                    actor_role=approved_by,
+                ),
+                ensure_ascii=False,
+                default=_json_default,
+            )
 
         if normalized_mode == "plan_ehr_export_import":
             if not export_dir:
@@ -410,11 +498,22 @@ def sinria_integrations(
             "mode must be one of: list_connectors, list_connector_templates, "
             "list_medevidence_skills, list_medevidence_skill_stubs, "
             "describe_medevidence_skill, medevidence_setup_status, "
-            "integration_readiness_report, "
+            "integration_readiness_report, medevidence_gcp_runtime_plan, "
+            "record_medevidence_dogfood_result, run_clinical_workflow_demo, "
             "plan_ehr_export_import, plan_connector_operation, "
             "plan_connector_runtime_gate, plan_medevidence_skill"
         )
     except Exception as exc:
+        if normalized_mode == "run_clinical_workflow_demo" and not isinstance(
+            exc, ValueError
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Synthetic clinical workflow demo failed safely.",
+                },
+                ensure_ascii=False,
+            )
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
@@ -423,8 +522,10 @@ SINRIA_INTEGRATIONS_SCHEMA = {
     "description": (
         "List Sinria SaaS/EMR/EHR connectors and safe connector templates, and "
         "plan sanitized, approval-gated operations including runtime allowlist "
-        "gates and MedEvidence / メドエビデンス skill bridge use. This is "
-        "local planning only and performs no external API calls."
+        "gates and MedEvidence / メドエビデンス skill bridge use, plus GCP版MedEvidence "
+        "runtime target-lock planning, sanitized dogfood-result recording, and a "
+        "deterministic offline synthetic Clinical Gateway drafting/approval demo. "
+        "Planning and demo modes perform no external API calls."
     ),
     "parameters": {
         "type": "object",
@@ -439,6 +540,9 @@ SINRIA_INTEGRATIONS_SCHEMA = {
                     "describe_medevidence_skill",
                     "medevidence_setup_status",
                     "integration_readiness_report",
+                    "medevidence_gcp_runtime_plan",
+                    "record_medevidence_dogfood_result",
+                    "run_clinical_workflow_demo",
                     "plan_ehr_export_import",
                     "plan_connector_operation",
                     "plan_connector_runtime_gate",
@@ -456,6 +560,11 @@ SINRIA_INTEGRATIONS_SCHEMA = {
             "config": {"type": "object", "description": "Optional local connector metadata shaped like integrations.connectors; no secrets. If omitted, Sinria reads only integrations.* from the active config.yaml."},
             "medevidence_root": {"type": "string", "description": "Optional local MedEvidence checkout path for metadata-only setup status checks."},
             "export_dir": {"type": "string", "description": "Local EHR/カルテ export directory for metadata-only import planning; file contents and names are not returned."},
+            "clinical_document_kind": {
+                "type": "string",
+                "enum": ["discharge_summary", "referral_letter"],
+                "description": "Bundled synthetic document kind for run_clinical_workflow_demo.",
+            },
         },
         "required": ["mode"],
     },
@@ -479,6 +588,7 @@ registry.register(
         config=args.get("config"),
         medevidence_root=args.get("medevidence_root"),
         export_dir=args.get("export_dir"),
+        clinical_document_kind=args.get("clinical_document_kind"),
         task_id=kw.get("task_id"),
     ),
     check_fn=lambda: True,

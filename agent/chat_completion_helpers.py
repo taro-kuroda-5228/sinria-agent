@@ -63,6 +63,11 @@ from utils import base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
 
+# Final summaries run outside the main retry loop.  Keep recovery bounded even
+# if a custom credential/fallback adapter incorrectly reports success without
+# advancing its own state.
+_MAX_ITERATION_SUMMARY_RECOVERIES = 8
+
 
 def _ra():
     """Lazy ``run_agent`` reference.
@@ -90,8 +95,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    from agent.sinria_egress import prepare_model_provider_payload
+
     result = {"response": None, "error": None}
     request_client_holder = {"client": None}
+    _call_start = time.time()
+    _protocol_progress = {"at": _call_start, "seen_first": False}
+
+    def _mark_protocol_progress() -> None:
+        # Codex Responses is implemented as a stream behind this nominally
+        # non-streaming wrapper. Its watchdog must measure event inactivity,
+        # not total request runtime.
+        _protocol_progress["at"] = time.time()
+        _protocol_progress["seen_first"] = True
 
     def _call():
         try:
@@ -104,9 +120,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     api_kwargs,
                     client=request_client_holder["client"],
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+                    on_progress=_mark_protocol_progress,
                 )
             elif agent.api_mode == "anthropic_messages":
-                result["response"] = agent._anthropic_messages_create(api_kwargs)
+                transport_kwargs = prepare_model_provider_payload(agent, api_kwargs)
+                result["response"] = agent._anthropic_messages_create(transport_kwargs)
             elif agent.api_mode == "bedrock_converse":
                 # Bedrock uses boto3 directly — no OpenAI client needed.
                 # normalize_converse_response produces an OpenAI-compatible
@@ -120,9 +138,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
+                transport_kwargs = prepare_model_provider_payload(agent, api_kwargs)
                 client = _get_bedrock_runtime_client(region)
                 try:
-                    raw_response = client.converse(**api_kwargs)
+                    raw_response = client.converse(**transport_kwargs)
                 except Exception as _bedrock_exc:
                     # Evict the cached client on stale-connection failures
                     # so the outer retry loop builds a fresh client/pool.
@@ -131,11 +150,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     raise
                 result["response"] = normalize_converse_response(raw_response)
             else:
+                transport_kwargs = prepare_model_provider_payload(agent, api_kwargs)
                 request_client_holder["client"] = agent._create_request_openai_client(
                     reason="chat_completion_request",
-                    api_kwargs=api_kwargs,
+                    api_kwargs=transport_kwargs,
                 )
-                result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                result["response"] = request_client_holder["client"].chat.completions.create(**transport_kwargs)
         except Exception as e:
             result["error"] = e
         finally:
@@ -149,11 +169,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(
-        api_kwargs.get("messages", [])
-    )
+    _timeout_payload = api_kwargs.get("messages") or api_kwargs.get("input") or []
+    _stale_timeout = agent._compute_non_stream_stale_timeout(_timeout_payload)
+    # Reasoning models (codex/gpt-5.6) emit nothing until server-side reasoning
+    # finishes, so time-to-first-event can legitimately exceed a mid-stream gap.
+    # Every observed "no protocol progress" kill had inactive==total (silent
+    # from the start), i.e. the first event never arrived in time — a slow-but-
+    # healthy reasoning request, not a hang. Use a generous budget before the
+    # first event and the base budget for inactivity after streaming started.
+    from agent.request_efficiency import resolve_watchdog_timeouts
+    _first_token_timeout, _stall_timeout = resolve_watchdog_timeouts(_stale_timeout)
 
-    _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
     t = threading.Thread(target=_call, daemon=True)
@@ -171,20 +197,29 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        _elapsed = time.time() - _call_start
-        if _elapsed > _stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+        # Stale-call detector: for Codex's hidden event stream, measure
+        # protocol inactivity. Other API modes still measure from call start.
+        _now = time.time()
+        _elapsed = _now - _call_start
+        _inactive_for = _now - _protocol_progress["at"]
+        _seen_first = _protocol_progress.get("seen_first", False)
+        _active_threshold = _stall_timeout if _seen_first else _first_token_timeout
+        if _inactive_for > _active_threshold:
+            _est_ctx = sum(len(str(v)) for v in _timeout_payload) // 4
+            _call_label = (
+                "Codex stream" if agent.api_mode == "codex_responses"
+                else "Non-streaming API call"
+            )
+            _phase = "mid-stream" if _seen_first else "before first response"
             logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                "%s inactive for %.0fs (%s threshold %.0fs, total %.0fs). "
                 "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
+                _call_label, _inactive_for, _phase, _active_threshold, _elapsed,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(
-                f"⚠️ No response from provider for {int(_elapsed)}s "
-                f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                f"⚠️ No protocol progress from provider for {int(_inactive_for)}s "
+                f"(model: {api_kwargs.get('model', 'unknown')}). "
                 f"Aborting call."
             )
             try:
@@ -198,14 +233,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale API call killed after {int(_inactive_for)}s without progress"
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
-                    f"Non-streaming API call timed out after {int(_elapsed)}s "
-                    f"with no response (threshold: {int(_stale_timeout)}s)"
+                    f"{_call_label} timed out after {int(_inactive_for)}s "
+                    f"without protocol progress ({_phase}; total: {int(_elapsed)}s, "
+                    f"threshold: {int(_active_threshold)}s)"
                 )
             break
 
@@ -232,20 +268,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    # Deterministic no-egress wire cap: shrink oversized OLD tool-result
+    # payloads (re-sent verbatim every turn) before they hit the transport.
+    # This bounds request size even when LLM compression cannot run — the
+    # auxiliary model is unavailable, or the confidentiality egress boundary
+    # blocks sending confidential context out — which is the dominant driver
+    # of very-large provider stalls. Recent turns are protected and the full
+    # result stays in the local session. See agent/request_efficiency.py.
+    from agent.request_efficiency import (
+        cap_oversized_history_tool_results,
+        enforce_total_wire_budget,
+    )
+    _protect_n = getattr(getattr(agent, "context_compressor", None), "protect_last_n", 20)
+    api_messages = cap_oversized_history_tool_results(
+        api_messages,
+        protect_last_n=_protect_n if isinstance(_protect_n, int) and _protect_n >= 0 else 20,
+    )
+    # Total-size backstop: the per-message cap above cannot bound a history made
+    # of many moderate results or of large results in its protected tail. This
+    # keeps the whole payload out of the very-large band that stalls providers
+    # (and that re-uploads verbatim on provider fallback).
+    api_messages = enforce_total_wire_budget(api_messages)
     tools_for_api = agent.tools
-
-    # Sinria egress boundary: guard model-provider payloads before any
-    # organization-external transmission. Internal/local model endpoints remain
-    # allowed, including confidential content.
-    try:
-        from agent.sinria_egress import guard_model_provider_egress, redact_model_provider_messages
-        api_messages = redact_model_provider_messages(agent, api_messages)
-        guard_model_provider_egress(agent, api_messages)
-    except Exception as _sinria_egress_exc:
-        from agent.sinria_egress import SinriaEgressBlocked
-        if isinstance(_sinria_egress_exc, SinriaEgressBlocked):
-            raise
-        logger.debug("Sinria egress guard skipped due to error: %s", _sinria_egress_exc)
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -739,6 +783,38 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+
+        # Provider fallback is a complete runtime switch, including its
+        # credential pool. Previously the primary Codex pool remained bound
+        # after switching to Anthropic; a fallback 403 then refreshed and
+        # injected the Codex credential into the Anthropic client.
+        fb_credential_pool = None
+        if (
+            getattr(agent, "_credential_pool", None) is not None
+            and not fb_api_key_hint
+            and not fb_base_url_hint
+        ):
+            try:
+                from agent.credential_pool import load_pool
+
+                candidate_pool = load_pool(fb_provider)
+                candidate_entry = candidate_pool.select()
+                if candidate_entry is not None:
+                    fb_credential_pool = candidate_pool
+                    fb_api_key_hint = (
+                        getattr(candidate_entry, "runtime_api_key", None)
+                        or getattr(candidate_entry, "access_token", None)
+                    )
+                    fb_base_url_hint = (
+                        getattr(candidate_entry, "runtime_base_url", None)
+                        or getattr(candidate_entry, "base_url", None)
+                    )
+            except Exception as pool_error:
+                logging.warning(
+                    "Fallback credential pool unavailable for %s: %s",
+                    fb_provider,
+                    type(pool_error).__name__,
+                )
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
@@ -791,6 +867,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._config_context_length = None
         agent.model = fb_model
         agent.provider = fb_provider
+        agent._credential_pool = fb_credential_pool
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
         if hasattr(agent, "_transport_cache"):
@@ -893,8 +970,22 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    _recovery_attempts: int = 0,
+    _credential_rotation_attempted: bool = False,
+    _fallback_attempted: bool = False,
+) -> str:
+    """Request a summary when max iterations are reached.
+
+    The normal conversation loop already knows how to fail over on provider
+    errors, but this final tool-free summary request runs outside that loop.
+    Keep the same recovery invariant here: quota/auth/model failures try the
+    configured fallback chain before returning a resumable checkpoint.
+    """
     print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
 
     summary_request = (
@@ -977,6 +1068,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             from agent.portal_tags import nous_portal_tags as _portal_tags
             summary_extra_body["tags"] = _portal_tags()
 
+        from agent.sinria_egress import prepare_model_provider_payload
+
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
@@ -1042,10 +1135,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
+                _ant_kw = prepare_model_provider_payload(agent, _ant_kw)
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                summary_kwargs = prepare_model_provider_payload(agent, summary_kwargs)
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
@@ -1072,6 +1167,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
+                _ant_kw2 = prepare_model_provider_payload(agent, _ant_kw2)
                 retry_response = agent._anthropic_messages_create(_ant_kw2)
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
@@ -1089,6 +1185,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                summary_kwargs = prepare_model_provider_payload(agent, summary_kwargs)
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
@@ -1104,8 +1201,191 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logging.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        # The iteration-limit summary bypasses the normal conversation-loop
+        # recovery block.  Classify the failure here so a provider quota or
+        # auth/model outage does not turn a completed run into a raw error when
+        # a rotated credential or independent fallback is available.
+        try:
+            classified = classify_api_error(
+                e,
+                provider=getattr(agent, "provider", "") or "",
+                model=getattr(agent, "model", "") or "",
+                num_messages=len(messages),
+            )
+        except Exception as classification_error:  # fail closed on malformed provider metadata
+            logging.warning(
+                "Iteration-limit summary error classification failed: error_type=%s",
+                type(classification_error).__name__,
+            )
+            classified = SimpleNamespace(
+                reason=FailoverReason.unknown,
+                status_code=getattr(e, "status_code", None),
+                should_rotate_credential=False,
+                should_fallback=False,
+            )
+
+        try:
+            error_context = agent._extract_api_error_context(e)
+            if not isinstance(error_context, dict):
+                error_context = {}
+        except Exception as context_error:
+            logging.warning(
+                "Iteration-limit summary error-context extraction failed: error_type=%s",
+                type(context_error).__name__,
+            )
+            error_context = {}
+
+        logging.warning(
+            "Iteration-limit summary failed: provider=%s model=%s reason=%s status=%s recovery=%s/%s",
+            getattr(agent, "provider", "") or "unknown",
+            getattr(agent, "model", "") or "unknown",
+            classified.reason.value,
+            classified.status_code if classified.status_code is not None else "unknown",
+            _recovery_attempts,
+            _MAX_ITERATION_SUMMARY_RECOVERIES,
+        )
+
+        def _remove_failed_summary_request() -> None:
+            last_message = messages[-1] if messages else None
+            if (
+                isinstance(last_message, dict)
+                and last_message.get("role") == "user"
+                and last_message.get("content") == summary_request
+            ):
+                messages.pop()
+
+        can_recover = _recovery_attempts < _MAX_ITERATION_SUMMARY_RECOVERIES
+
+        # Match the main conversation-loop ordering: refresh/rotate a credential
+        # before crossing the provider boundary.  usage_limit_reached rotates
+        # immediately; ordinary transient 429s do not burn another same-provider
+        # summary request here and can continue to the configured fallback.
+        if can_recover and classified.should_rotate_credential:
+            recovered_with_pool = False
+            try:
+                recovered_with_pool, _ = agent._recover_with_credential_pool(
+                    status_code=classified.status_code,
+                    has_retried_429=False,
+                    classified_reason=classified.reason,
+                    error_context=error_context,
+                )
+            except Exception as pool_error:
+                logging.warning(
+                    "Iteration-limit summary credential recovery failed: error_type=%s",
+                    type(pool_error).__name__,
+                )
+            if recovered_with_pool:
+                _remove_failed_summary_request()
+                logging.info(
+                    "Retrying iteration-limit summary after credential recovery: provider=%s model=%s",
+                    getattr(agent, "provider", "") or "unknown",
+                    getattr(agent, "model", "") or "unknown",
+                )
+                return handle_max_iterations(
+                    agent,
+                    messages,
+                    api_call_count,
+                    _recovery_attempts=_recovery_attempts + 1,
+                )
+
+        if can_recover and classified.should_fallback:
+            fallback_activated = False
+            fallback_before = (
+                getattr(agent, "provider", "") or "",
+                getattr(agent, "model", "") or "",
+                getattr(agent, "base_url", "") or "",
+                getattr(agent, "api_mode", "") or "",
+                id(getattr(agent, "client", None)),
+            )
+            try:
+                fallback_activated = agent._try_activate_fallback(
+                    reason=classified.reason
+                )
+            except Exception as fallback_error:
+                logging.warning(
+                    "Iteration-limit summary fallback activation failed: error_type=%s",
+                    type(fallback_error).__name__,
+                )
+            fallback_after = (
+                getattr(agent, "provider", "") or "",
+                getattr(agent, "model", "") or "",
+                getattr(agent, "base_url", "") or "",
+                getattr(agent, "api_mode", "") or "",
+                id(getattr(agent, "client", None)),
+            )
+            if fallback_activated and fallback_after == fallback_before:
+                logging.warning(
+                    "Iteration-limit summary fallback reported success without changing runtime; stopping duplicate retry"
+                )
+                fallback_activated = False
+            if fallback_activated:
+                # Re-enter with exactly one synthetic summary request. Leaving
+                # the failed request in history would create duplicate user
+                # turns and can break strict role-alternation providers.
+                _remove_failed_summary_request()
+                logging.info(
+                    "Retrying iteration-limit summary with fallback provider=%s model=%s",
+                    getattr(agent, "provider", "") or "unknown",
+                    getattr(agent, "model", "") or "unknown",
+                )
+                return handle_max_iterations(
+                    agent,
+                    messages,
+                    api_call_count,
+                    _recovery_attempts=_recovery_attempts + 1,
+                )
+
+        if classified.reason == FailoverReason.rate_limit:
+            reset_at = error_context.get("reset_at")
+            reset_text = None
+            if isinstance(reset_at, (int, float)):
+                try:
+                    reset_text = datetime.fromtimestamp(float(reset_at)).astimezone().isoformat(
+                        timespec="seconds"
+                    )
+                except (OverflowError, OSError, ValueError):
+                    reset_text = None
+            elif isinstance(reset_at, str):
+                candidate = reset_at.strip()
+                if re.fullmatch(r"\d+(?:\.\d+)?", candidate):
+                    try:
+                        reset_text = datetime.fromtimestamp(float(candidate)).astimezone().isoformat(
+                            timespec="seconds"
+                        )
+                    except (OverflowError, OSError, ValueError):
+                        reset_text = None
+                elif re.fullmatch(r"[0-9TtZz:+.\- ]{8,64}", candidate):
+                    # Structured ISO-like timestamps are safe to display; do
+                    # not echo arbitrary provider fields or raw error bodies.
+                    reset_text = candidate
+
+            resume_when = f" after {reset_text}" if reset_text else " after the provider quota resets"
+            final_response = (
+                f"I reached the maximum iterations ({agent.max_iterations}), but the summary "
+                "provider usage limit was reached. Progress is saved in this session; "
+                f"resume{resume_when}, or use a configured fallback provider."
+            )
+        elif classified.reason == FailoverReason.billing:
+            final_response = (
+                f"I reached the maximum iterations ({agent.max_iterations}), but summary-provider "
+                "billing or credits are unavailable. Progress is saved in this session; resume "
+                "after billing access is restored, or use a configured fallback provider."
+            )
+        else:
+            status_text = (
+                f", HTTP {classified.status_code}"
+                if isinstance(classified.status_code, int)
+                else ""
+            )
+            final_response = (
+                f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. "
+                f"Error: summary provider failure ({classified.reason.value}{status_text}). "
+                "Progress is saved in this session and can be resumed."
+            )
+
+        # Keep persisted history role-valid so the next user message can resume
+        # cleanly even when every summary provider is unavailable.
+        messages.append({"role": "assistant", "content": final_response})
 
     return final_response
 
@@ -1159,6 +1439,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    from agent.sinria_egress import prepare_model_provider_payload
+
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
@@ -1198,9 +1480,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
                 api_kwargs.pop("__bedrock_converse__", None)
+                transport_kwargs = prepare_model_provider_payload(agent, api_kwargs)
                 client = _get_bedrock_runtime_client(region)
                 try:
-                    raw_response = client.converse_stream(**api_kwargs)
+                    raw_response = client.converse_stream(**transport_kwargs)
                 except Exception as _bedrock_exc:
                     # Evict the cached client on stale-connection failures
                     # so the outer retry loop builds a fresh client/pool.
@@ -1296,6 +1579,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pool=30.0,
             ),
         }
+        stream_kwargs = prepare_model_provider_payload(agent, stream_kwargs)
         request_client_holder["client"] = agent._create_request_openai_client(
             reason="chat_completion_stream_request",
             api_kwargs=stream_kwargs,
@@ -1555,8 +1839,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        transport_kwargs = prepare_model_provider_payload(agent, api_kwargs)
         # Use the Anthropic SDK's streaming context manager
-        with agent._anthropic_client.messages.stream(**api_kwargs) as stream:
+        with agent._anthropic_client.messages.stream(**transport_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``.  Snapshot diagnostic headers
             # immediately so they survive a stream that dies before the
@@ -1624,8 +1909,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
     def _call():
         import httpx as _httpx
+        from agent.request_efficiency import resolve_stream_retry_budget
 
-        _max_stream_retries = int(os.getenv("HERMES_STREAM_RETRIES", 2))
+        _max_stream_retries = resolve_stream_retry_budget(
+            api_kwargs,
+            default_retries=2,
+            large_retries=1,
+            very_large_retries=0,
+        )
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):

@@ -135,6 +135,23 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
         pass  # Non-critical — skill still loads without config injection
 
 
+# Cap for the supporting-files listing injected into skill load messages.
+# Discovery for anything beyond the cap goes through references/README.md,
+# skill_view(), or a directory listing instead of inline enumeration.
+_SUPPORTING_FILES_LIST_CAP = 12
+
+
+def compose_auto_loaded_skill_message(
+    user_request: str, skill_messages: list[str]
+) -> str:
+    """Keep the real request ahead of potentially large auto-skill payloads."""
+    parts = [f"[User request]\n{str(user_request or '').strip()}"]
+    loaded = [str(message).strip() for message in skill_messages if str(message).strip()]
+    if loaded:
+        parts.append("[Auto-loaded skill instructions]\n" + "\n\n".join(loaded))
+    return "\n\n".join(parts)
+
+
 def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
@@ -219,8 +236,17 @@ def _build_skill_message(
             skill_view_target = skill_dir.name
         parts.append("")
         parts.append("[This skill has supporting files:]")
-        for sf in supporting:
-            parts.append(f"- {sf}  ->  {skill_dir / sf}")
+        # Paths are relative to the [Skill directory: ...] stated above; skills
+        # with large references/ trees would otherwise inject tens of KB of
+        # listing into every session that loads them.
+        for sf in supporting[:_SUPPORTING_FILES_LIST_CAP]:
+            parts.append(f"- {sf}")
+        remaining = len(supporting) - _SUPPORTING_FILES_LIST_CAP
+        if remaining > 0:
+            parts.append(
+                f"- …and {remaining} more supporting files under {skill_dir} "
+                f"(see references/README.md if present, or list the directory)."
+            )
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '

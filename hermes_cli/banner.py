@@ -20,18 +20,23 @@ from rich.table import Table
 
 from prompt_toolkit import print_formatted_text as _pt_print
 from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+from sinria_product import (
+    PRODUCT,
+    cli_command_name as _identity_cli_command_name,
+    product_name as _identity_product_name,
+)
 
 logger = logging.getLogger(__name__)
 
 
 
 def _cli_command_name() -> str:
-    return (os.getenv("SINRIA_CLI_NAME") or os.getenv("HERMES_CLI_NAME") or "sinria").strip().lower() or "sinria"
+    return _identity_cli_command_name()
 
 
 
 def _product_name() -> str:
-    return "Sinria Agent" if _cli_command_name() == "sinria" else "Sinria"
+    return _identity_product_name()
 
 
 # =========================================================================
@@ -77,12 +82,12 @@ def _skin_branding(key: str, fallback: str) -> str:
 
 from hermes_cli import __version__ as VERSION, __release_date__ as RELEASE_DATE
 
-HERMES_AGENT_LOGO = """[bold #FFD700]██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗       █████╗  ██████╗ ███████╗███╗   ██╗████████╗[/]
-[bold #FFD700]██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝[/]
-[#FFBF00]███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗█████╗███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║[/]
-[#FFBF00]██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║╚════╝██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║[/]
-[#CD7F32]██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║      ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║[/]
-[#CD7F32]╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝      ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝[/]"""
+SINRIA_AGENT_LOGO = """[bold #FFD700]╔══════════════════════════════════════╗[/]
+[bold #FFBF00]║             SINRIA AGENT             ║[/]
+[#CD7F32]╚══════════════════════════════════════╝[/]"""
+
+# Internal alias retained for source compatibility with extension modules.
+HERMES_AGENT_LOGO = SINRIA_AGENT_LOGO
 
 HERMES_CADUCEUS = """[#CD7F32]⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⣀⣀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀[/]
 [#CD7F32]⠀⠀⠀⠀⠀⠀⢀⣠⣴⣾⣿⣿⣇⠸⣿⣿⠇⣸⣿⣿⣷⣦⣄⡀⠀⠀⠀⠀⠀⠀[/]
@@ -137,7 +142,7 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 # (e.g. a nix-built CLI binary with no local git history to count against).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/taro-kuroda-5228/sinria-agent.git"
+_UPSTREAM_REPO_URL = f"{PRODUCT.repository_url}.git"
 
 
 def _check_via_rev(local_rev: str) -> Optional[int]:
@@ -338,6 +343,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
 
 
 _RELEASE_URL_BASE = "https://github.com/taro-kuroda-5228/sinria-agent/releases/tag"
+_OFFICIAL_REPO_URL = "https://github.com/taro-kuroda-5228/sinria-agent.git"
 _latest_release_cache: Optional[tuple] = None  # (tag, url) once resolved
 
 
@@ -522,7 +528,7 @@ def build_welcome_banner(console: Console, model: str, cwd: str,
     if len(model_short) > 28:
         model_short = model_short[:25] + "..."
     ctx_str = f" [dim {dim}]·[/] [dim {dim}]{_format_context_length(context_length)} context[/]" if context_length else ""
-    left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Nous Research[/]")
+    left_lines.append(f"[{accent}]{model_short}[/]{ctx_str} [dim {dim}]·[/] [dim {dim}]Medical Horizon[/]")
 
     if os.getenv("HERMES_YOLO_MODE"):
         left_lines.append(f"[bold red]⚠ YOLO mode[/] [dim {dim}]— all approval prompts bypassed[/]")

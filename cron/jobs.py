@@ -496,6 +496,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    decision_required: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -627,6 +628,8 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        # Typed producer intent for durable human-decision delivery.
+        "decision_required": bool(decision_required),
     }
 
     jobs = load_jobs()
@@ -811,7 +814,11 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 notification_state: Optional[Dict[str, Any]] = None,
+                 script_status: Optional[str] = None,
+                 script_error: Optional[str] = None,
+                 agent_status: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -830,6 +837,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
+                job["last_script_status"] = script_status
+                job["last_script_error"] = script_error
+                job["last_agent_status"] = agent_status
                 job["last_delivery_error"] = delivery_error
                 
                 # Increment completed count

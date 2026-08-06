@@ -6,6 +6,8 @@ should import from this module when touching product-facing runtime/home/path
 helpers; the names below delegate to the existing compatibility layer.
 """
 
+from sinria_product import PRODUCT, SINRIA_PRODUCT, ProductIdentity  # noqa: F401
+
 from hermes_constants import (  # noqa: F401
     AI_GATEWAY_BASE_URL,
     OPENROUTER_BASE_URL,

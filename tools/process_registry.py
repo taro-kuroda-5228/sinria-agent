@@ -45,13 +45,13 @@ from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_s
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from sinria_constants import get_sinria_home
 
 logger = logging.getLogger(__name__)
 
 
 # Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+CHECKPOINT_PATH = get_sinria_home() / "processes.json"
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -72,6 +72,15 @@ WATCH_STRIKE_LIMIT = 3            # Strikes in a row → disable watch + promote
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
+
+
+def _login_shell_command(command: str, env: dict) -> str:
+    """Restore the supplied PATH after POSIX login-shell startup files run."""
+    if _IS_WINDOWS:
+        return command
+    path = env.get("PATH")
+    path_prefix = f"export PATH={shlex.quote(path)}; " if path else ""
+    return f"{path_prefix}set +m; {command}"
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -506,7 +515,7 @@ class ProcessRegistry:
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {command}"],
+                    [user_shell, "-lic", _login_shell_command(command, pty_env)],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -547,7 +556,7 @@ class ProcessRegistry:
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
+            [user_shell, "-lic", _login_shell_command(command, bg_env)],
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -1512,15 +1521,29 @@ PROCESS_SCHEMA = {
 
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
+    # Terminal environments and background processes are keyed by the same
+    # resolved scope. In gateway mode this is a privacy-preserving hash of the
+    # channel/thread session key rather than a per-turn UUID.
+    from tools.terminal_tool import _resolve_container_task_id
+
+    process_scope = _resolve_container_task_id(task_id)
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
     if action == "list":
-        return json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
+        return json.dumps(
+            {"processes": process_registry.list_sessions(task_id=process_scope)},
+            ensure_ascii=False,
+        )
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        owned_session = process_registry.get(session_id)
+        if owned_session is None or owned_session.task_id != process_scope:
+            # Do not reveal whether a process ID belongs to another gateway
+            # channel/thread session.
+            return tool_error("Process session not found")
         if action == "poll":
             return json.dumps(process_registry.poll(session_id), ensure_ascii=False)
         elif action == "log":

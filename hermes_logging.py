@@ -212,6 +212,29 @@ def setup_logging(
 
     root = logging.getLogger()
 
+    # Existing process logging is stable unless an explicit reconfiguration is
+    # requested.  The gateway mode is the one supported upgrade path: a CLI
+    # process may start the gateway later and then needs gateway.log attached.
+    # Crucially, do not attach agent/errors handlers for every temporary home.
+    if _logging_initialized and not force:
+        if mode == "gateway" and not _has_owned_log_handler(root, "gateway.log"):
+            _add_rotating_handler(
+                root,
+                log_dir / "gateway.log",
+                level=logging.INFO,
+                max_bytes=5 * 1024 * 1024,
+                backup_count=3,
+                formatter=RedactingFormatter(_LOG_FORMAT),
+                log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
+            )
+        return log_dir
+
+    # A forced reconfiguration transfers ownership to the new Sinria home.
+    # Close only handlers created by this module; third-party handlers sharing
+    # the root logger are not ours to remove.
+    if force:
+        _close_owned_rotating_handlers(root)
+
     # --- agent.log (INFO+) — the main activity log -------------------------
     _add_rotating_handler(
         root,
@@ -258,10 +281,6 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
-    if _logging_initialized and not force:
-        return log_dir
-
-    # Ensure root logger level is low enough for the handlers to fire.
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)
 
@@ -339,6 +358,23 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
     def doRollover(self):
         super().doRollover()
         self._chmod_if_managed()
+
+
+def _has_owned_log_handler(logger: logging.Logger, filename: str) -> bool:
+    """Return whether this module already owns the requested log handler."""
+    return any(
+        isinstance(handler, _ManagedRotatingFileHandler)
+        and Path(getattr(handler, "baseFilename", "")).name == filename
+        for handler in logger.handlers
+    )
+
+
+def _close_owned_rotating_handlers(logger: logging.Logger) -> None:
+    """Detach and close only file handlers created by this module."""
+    for handler in list(logger.handlers):
+        if isinstance(handler, _ManagedRotatingFileHandler):
+            logger.removeHandler(handler)
+            handler.close()
 
 
 def _add_rotating_handler(

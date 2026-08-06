@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_sinria_home
 
-from agent.context_share.safety import contains_sensitive_text
+from agent.privacy.sanitization import contains_sensitive_text
 from agent.redact import redact_sensitive_text
 
 _SYNTHETIC_MARKERS = (

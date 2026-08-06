@@ -6,8 +6,6 @@ Thank you for contributing to Sinria! This guide covers everything you need: set
 
 ## Contribution Priorities
 
-This public repository is the **Sinria OSS core**. Contributions should strengthen the local-first runtime, CLI, tool/skill framework, gateway foundations, documentation, and generic safety primitives. Do **not** submit customer-specific workflows, PHI/PII, secrets, private deployment topology, proprietary evaluation sets, or institution-specific connector details here; those belong in private enterprise/customer repositories or local Sinria runtime storage.
-
 We value contributions in this order:
 
 1. **Bug fixes** — crashes, incorrect behavior, data loss. Always top priority.

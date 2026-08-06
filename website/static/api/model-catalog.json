@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-05-11T16:41:16Z",
+  "updated_at": "2026-07-12T11:18:57Z",
   "metadata": {
     "source": "sinria-agent repo",
     "docs": "https://taro-kuroda-5228.github.io/sinria-agent/docs/reference/model-catalog"
@@ -39,6 +39,22 @@
         {
           "id": "anthropic/claude-haiku-4.5",
           "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6",
+          "description": "alias to gpt-5.6-sol"
+        },
+        {
+          "id": "openai/gpt-5.6-sol",
+          "description": "frontier capability"
+        },
+        {
+          "id": "openai/gpt-5.6-terra",
+          "description": "balanced intelligence/cost"
+        },
+        {
+          "id": "openai/gpt-5.6-luna",
+          "description": "efficient high-volume workloads"
         },
         {
           "id": "openai/gpt-5.5",
@@ -161,6 +177,18 @@
         },
         {
           "id": "anthropic/claude-haiku-4.5"
+        },
+        {
+          "id": "openai/gpt-5.6"
+        },
+        {
+          "id": "openai/gpt-5.6-sol"
+        },
+        {
+          "id": "openai/gpt-5.6-terra"
+        },
+        {
+          "id": "openai/gpt-5.6-luna"
         },
         {
           "id": "openai/gpt-5.5"

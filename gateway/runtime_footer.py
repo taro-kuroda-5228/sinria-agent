@@ -113,7 +113,9 @@ def format_runtime_footer(
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
         elif field == "cwd":
-            rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
+            from gateway.session_context import get_session_env
+
+            rel = _home_relative_cwd(cwd or get_session_env("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
         # Unknown field names are silently ignored.
