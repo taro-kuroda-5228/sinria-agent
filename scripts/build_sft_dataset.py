@@ -28,7 +28,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from agent.context_share.safety import contains_sensitive_text  # noqa: E402
+from agent.privacy.sanitization import contains_sensitive_text  # noqa: E402
 
 
 def _tool_call_block(call: dict[str, Any]) -> str:

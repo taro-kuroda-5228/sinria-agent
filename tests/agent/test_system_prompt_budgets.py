@@ -87,7 +87,7 @@ def test_missing_profile_is_unchanged(monkeypatch):
     assert "Small-context mode" not in parts["stable"]
 
 
-def test_resolver_block_respects_budget(monkeypatch):
+def test_system_prompt_omits_turn_scoped_resolver_even_with_budget(monkeypatch):
     _patch_prompt_helpers(monkeypatch)
     tiny = ModelCapabilityProfile(
         context_length=16_000,
@@ -95,8 +95,8 @@ def test_resolver_block_respects_budget(monkeypatch):
         max_iterations_cap=30,
         memory_char_budget=4_000,
         user_profile_char_budget=2_000,
-        resolver_char_budget=50,
+        advice_char_budget=50,
     )
     parts = build_system_prompt_parts(_make_agent(tiny), system_message="改善して")
-    assert "Context Share Resolver" in parts["volatile"]
-    assert "truncated to fit the model's context budget" in parts["volatile"]
+    # conversation_loop is the single owner of per-turn correction advice.
+    assert "Correction Checklist" not in parts["volatile"]
