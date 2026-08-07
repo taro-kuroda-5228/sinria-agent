@@ -6,7 +6,7 @@ from hermes_constants import get_sinria_home
 
 
 def _seed_evidence():
-    store = get_sinria_home() / "context_share" / "evidence.jsonl"
+    store = get_sinria_home() / "corrections" / "evidence.jsonl"
     store.parent.mkdir(parents=True, exist_ok=True)
     rows = [
         {

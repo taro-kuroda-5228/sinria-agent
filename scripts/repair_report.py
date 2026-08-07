@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """code-defect telemetry report — self-repair loop Phase 1 observation.
 
-Reads the sanitized ``SINRIA_HOME/context_share/code_defects.jsonl`` and
+Reads the sanitized ``SINRIA_HOME/repair/code_defects.jsonl`` and
 reports, for the observation window: event counts, unique fingerprints,
 severity/repo distribution, transient-noise ratio, and the top recurring
 fingerprints. Aggregate-only — nothing beyond exception class names and
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--window-days", type=int, default=7)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    path = get_sinria_home() / "context_share" / "code_defects.jsonl"
+    path = get_sinria_home() / "repair" / "code_defects.jsonl"
     report = build_report(load_events(path), window_days=args.window_days, now=datetime.now(timezone.utc))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))

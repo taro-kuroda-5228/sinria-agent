@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """verify-after-act 運用観察 report — measures the P1 actuator's effect.
 
-Reads the sanitized JSONL stores under ``SINRIA_HOME/context_share/``
+Reads the sanitized JSONL stores under ``SINRIA_HOME/repair/``
 (outcome_gap.jsonl, verify_nudges.jsonl, routing_signals.jsonl) and reports,
 for the observation window vs the pre-P1 baseline:
 
@@ -197,7 +197,7 @@ def main() -> int:
         sys.path.insert(0, str(repo_root))
     from hermes_constants import get_sinria_home
 
-    share = get_sinria_home() / "context_share"
+    share = get_sinria_home() / "corrections"
     now = datetime.now(timezone.utc)
     window_start = (now - timedelta(days=args.window_days)).isoformat().replace("+00:00", "Z")
 
