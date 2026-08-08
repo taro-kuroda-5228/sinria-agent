@@ -51,8 +51,8 @@ The rolling `main` channel follows the latest reviewed GitHub commit. Versioned 
 > Recommended first path on macOS or Linux: clone the repo, run setup, then start Sinria locally.
 
 ```bash
-git clone https://github.com/taro-kuroda-5228/sinria.git
-cd sinria
+git clone https://github.com/taro-kuroda-5228/sinria-agent.git
+cd sinria-agent
 ./setup-sinria.sh
 ./sinria
 ```
@@ -80,7 +80,7 @@ Sinria keeps user/runtime state outside the repository:
 
 ```text
 ~/.sinria/                 # Sinria runtime home: config, memory, skills, cron output, logs
-~/sinria or ./sinria repo  # source checkout
+~/sinria-agent             # employee/distribution source checkout
 ```
 
 Do not commit `.env`, credentials, patient data, private vault content, or local runtime exports.
@@ -92,7 +92,7 @@ Do not commit `.env`, credentials, patient data, private vault content, or local
 ### macOS / Linux / WSL2
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/taro-kuroda-5228/sinria/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.sh | bash
 ```
 
 Then reload your shell and run:
@@ -115,7 +115,7 @@ To install natively on Windows instead, run the PowerShell installer
 (`scripts/install.ps1`) from an elevated PowerShell prompt:
 
 ```powershell
-irm https://raw.githubusercontent.com/taro-kuroda-5228/sinria/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/taro-kuroda-5228/sinria-agent/main/scripts/install.ps1 | iex
 ```
 
 ---
