@@ -153,14 +153,15 @@ class TestHandleUpdateCommand:
         assert "hermes_cli.main" in joined or "bash" in call_args[0]
 
     @pytest.mark.asyncio
-    async def test_resolve_hermes_bin_prefers_which(self, tmp_path):
-        """_resolve_hermes_bin returns argv parts from shutil.which when available."""
+    async def test_resolve_hermes_bin_prefers_running_runtime(self, tmp_path):
+        """A stale PATH shim must not redirect a gateway update to another checkout."""
+        import sys
         from gateway.run import _resolve_hermes_bin
 
         with patch("shutil.which", return_value="/custom/path/hermes"):
             result = _resolve_hermes_bin()
 
-        assert result == ["/custom/path/hermes"]
+        assert result == [sys.executable, "-m", "hermes_cli.main"]
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_fallback(self):

@@ -1221,20 +1221,15 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
-    """Resolve the Hermes update command as argv parts.
+    """Resolve the update command in the gateway's running Python runtime.
 
-    Tries in order:
-    1. ``shutil.which("hermes")`` — standard PATH lookup
-    2. ``sys.executable -m hermes_cli.main`` — fallback when Hermes is running
-       from a venv/module invocation and the ``hermes`` shim is not on PATH
-
-    Returns argv parts ready for quoting/joining, or ``None`` if neither works.
+    A PATH shim can belong to an older checkout or virtualenv than the running
+    gateway. Updating through it mixes runtime ownership and can leave launchd
+    repeatedly starting and stopping different installations. Prefer the
+    interpreter that already owns this gateway; retain PATH lookup only as a
+    compatibility fallback for unusual embedded launches.
     """
     import shutil
-
-    hermes_bin = shutil.which("hermes")
-    if hermes_bin:
-        return [hermes_bin]
 
     try:
         import importlib.util
@@ -1243,6 +1238,10 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
             return [sys.executable, "-m", "hermes_cli.main"]
     except Exception:
         pass
+
+    resolved = shutil.which("sinria") or shutil.which("hermes")
+    if resolved:
+        return [resolved]
 
     return None
 
