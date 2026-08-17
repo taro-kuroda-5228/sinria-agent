@@ -9706,7 +9706,7 @@ def _build_provider_choices() -> list[str]:
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "auth", "backup", "checkpoints", "claw", "completion",
-        "computer-use",
+        "chrome", "computer-use",
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "gcp", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
@@ -9826,6 +9826,29 @@ def main():
     cli_name = _cli_command_name()
     product_name = _product_name()
     home_display = "~/.sinria"
+
+    # =========================================================================
+    # chrome command
+    # =========================================================================
+    chrome_parser = subparsers.add_parser(
+        "chrome",
+        help="Install or open Sinria in Chrome",
+        description="Install and launch the local-first Sinria in Chrome extension runtime",
+    )
+    chrome_parser.add_argument(
+        "action",
+        nargs="?",
+        default="open",
+        choices=["open", "install", "status", "uninstall"],
+        help="Action to perform (default: open)",
+    )
+
+    def cmd_chrome(args):
+        from sinria_cli.chrome import chrome_command
+
+        return chrome_command(args)
+
+    chrome_parser.set_defaults(func=cmd_chrome)
 
     # =========================================================================
     # model command
