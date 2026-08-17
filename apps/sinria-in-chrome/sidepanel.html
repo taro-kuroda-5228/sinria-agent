@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sinria</title>
+  <link rel="stylesheet" href="src/sidepanel.css">
+</head>
+<body>
+  <header>
+    <div><strong>Sinria</strong><span>in Chrome</span></div>
+    <button id="settings-toggle" class="quiet" type="button" aria-expanded="false">Settings</button>
+  </header>
+  <section id="settings" hidden>
+    <label>Local API URL<input id="base-url" type="url" value="http://127.0.0.1:8642" spellcheck="false"></label>
+    <label>API token (optional)<input id="api-token" type="password" autocomplete="off"></label>
+    <label>Extension origin (add to Sinria CORS allowlist)<input id="extension-origin" type="text" readonly></label>
+    <div class="row"><button id="save-settings" type="button">Save &amp; test</button><span id="connection-status" role="status">Not tested</span></div>
+    <p class="hint">The token stays only in Chrome session storage and clears when the browser session ends. This MVP accepts localhost only. Restart the API with this extension origin in <code>API_SERVER_CORS_ORIGINS</code>.</p>
+  </section>
+  <main id="transcript" aria-live="polite">
+    <article class="message assistant">Ask Sinria about this page or request an action. Page actions always wait for your approval.</article>
+  </main>
+  <section id="proposals" aria-live="assertive"></section>
+  <form id="composer">
+    <textarea id="prompt" rows="3" placeholder="Ask about this page…" required></textarea>
+    <div class="composer-row"><span id="status" role="status">Ready</span><button id="send" type="submit">Send</button></div>
+  </form>
+  <script type="module" src="src/sidepanel.js"></script>
+</body>
+</html>

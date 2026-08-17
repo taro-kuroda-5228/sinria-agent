@@ -69,6 +69,10 @@ Useful first commands:
 sinria setup        # configure providers, tools, and gateway options
 sinria model        # choose or switch model/provider
 sinria tools        # enable/disable toolsets
+sinria computer-use install  # macOS: install/repair background desktop control
+sinria computer-use status   # verify cua-driver is ready
+sinria chrome install        # install the local Sinria in Chrome runtime
+sinria chrome                # open the dedicated Chrome profile
 sinria doctor       # diagnose local setup problems
 sinria gateway      # run messaging gateway integrations
 sinria update       # update Sinria from GitHub

@@ -1,0 +1,24 @@
+:root { color-scheme: light; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #171717; background: #f7f7f7; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 300px; height: 100vh; display: grid; grid-template-rows: auto auto 1fr auto auto; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid #dedede; background: #fff; }
+header div { display: flex; gap: 6px; align-items: baseline; } header span { color: #696969; font-size: 12px; }
+button { border: 0; border-radius: 8px; padding: 8px 12px; background: #181818; color: white; cursor: pointer; font: inherit; }
+button:hover { background: #333; } button:disabled { opacity: .45; cursor: not-allowed; }
+button.quiet { color: #333; background: transparent; padding: 5px; }
+#settings { padding: 12px 14px; background: #fff; border-bottom: 1px solid #ddd; }
+label { display: block; font-size: 12px; color: #555; margin-bottom: 9px; }
+input, textarea { width: 100%; margin-top: 4px; padding: 9px; border: 1px solid #c8c8c8; border-radius: 8px; background: #fff; color: #171717; font: inherit; }
+textarea { resize: vertical; min-height: 66px; max-height: 180px; }
+.row, .composer-row { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.hint, #status, #connection-status { color: #696969; font-size: 12px; }
+#transcript { overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+.message { max-width: 94%; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px 12px; border-radius: 12px; background: #fff; border: 1px solid #e1e1e1; }
+.message.user { align-self: flex-end; background: #222; color: #fff; border-color: #222; }
+.message.system { font-size: 12px; color: #555; background: #f0f0f0; }
+#proposals { padding: 0 12px; }
+.proposal { border: 1px solid #c7a84b; background: #fffbed; border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+.proposal strong { display: block; margin-bottom: 4px; } .proposal .buttons { display: flex; gap: 8px; margin-top: 9px; }
+.proposal .deny { background: #e6e6e6; color: #222; }
+#composer { padding: 10px 12px 12px; background: #fff; border-top: 1px solid #dedede; }
+#composer textarea { margin: 0 0 8px; }
