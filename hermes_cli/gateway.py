@@ -3023,21 +3023,68 @@ def launchd_plist_is_current() -> bool:
 
 
 def refresh_launchd_plist_if_needed() -> bool:
-    """Rewrite the installed launchd plist when the generated definition has changed.
-
-    Unlike systemd, launchd picks up plist changes on the next ``launchctl kill``/
-    ``launchctl kickstart`` cycle — no daemon-reload is needed. We still bootout/
-    bootstrap to make launchd re-read the updated plist immediately.
-    """
+    """Atomically reload a stale plist, restoring the old runtime on failure."""
     plist_path = get_launchd_plist_path()
     if not plist_path.exists() or launchd_plist_is_current():
         return False
 
-    plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
+    previous = plist_path.read_text(encoding="utf-8")
+    updated = generate_launchd_plist()
+    temp_path = plist_path.with_name(f".{plist_path.name}.{os.getpid()}.tmp")
+    temp_path.write_text(updated, encoding="utf-8")
+    os.replace(temp_path, plist_path)
+
     label = get_launchd_label()
-    # Bootout/bootstrap so launchd picks up the new definition
-    subprocess.run(["launchctl", "bootout", f"{_launchd_domain()}/{label}"], check=False, timeout=90)
-    subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=False, timeout=30)
+    domain = _launchd_domain()
+    try:
+        # bootout is best-effort because an installed job may already be
+        # unloaded. bootstrap must succeed before the new entrypoint is trusted.
+        subprocess.run(
+            ["launchctl", "bootout", f"{domain}/{label}"],
+            check=False,
+            timeout=90,
+        )
+        subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        # Restore the last known-good definition and reload it before surfacing
+        # the update failure. This avoids leaving the machine with no gateway.
+        rollback_path = plist_path.with_name(
+            f".{plist_path.name}.{os.getpid()}.rollback"
+        )
+        try:
+            rollback_path.write_text(previous, encoding="utf-8")
+            os.replace(rollback_path, plist_path)
+            # The failed bootstrap may have partially registered the new job.
+            # Unload it before restoring the last known-good definition.
+            subprocess.run(
+                ["launchctl", "bootout", f"{domain}/{label}"],
+                check=False,
+                timeout=90,
+            )
+            subprocess.run(
+                ["launchctl", "bootstrap", domain, str(plist_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as rollback_error:
+            logger.error(
+                "Failed to restore the previous launchd gateway definition: %s",
+                rollback_error,
+            )
+        finally:
+            rollback_path.unlink(missing_ok=True)
+        raise
+    finally:
+        temp_path.unlink(missing_ok=True)
+
     print(f"↻ Updated gateway launchd service definition to match the current {_gateway_product_name()} install")
     return True
 

@@ -8485,6 +8485,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             restarted_services = []
             killed_pids = set()
             relaunched_profiles = []
+            launchd_definition_refreshed = False
 
             # --- Systemd services (Linux) ---
             # Discover all sinria-gateway* units (default + profiles)
@@ -8735,6 +8736,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         launchd_restart,
                         get_launchd_label,
                         get_launchd_plist_path,
+                        refresh_launchd_plist_if_needed,
                     )
 
                     plist_path = get_launchd_plist_path()
@@ -8747,7 +8749,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         if check.returncode == 0:
                             try:
-                                launchd_restart()
+                                # A stale plist may still point launchd at an
+                                # older checkout or virtualenv. Refreshing it
+                                # performs bootout + bootstrap and therefore
+                                # already owns the restart. Do not terminate
+                                # that fresh replacement a second time.
+                                refreshed = refresh_launchd_plist_if_needed()
+                                if not refreshed:
+                                    launchd_restart()
+                                else:
+                                    launchd_definition_refreshed = True
                                 restarted_services.append(get_launchd_label())
                             except subprocess.CalledProcessError as e:
                                 stderr = (getattr(e, "stderr", "") or "").strip()
@@ -8759,15 +8770,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Kill any remaining gateway processes not managed by a service.
             # Exclude PIDs that belong to just-restarted services so we don't
             # immediately kill the process that systemd/launchd just spawned.
-            service_pids = _get_service_pids()
-            manual_pids = find_gateway_pids(
-                exclude_pids=service_pids, all_profiles=True
-            )
-            profile_processes = {
-                proc.pid: proc
-                for proc in find_profile_gateway_processes(exclude_pids=service_pids)
-                if proc.pid in manual_pids
-            }
+            if launchd_definition_refreshed:
+                # bootstrap has created a replacement, but launchctl may not
+                # expose its PID immediately. Never classify that replacement
+                # as an unmanaged process during this update tick.
+                service_pids = set()
+                manual_pids = []
+                profile_processes = {}
+            else:
+                service_pids = _get_service_pids()
+                manual_pids = find_gateway_pids(
+                    exclude_pids=service_pids, all_profiles=True
+                )
+                profile_processes = {
+                    proc.pid: proc
+                    for proc in find_profile_gateway_processes(exclude_pids=service_pids)
+                    if proc.pid in manual_pids
+                }
             for pid, proc in profile_processes.items():
                 if not launch_detached_profile_gateway_restart(proc.profile, pid):
                     continue
@@ -8827,6 +8846,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # any remaining pre-update PIDs so the watcher / service
             # manager can relaunch with fresh code.
             try:
+                if not killed_pids:
+                    raise StopIteration
                 _time.sleep(3.0)
                 _service_pids_after = _get_service_pids()
                 _surviving = find_gateway_pids(
@@ -8856,6 +8877,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # Give the OS a beat to reap the processes so the
                     # watchers see them exit and respawn.
                     _time.sleep(1.5)
+            except StopIteration:
+                pass
             except Exception as _sweep_exc:
                 logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
