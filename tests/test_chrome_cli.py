@@ -104,7 +104,7 @@ def test_status_reports_missing_components_without_mutation(tmp_path):
     assert not home.exists()
 
 
-def test_chrome_command_honors_install_action(monkeypatch, tmp_path):
+def test_chrome_command_honors_install_action(monkeypatch, tmp_path, capsys):
     browser = tmp_path / "Google Chrome"
     browser.touch()
     install = chrome.ChromeInstall(
@@ -125,6 +125,37 @@ def test_chrome_command_honors_install_action(monkeypatch, tmp_path):
     )
 
     assert chrome.chrome_command(SimpleNamespace(action="install")) == 0
+    output = capsys.readouterr().out
+    assert "runtime installed" in output
+    assert "every computer" in output
+    assert "each Chrome profile" in output
+    assert str(install.extension_dir) in output
+    assert f"API_SERVER_CORS_ORIGINS=chrome-extension://{EXTENSION_ID}" in output
+    assert "http://127.0.0.1:8642" in output
+    assert "Save & test" in output
+
+
+def test_chrome_status_distinguishes_runtime_from_profile_activation(
+    monkeypatch, tmp_path, capsys
+):
+    status = chrome.ChromeStatus(
+        installed=True,
+        problems=[],
+        extension_dir=tmp_path / "extension",
+        native_host=tmp_path / "native-host",
+        manifest_paths=(),
+    )
+    browser = tmp_path / "Google Chrome"
+    browser.touch()
+    monkeypatch.setattr(chrome, "default_sinria_home", lambda: tmp_path / ".sinria")
+    monkeypatch.setattr(chrome, "default_chrome_support_dirs", lambda: ())
+    monkeypatch.setattr(chrome, "inspect_chrome_runtime", lambda *_: status)
+    monkeypatch.setattr(chrome, "_managed_chrome_path", lambda *_: browser)
+
+    assert chrome.chrome_command(SimpleNamespace(action="status")) == 0
+    output = capsys.readouterr().out
+    assert "Sinria in Chrome runtime: installed" in output
+    assert "does not verify Chrome profile activation" in output
 
 
 def test_managed_chrome_paths_keep_cross_platform_runtime_bundles(monkeypatch, tmp_path):

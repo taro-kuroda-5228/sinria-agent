@@ -13,9 +13,15 @@ sinria chrome
 
 `sinria chrome` opens a dedicated local Chrome profile with the extension loaded. Start the Sinria API server on `http://127.0.0.1:8642`; if the gateway is managed by a daemon, enable its existing `api_server` adapter instead of starting a second gateway. In the side-panel **Settings**, save and test the local API URL.
 
-The extension has a stable origin, `chrome-extension://pebcacnleolamclolgncigkgojkdghgc`. Add that origin to the API server's `api_server.cors_origins` configuration when direct local API access is enabled. The optional bearer token is held only for the current browser session.
+The extension has a stable origin, `chrome-extension://pebcacnleolamclolgncigkgojkdghgc`. Before starting the API server, set `API_SERVER_CORS_ORIGINS=chrome-extension://pebcacnleolamclolgncigkgojkdghgc` when direct local API access is enabled. The optional bearer token is held only for the current browser session.
 
-Use `sinria chrome status` to verify the extension, native host, and browser manifests. Use `sinria chrome uninstall` to remove only Sinria's installed Chrome runtime.
+Use `sinria chrome status` to verify that the local runtime files, native host, and managed browser are installed. Chrome profile activation is managed by Chrome and must be checked separately in `chrome://extensions`. Use `sinria chrome uninstall` to remove only Sinria's installed Chrome runtime.
+
+### Another computer or Chrome profile
+
+Google account sync does not install unpacked extensions. Run `sinria chrome install` on every computer, then repeat **Load unpacked** in every Chrome profile that should use Sinria. Select the exact absolute extension path printed by the command; do not type a literal `~` in Chrome's file picker.
+
+Each computer must run its own Sinria API on `127.0.0.1:8642`. In each profile, open **Settings**, select **Save & test**, and confirm **Connected**. The extension can control only profiles where this activation has been completed.
 
 ### Developer-mode fallback
 
