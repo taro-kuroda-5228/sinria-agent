@@ -247,6 +247,25 @@ def uninstall_chrome_runtime(sinria_home: Path, chrome_support_dirs: Iterable[Pa
     return removed
 
 
+def _profile_activation_instructions(extension_dir: Path) -> tuple[str, ...]:
+    """Return Chrome's required manual steps after staging the local extension."""
+    return (
+        "",
+        "Next: activate the extension in Chrome.",
+        "Run this install on every computer. Google account sync does not install unpacked extensions.",
+        "Repeat these steps in each Chrome profile that should use Sinria:",
+        "1. Open chrome://extensions and enable Developer mode.",
+        "2. Select Load unpacked and choose this exact extension directory:",
+        f"   {extension_dir}",
+        "3. Pin Sinria in Chrome and open its side panel.",
+        "4. Set this environment variable for the Sinria API, then restart it:",
+        f"   API_SERVER_CORS_ORIGINS=chrome-extension://{EXTENSION_ID}",
+        "5. In Settings, set the API URL to http://127.0.0.1:8642 and select Save & test.",
+        "6. Confirm the side panel shows Connected.",
+        "The extension can control only profiles where you complete these steps.",
+    )
+
+
 def chrome_command(args) -> int:
     action = getattr(args, "action", None) or getattr(args, "chrome_command", None) or "open"
     source = default_source_dir()
@@ -257,9 +276,14 @@ def chrome_command(args) -> int:
         browser = _chrome_app() or _managed_chrome_path(_runtime_paths(home, support))
         browser_ready = browser.exists()
         ready = status.installed and browser_ready
-        print("Sinria in Chrome: installed" if ready else "Sinria in Chrome: not ready")
+        state = "installed" if ready else "not ready"
+        print(f"Sinria in Chrome runtime: {state}")
         print(f"Extension: {status.extension_dir}")
         print(f"Browser: {browser}")
+        print(
+            "Chrome profile activation: check each profile separately; "
+            "this status does not verify Chrome profile activation."
+        )
         for problem in status.problems:
             print(f"- {problem}")
         if not browser_ready:
@@ -272,9 +296,11 @@ def chrome_command(args) -> int:
     result = install_chrome_runtime(source, home, support)
     if action == "install":
         browser = _chrome_app() or _download_chrome_for_testing(result)
-        print("Sinria in Chrome installed.")
+        print("Sinria in Chrome runtime installed.")
         print(f"Extension: {result.extension_dir}")
         print(f"Browser: {browser}")
+        for line in _profile_activation_instructions(result.extension_dir):
+            print(line)
         return 0
     launch_chrome(result)
     print("Sinria in Chrome opened in a dedicated local Chrome profile.")
