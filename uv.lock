@@ -3634,7 +3634,7 @@ wheels = [
 
 [[package]]
 name = "sinria-agent"
-version = "0.14.6"
+version = "0.14.7"
 source = { editable = "." }
 dependencies = [
     { name = "croniter" },

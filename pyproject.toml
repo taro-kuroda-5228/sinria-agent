@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sinria-agent"
-version = "0.14.6"
+version = "0.14.7"
 description = "Sinria — Medical Horizon's independent AI agent platform for healthcare institutions"
 readme = "README.md"
 requires-python = ">=3.11"
