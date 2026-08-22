@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 import run_agent
+from agent.context_source_policy import ContextSourcePolicy
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
@@ -97,6 +98,27 @@ class TestRunConversationCodexPath:
         final = [m for m in msgs if m.get("role") == "assistant"
                  and m.get("content") == "echo: hello"]
         assert final, f"expected final assistant message in {msgs}"
+
+    def test_context_source_guidance_reaches_codex_without_mutating_stored_user_message(self, fake_session):
+        agent = _make_codex_agent()
+        setattr(agent, "_context_source_policy", ContextSourcePolicy.from_config({
+            "enabled": True,
+            "company": {
+                "label": "Example Org knowledge",
+                "kind": "company_knowledge_manifest",
+                "title": "Example Org knowledge index",
+                "hints": ["team knowledge"],
+            },
+        }))
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("check team knowledge")
+
+        assert "reviewed Company Knowledge manifest" in result["final_response"]
+        user_messages = [message for message in result["messages"] if message.get("role") == "user"]
+        assert len(user_messages) == 1
+        assert user_messages[0]["content"] == "check team knowledge"
+        assert user_messages[0]["_injected_user_context"]
 
     def test_nudge_counters_tick(self, fake_session):
         """The skill nudge counter must accumulate tool_iterations across

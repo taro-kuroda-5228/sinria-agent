@@ -496,6 +496,20 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Optional source-of-truth routing. Disabled until each installation
+    # defines its own personal and shared knowledge locations.
+    "context_sources": {
+        "enabled": False,
+        "priority": [
+            "current_user_instruction",
+            "live_system_of_record",
+            "latest_explicit_decision",
+            "handoff",
+            "history",
+        ],
+        "personal": {},
+        "company": {},
+    },
     "sinria": {
         "product_name": "Sinria",
         "policy": {

@@ -39,6 +39,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.company_context.runtime import ContextIdentity
+from agent.context_source_policy import guidance_for_agent
 from agent.correction_loop.advice import format_correction_advice
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
@@ -725,13 +726,17 @@ def run_conversation(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
+    # Normalize the user-authored query once for every per-turn advisory path.
+    # This must not depend on external memory being enabled: context-source
+    # guidance also consumes it when no memory manager is configured.
+    _query = original_user_message if isinstance(original_user_message, str) else ""
+
     # Notify memory providers of the new turn so cadence tracking works.
     # Must happen BEFORE prefetch_all() so providers know which turn it is
     # and can gate context/dialectic refresh via contextCadence/dialecticCadence.
     if agent._memory_manager:
         try:
-            _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
-            agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
+            agent._memory_manager.on_turn_start(agent._user_turn_count, _query)
         except Exception:
             pass
 
@@ -743,7 +748,6 @@ def run_conversation(
     _ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
@@ -751,6 +755,7 @@ def run_conversation(
     # fail-open and has no execution-policy authority.
     _turn_injections = _current_turn_user_injections(
         format_correction_advice(user_message),
+        guidance_for_agent(agent, _query),
         build_memory_context_block(_ext_prefetch_cache) if _ext_prefetch_cache else "",
         _plugin_user_context,
     )
@@ -759,12 +764,14 @@ def run_conversation(
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
+    # all run inside Codex). Keep stored user content byte-pure while sending
+    # the same fixed per-turn injection bytes as the regular provider path.
     if agent.api_mode == "codex_app_server":
+        _codex_user_input = user_message
+        if _turn_injections and isinstance(user_message, str):
+            _codex_user_input = user_message + "\n\n" + "\n\n".join(_turn_injections)
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=_codex_user_input,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,

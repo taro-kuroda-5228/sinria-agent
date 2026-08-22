@@ -268,6 +268,17 @@ def _mock_response(
     return resp
 
 
+def test_context_source_guidance_does_not_require_memory_manager(agent):
+    """A turn must normalize its query even when external memory is disabled."""
+    agent._memory_manager = None
+    agent.client.chat.completions.create.return_value = _mock_response(content="ok")
+
+    result = agent.run_conversation("PythonでCSVをソートして")
+
+    assert result["final_response"] == "ok"
+    assert result["completed"] is True
+
+
 # ===================================================================
 # Group 1: Pure Functions
 # ===================================================================

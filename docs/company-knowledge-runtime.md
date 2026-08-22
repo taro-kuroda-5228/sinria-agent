@@ -2,16 +2,56 @@
 
 Sinria can synchronize reviewed, metadata-only Company Knowledge into a member-scoped encrypted local index and inject matching citations into individual model turns.
 
+## Personal and team source routing
+
+Source routing is disabled by default. Each installation may opt in through
+`~/.sinria/config.yaml`; never copy another member's paths or source IDs.
+
+```yaml
+context_sources:
+  enabled: true
+  priority:
+    - current_user_instruction
+    - live_system_of_record
+    - latest_explicit_decision
+    - handoff
+    - history
+  personal:
+    label: Personal knowledge
+    kind: obsidian_vault
+    location: ~/knowledge-vault
+    entrypoints: [handoff.md, decisions/]
+    hints: [personal knowledge, my notes, decisions]
+  company:
+    label: Example Org knowledge
+    kind: company_knowledge_manifest
+    title: Example Org knowledge index
+    migration_target: Company OS
+    hints: [Company Knowledge, team knowledge, internal]
+```
+
+The router uses configured metadata locally for source selection and injects only
+fixed, non-sensitive retrieval guidance. It does not place configured paths, IDs,
+labels, titles, entrypoints, or source content into model input. Personal knowledge
+remains private to the member profile. Shared knowledge continues through the
+reviewed Company Knowledge runtime below. Explicit user instructions outrank
+retrieved history, and raw confidential data, credentials, PHI, and PII remain
+local.
+
+Peer collaboration is separate from source retrieval: the peer runtime can
+claim, heartbeat, complete, fail, and revise delegated work, while source routing
+determines which personal or shared knowledge is appropriate for the current turn.
+
 ## Required identity
 
 Each installation must use its own identity. Do not share profiles or indexes between employees.
 
 ```bash
 SINRIA_COMPANY_CONTEXT_ENABLED=true
-SINRIA_COMPANY_CONTEXT_PROFILE_ID=profile-kikuchi
-SINRIA_COMPANY_CONTEXT_WORKSPACE_ID=medical-horizon
-SINRIA_COMPANY_CONTEXT_OWNER_ID=member_kikuchi
-SINRIA_COMPANY_CONTEXT_MANIFEST_URL=https://medical-horizon-company-os.vercel.app/api/knowledge-assets/manifest
+SINRIA_COMPANY_CONTEXT_PROFILE_ID=profile-example-member
+SINRIA_COMPANY_CONTEXT_WORKSPACE_ID=example-org
+SINRIA_COMPANY_CONTEXT_OWNER_ID=member-example
+SINRIA_COMPANY_CONTEXT_MANIFEST_URL=https://company-knowledge.example.invalid/api/knowledge-assets/manifest
 ```
 
 Recommended bounded policy:
