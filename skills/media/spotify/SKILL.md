@@ -15,7 +15,7 @@ metadata:
 
 # Spotify
 
-Control the user's Spotify account via the Hermes Spotify toolset (7 tools). Setup guide: https://hermes-agent.nousresearch.com/docs/user-guide/features/spotify
+Control the user's Spotify account via the Hermes Spotify toolset (7 tools). Setup guide: https://github.com/taro-kuroda-5228/sinria-agent
 
 ## When to use this skill
 

@@ -2,7 +2,7 @@ class SinriaAgent < Formula
   include Language::Python::Virtualenv
 
   desc "Self-improving AI agent that creates skills from experience"
-  homepage "https://sinria-agent.nousresearch.com"
+  homepage "https://github.com/taro-kuroda-5228/sinria-agent"
   # Stable source should point at the semver-named sdist asset attached by
   # scripts/release.py, not the CalVer tag tarball.
   url "https://github.com/taro-kuroda-5228/sinria-agent/releases/download/v2026.3.30/sinria_agent-0.6.0.tar.gz"

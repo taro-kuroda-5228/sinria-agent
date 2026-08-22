@@ -194,7 +194,7 @@ sinria-agent/
 ├── skills/                   # Bundled skills (copied to ~/.sinria/skills/ on install)
 ├── optional-skills/          # Official optional skills (discoverable via hub, not activated by default)
 ├── tests/                    # Test suite
-├── website/                  # Documentation site (sinria-agent.nousresearch.com)
+├── website/                  # Documentation site source (published link pending)
 │
 ├── cli-config.yaml.example   # Example configuration (copied to ~/.sinria/config.yaml)
 └── AGENTS.md                 # Development guide for AI coding assistants

@@ -18,7 +18,7 @@ class TestBuildOrHeaders:
         from agent.auxiliary_client import build_or_headers
 
         headers = build_or_headers(or_config={"response_cache": False})
-        assert headers["HTTP-Referer"] == "https://sinria-agent.nousresearch.com"
+        assert headers["HTTP-Referer"] == "https://github.com/taro-kuroda-5228/sinria-agent"
         assert headers["X-Title"] == "Sinria"
         assert headers["X-OpenRouter-Categories"] == "productivity,cli-agent"
 

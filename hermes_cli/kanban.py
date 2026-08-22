@@ -175,7 +175,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "Durable SQLite-backed task board shared across profiles. "
             "Tasks are claimed atomically, can depend on other tasks, and "
             "are executed by a named profile in an isolated workspace. "
-            "See https://sinria-agent.nousresearch.com/docs/user-guide/features/kanban "
+            "See https://github.com/taro-kuroda-5228/sinria-agent "
             "for the full design."
         ),
     )

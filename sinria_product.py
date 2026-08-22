@@ -34,8 +34,8 @@ SINRIA_PRODUCT = ProductIdentity(
     home_env="SINRIA_HOME",
     cli_name_env="SINRIA_CLI_NAME",
     service_label="ai.sinria.gateway",
-    repository_url="https://github.com/taro-kuroda-5228/sinria",
-    documentation_url="https://sinria-agent.nousresearch.com/docs",
+    repository_url="https://github.com/taro-kuroda-5228/sinria-agent",
+    documentation_url="https://github.com/taro-kuroda-5228/sinria-agent",
 )
 
 # Short alias for renderers where the distribution is unambiguous.

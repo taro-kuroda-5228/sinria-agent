@@ -339,7 +339,7 @@ TIPS = [
     "HERMES_DEV=1 bypasses container mode detection for local development.",
     "Each MCP server gets its own toolset (mcp-servername) that can be toggled independently via `tools`.",
     "MCP ${ENV_VAR} placeholders in config are resolved at server spawn — including vars from the runtime .env.",
-    "Skills from trusted repos (NousResearch) get a 'trusted' security level; community skills get extra scanning.",
+    "Skills from allowlisted repositories get a 'trusted' security level; community skills get extra scanning.",
     "The skills quarantine in the runtime home holds skills pending security review.",
 
     # --- Advanced Slash Commands ---

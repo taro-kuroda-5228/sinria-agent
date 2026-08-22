@@ -2749,7 +2749,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
     print(color(f"⚕ {_tools_product_name()} Tool Configuration", Colors.CYAN, Colors.BOLD))
     print(color("  Enable or disable tools per platform.", Colors.DIM))
     print(color("  Tools that need API keys will be configured when enabled.", Colors.DIM))
-    print(color("  Guide: https://sinria-agent.nousresearch.com/docs/user-guide/features/tools", Colors.DIM))
+    print(color("  Guide: https://github.com/taro-kuroda-5228/sinria-agent", Colors.DIM))
     print()
 
     # ── First-time install: linear flow, no platform menu ──

@@ -15,7 +15,7 @@
 
 [Unit]
 Description=Hermes Kanban dispatcher (DEPRECATED standalone daemon — prefer gateway-embedded dispatch)
-Documentation=https://sinria-agent.nousresearch.com/docs/user-guide/features/kanban
+Documentation=https://github.com/taro-kuroda-5228/sinria-agent
 After=network.target
 
 [Service]

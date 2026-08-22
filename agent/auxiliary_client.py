@@ -319,7 +319,7 @@ _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
 # `X-Title` is the canonical attribution header OpenRouter's dashboard
 # reads; the previous `X-OpenRouter-Title` label was not recognized there.
 _OR_HEADERS_BASE = {
-    "HTTP-Referer": "https://sinria-agent.nousresearch.com",
+    "HTTP-Referer": "https://github.com/taro-kuroda-5228/sinria-agent",
     "X-Title": "Sinria",
     "X-OpenRouter-Categories": "productivity,cli-agent",
 }
@@ -399,7 +399,7 @@ def build_nvidia_nim_headers(base_url: str | None) -> dict:
 from hermes_cli import __version__ as _HERMES_VERSION
 
 _AI_GATEWAY_HEADERS = {
-    "HTTP-Referer": "https://sinria-agent.nousresearch.com",
+    "HTTP-Referer": "https://github.com/taro-kuroda-5228/sinria-agent",
     "X-Title": "Sinria",
     "User-Agent": f"SinriaAgent/{_HERMES_VERSION}",
 }
