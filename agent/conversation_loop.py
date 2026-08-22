@@ -38,6 +38,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.company_context.runtime import ContextIdentity
 from agent.correction_loop.advice import format_correction_advice
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
@@ -999,6 +1000,33 @@ def run_conversation(
             # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
+
+        # Company context is a per-turn, API-only message.  It is intentionally
+        # resolved after copying ``messages`` so neither the transcript nor the
+        # cached system prompt can retain another turn's/company scope's data.
+        _company_runtime = getattr(agent, "company_context_runtime", None)
+        if _company_runtime is None:
+            _company_runtime = getattr(agent, "_company_context_runtime", None)
+        if _company_runtime is not None:
+            try:
+                _cc_identity = getattr(agent, "company_context_identity", None)
+                if _cc_identity is None:
+                    _cc_identity = ContextIdentity(
+                        profile_id=str(getattr(agent, "company_context_profile_id", "")),
+                        workspace_id=str(getattr(agent, "company_context_workspace_id", "")),
+                        owner_id=str(getattr(agent, "company_context_owner_id", getattr(agent, "_user_id", ""))),
+                        session_id=str(agent.session_id or ""),
+                        source_id=str(getattr(agent, "company_context_source_id", "")),
+                    )
+                _cc_message = _company_runtime.message_for_turn(original_user_message, _cc_identity)
+                if _cc_message:
+                    # Insert before the final user turn's response/tool traffic;
+                    # this is not added to ``messages`` and thus cannot persist.
+                    api_messages.insert(max(0, len(api_messages) - 1), dict(_cc_message))
+            except Exception:
+                # Context is advisory and fail-closed: a broken provider must
+                # never alter the normal conversation request.
+                logger.warning("Company context unavailable; continuing without context", exc_info=True)
 
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).

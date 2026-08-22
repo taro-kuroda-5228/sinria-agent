@@ -337,6 +337,16 @@ def init_agent(
     agent.tool_progress_callback = tool_progress_callback
     agent.tool_start_callback = tool_start_callback
     agent.tool_complete_callback = tool_complete_callback
+
+    # Optional organization context is local/profile-scoped and opt-in.  The
+    # factory fails closed when identity, keychain, or store configuration is
+    # incomplete; no confidential payload is logged or persisted remotely.
+    try:
+        from agent.company_context.runtime import bind_runtime_identity, runtime_from_local_store_env
+
+        bind_runtime_identity(agent, runtime_from_local_store_env())
+    except Exception:
+        agent._company_context_runtime = None
     agent.suppress_status_output = False
     agent.thinking_callback = thinking_callback
     agent.reasoning_callback = reasoning_callback
