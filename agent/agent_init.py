@@ -946,6 +946,17 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
     try:
+        from agent.context_source_policy import ContextSourcePolicy
+
+        agent._context_source_policy = ContextSourcePolicy.from_config(
+            _agent_cfg.get("context_sources", {})
+        )
+    except Exception as _context_source_err:
+        agent._context_source_policy = None
+        _ra().logger.warning(
+            "Context source policy config ignored: %s", _context_source_err
+        )
+    try:
         agent._dynamic_tool_selection_config = DynamicToolSelectionConfig.from_mapping(
             _agent_cfg.get("dynamic_tool_selection", {})
         )
