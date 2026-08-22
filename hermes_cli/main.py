@@ -6120,7 +6120,7 @@ def _print_curator_first_run_notice() -> None:
     print(f"  Preview now:  {_cli_cmd('curator run --dry-run')}")
     print(f"  Pause it:     {_cli_cmd('curator pause')}")
     print(
-        "  Docs:         https://sinria-agent.nousresearch.com/docs/user-guide/features/curator"
+        "  Docs:         https://github.com/taro-kuroda-5228/sinria-agent"
     )
 
 
@@ -9907,7 +9907,7 @@ def main():
             "Manage the fallback provider chain.  Fallback providers are tried "
             "in order when the primary model fails with rate-limit, overload, or "
             "connection errors.  See: "
-            "https://sinria-agent.nousresearch.com/docs/user-guide/features/fallback-providers"
+            "https://github.com/taro-kuroda-5228/sinria-agent"
         ),
     )
     fallback_subparsers = fallback_parser.add_subparsers(dest="fallback_command")

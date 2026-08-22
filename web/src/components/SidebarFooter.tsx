@@ -23,7 +23,7 @@ export function SidebarFooter() {
       </Typography>
 
       <a
-        href="https://nousresearch.com"
+        href="https://github.com/taro-kuroda-5228/sinria-agent"
         target="_blank"
         rel="noopener noreferrer"
         className={cn(

@@ -34,7 +34,7 @@ vercel = VercelAIGatewayProfile(
     env_vars=("AI_GATEWAY_API_KEY",),
     base_url="https://ai-gateway.vercel.sh/v1",
     default_headers={
-        "HTTP-Referer": "https://sinria-agent.nousresearch.com",
+        "HTTP-Referer": "https://github.com/taro-kuroda-5228/sinria-agent",
         "X-Title": "Sinria",
     },
     default_aux_model="google/gemini-3-flash",
