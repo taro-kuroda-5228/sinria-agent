@@ -105,10 +105,23 @@ def test_public_core_and_sdist_manifest_exclude_private_overlays():
     assert "global-exclude *_test.py" in manifest
     assert "global-exclude conftest.py" in manifest
     assert "global-exclude pytest.ini" in manifest
-    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]' in pyproject
-    assert '[tool.setuptools.exclude-package-data]' in pyproject
-    assert '"*" = ["tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py", "pytest.ini"]' in pyproject
+    with (ROOT / "pyproject.toml").open("rb") as handle:
+        setuptools = tomllib.load(handle)["tool"]["setuptools"]
+    assert setuptools["packages"]["find"]["exclude"] == [
+        "tests",
+        "tests.*",
+        "*.tests",
+        "*.tests.*",
+    ]
+    excluded_data = set(setuptools["exclude-package-data"]["*"])
+    assert {
+        "tests/*",
+        "*/tests/*",
+        "test_*.py",
+        "*_test.py",
+        "conftest.py",
+        "pytest.ini",
+    } <= excluded_data
 
     forbidden = ("/Users/" + "tarokuroda", "exbrain-" + "vault")
     suffixes = {".py", ".md", ".json", ".toml", ".yml", ".yaml", ".sh", ".ps1"}

@@ -64,20 +64,19 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_truncation_fallback_no_client(self, compressor):
-        # compressor has client=None, so should use truncation fallback
+    def test_no_client_preserves_history(self, compressor):
+        # A missing summarizer must not destroy the only complete transcript.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        # Should keep system message and last N
-        assert result[0]["role"] == "system"
-        assert compressor.compression_count == 1
+        assert result == msgs
+        assert compressor.compression_count == 0
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        compressor.compress(msgs)
-        assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch.object(compressor, "_generate_summary", return_value="summary"):
+            compressor.compress(msgs)
+            assert compressor.compression_count == 1
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
@@ -128,7 +127,8 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        result = c.compress(msgs)
+        with patch.object(c, "_generate_summary", return_value="summary"):
+            result = c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -715,12 +715,10 @@ class TestAuxModelFallbackSurfacedToCallers:
         assert c._last_aux_model_failure_error is None
 
 
-class TestSummaryFailureTrackingForGatewayWarning:
-    """When summary generation fails, the compressor must record dropped count
-    + fallback flag so gateway hygiene & /compress can surface a visible
-    warning instead of silently dropping context."""
+class TestSummaryFailurePreservesHistory:
+    """A summarizer outage must never destroy the only copy of old turns."""
 
-    def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
+    def test_compress_returns_original_history_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -740,14 +738,11 @@ class TestSummaryFailureTrackingForGatewayWarning:
         with patch("agent.context_compressor.call_llm", side_effect=Exception("404 model not found")):
             result = c.compress(msgs)
 
-        assert c._last_summary_fallback_used is True
-        assert c._last_summary_dropped_count > 0
+        assert result == msgs
+        assert c.compression_count == 0
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
         assert c._last_summary_error is not None
-        # Result must still be well-formed (fallback summary present).
-        assert any(
-            isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
-            for m in result
-        )
 
     def test_compress_clears_fallback_flag_on_subsequent_success(self):
         mock_response = MagicMock()
@@ -768,10 +763,11 @@ class TestSummaryFailureTrackingForGatewayWarning:
             {"role": "user", "content": "msg 7"},
         ]
 
-        # First call fails, second succeeds — flag must reset on second compress.
+        # First call fails losslessly, second succeeds.
         with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
-            c.compress(msgs)
-        assert c._last_summary_fallback_used is True
+            first = c.compress(msgs)
+        assert first == msgs
+        assert c._last_summary_fallback_used is False
 
         # Reset cooldown to allow retry on second compress
         c._summary_failure_cooldown_until = 0.0
@@ -1338,7 +1334,8 @@ class TestSummaryTargetRatio:
             + [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
                for i in range(8)]
         )
-        result = c.compress(msgs)
+        with patch.object(c, "_generate_summary", return_value="summary"):
+            result = c.compress(msgs)
         # System prompt (msg[0]) survives as head
         assert result[0]["role"] == "system"
         assert result[0]["content"].startswith("System prompt")

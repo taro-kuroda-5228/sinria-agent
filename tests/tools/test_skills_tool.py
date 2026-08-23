@@ -226,6 +226,13 @@ class TestFindAllSkills:
             skills = _find_all_skills()
         assert skills == []
 
+    def test_backup_skill_trees_are_preserved_but_not_loaded(self, tmp_path):
+        _make_skill(tmp_path / "social-media", "youtube-content.bak")
+        _make_skill(tmp_path / "social-media", "youtube-content")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skills = _find_all_skills()
+        assert [skill["name"] for skill in skills] == ["youtube-content"]
+
     def test_categorized_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "axolotl", category="mlops")

@@ -4,11 +4,14 @@ from pathlib import Path
 import tomllib
 
 
-def _load_optional_dependencies():
+def _load_pyproject():
     pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with pyproject_path.open("rb") as handle:
-        project = tomllib.load(handle)["project"]
-    return project["optional-dependencies"]
+        return tomllib.load(handle)
+
+
+def _load_optional_dependencies():
+    return _load_pyproject()["project"]["optional-dependencies"]
 
 
 def test_matrix_extra_not_in_all():
@@ -103,3 +106,29 @@ def test_feishu_extra_includes_qrcode_for_qr_login():
 
     feishu_extra = optional_dependencies["feishu"]
     assert any(dep.startswith("qrcode") for dep in feishu_extra)
+
+
+def test_bundled_skills_are_included_as_runtime_package_data():
+    """A wheel install must retain Skills without requiring a source checkout."""
+    root = Path(__file__).resolve().parents[1]
+    metadata = _load_pyproject()["tool"]["setuptools"]
+
+    assert "skills" in metadata["packages"]["find"]["include"]
+    assert "**/*" in metadata["package-data"]["skills"]
+    assert (root / "skills" / "__init__.py").is_file()
+    assert any((root / "skills").glob("*/SKILL.md"))
+
+
+def test_runtime_top_level_modules_are_included_in_wheel_metadata():
+    """New Sinria runtime modules must not silently disappear from wheels."""
+    root = Path(__file__).resolve().parents[1]
+    packaged = set(_load_pyproject()["tool"]["setuptools"]["py-modules"])
+    source_modules = {path.stem for path in root.glob("*.py") if path.name != "setup.py"}
+
+    assert source_modules <= packaged
+
+
+def test_repair_runtime_asset_is_included_in_package_data():
+    metadata = _load_pyproject()["tool"]["setuptools"]["package-data"]
+
+    assert "repair/assets/*" in metadata["agent"]

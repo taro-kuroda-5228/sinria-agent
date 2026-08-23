@@ -4,6 +4,7 @@ from agent.company_context.runtime import (
     CompanyContextRuntime,
     ContextIdentity,
     ContextRuntimeConfig,
+    _claim_startup_manifest_sync,
     bind_runtime_identity,
 )
 
@@ -63,3 +64,19 @@ def test_bind_runtime_identity_enables_the_conversation_scope():
     assert agent.company_context_profile_id == "profile"
     assert agent.company_context_workspace_id == "workspace"
     assert agent.company_context_owner_id == "owner"
+
+
+def test_startup_manifest_sync_is_claimed_once_per_scope_until_ttl_expires():
+    scope = ("profile-ttl", "workspace", "owner")
+    env = {"SINRIA_COMPANY_CONTEXT_SYNC_TTL_SECONDS": "300"}
+
+    assert _claim_startup_manifest_sync(scope, env, now=100.0) is True
+    assert _claim_startup_manifest_sync(scope, env, now=399.0) is False
+    assert _claim_startup_manifest_sync(scope, env, now=400.0) is True
+
+
+def test_startup_manifest_sync_can_be_disabled_without_disabling_local_context():
+    scope = ("profile-disabled", "workspace", "owner")
+    env = {"SINRIA_COMPANY_CONTEXT_SYNC_ON_STARTUP": "false"}
+
+    assert _claim_startup_manifest_sync(scope, env, now=100.0) is False
