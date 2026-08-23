@@ -3,10 +3,17 @@
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
-from evals.architecture_centric.run_eval import run_tasks
-from evals.architecture_centric.scoring import score_task
+run_tasks = pytest.importorskip(
+    "evals.architecture_centric.run_eval",
+    reason="architecture-centric eval assets are not included in the distribution checkout",
+).run_tasks
+score_task = pytest.importorskip(
+    "evals.architecture_centric.scoring",
+    reason="architecture-centric eval assets are not included in the distribution checkout",
+).score_task
 
 TASKS_PATH = Path("evals/architecture_centric/tasks.yaml")
 MOCKS_PATH = Path("evals/architecture_centric/mock_responses.example.json")

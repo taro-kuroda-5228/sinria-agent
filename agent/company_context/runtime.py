@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 import re
+import threading
+import time
 from typing import Any, Callable, Iterable
 
 from .data_policy import Classification, classify
@@ -17,6 +19,34 @@ _INJECTION = re.compile(
     r"follow\s+these\s+instructions|jailbreak|reveal\s+(?:the\s+)?prompt|tool\s+call)",
     re.I,
 )
+
+
+_manifest_sync_claims: dict[tuple[str, str, str], float] = {}
+_manifest_sync_claims_lock = threading.Lock()
+
+
+def _claim_startup_manifest_sync(
+    scope: tuple[str, str, str],
+    environ: dict[str, str] | None = None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Atomically claim the periodic manifest refresh for one runtime scope."""
+    env = os.environ if environ is None else environ
+    if env.get("SINRIA_COMPANY_CONTEXT_SYNC_ON_STARTUP", "true").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return False
+    try:
+        ttl = max(0.0, float(env.get("SINRIA_COMPANY_CONTEXT_SYNC_TTL_SECONDS", "300")))
+    except ValueError:
+        ttl = 300.0
+    current = time.monotonic() if now is None else now
+    with _manifest_sync_claims_lock:
+        if _manifest_sync_claims.get(scope, 0.0) > current:
+            return False
+        _manifest_sync_claims[scope] = current + ttl
+        return True
 
 
 @dataclass(frozen=True)
@@ -172,18 +202,19 @@ def runtime_from_local_store_env() -> CompanyContextRuntime | None:
             profile_id=config.profile_id,
             workspace_id=config.workspace_id,
         )
-        try:
-            from .knowledge_manifest import sync_manifest_from_env
+        if _claim_startup_manifest_sync((config.profile_id, config.workspace_id, config.owner_id)):
+            try:
+                from .knowledge_manifest import sync_manifest_from_env
 
-            sync_manifest_from_env(
-                store,
-                owner_id=config.owner_id,
-                workspace_id=config.workspace_id,
-            )
-        except Exception:
-            # Network/readback failure must not disable safe local context. Existing
-            # entries remain encrypted locally and expiry is enforced at retrieval.
-            pass
+                sync_manifest_from_env(
+                    store,
+                    owner_id=config.owner_id,
+                    workspace_id=config.workspace_id,
+                )
+            except Exception:
+                # Network/readback failure must not disable safe local context. Existing
+                # entries remain encrypted locally and expiry is enforced at retrieval.
+                pass
         return CompanyContextRuntime(config, ContextProvider(store))
     except Exception:
         return None

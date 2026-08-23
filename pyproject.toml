@@ -215,19 +215,23 @@ sinria-agent = "run_agent:main"
 sinria-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
-py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "sinria_product", "sinria_workspace_lock", "utils"]
+py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "sinria_product", "sinria_workspace_lock", "utils", "mcp_serve", "mini_swe_runner", "sinria_agentos_handlers", "sinria_constants", "sinria_egress", "sinria_hybrid_bridge", "sinria_hybrid_bridge_governance", "sinria_hybrid_bridge_http", "sinria_hybrid_bridge_transports", "sinria_integrations", "sinria_local_execution_adapters", "sinria_peer_collaboration"]
 
 [tool.setuptools.package-data]
+agent = ["repair/assets/*"]
 hermes_cli = ["web_dist/**/*"]
 gateway = ["assets/**/*"]
 sinria_cli = ["chrome_extension/**/*"]
+# Bundled Skill definitions are runtime data. Keep the tree inside the wheel so
+# `tools.skills_sync` can seed a fresh installation without a source checkout.
+skills = ["**/*"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "sinria_cli", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*"]
+include = ["agent", "agent.*", "tools", "tools.*", "sinria_cli", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "skills"]
 exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]
 
 [tool.setuptools.exclude-package-data]
-"*" = ["tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py", "pytest.ini"]
+"*" = ["tests/*", "*/tests/*", "test_*.py", "*_test.py", "conftest.py", "pytest.ini", "__pycache__/*", "*/__pycache__/*", "*/*/__pycache__/*", "*/*/*/__pycache__/*", "*/*/*/*/__pycache__/*", "*/*/*/*/*/__pycache__/*", "*.pyc", "*/*.pyc", "*/*/*.pyc", "*/*/*/*.pyc", "*/*/*/*/*.pyc", ".DS_Store", "*/.DS_Store", "*/*/.DS_Store", "*/*/*/.DS_Store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

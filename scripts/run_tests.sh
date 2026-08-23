@@ -23,11 +23,40 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# macOS commonly starts shells at 256 file descriptors. The full xdist suite
+# can legitimately exceed that after many network/filesystem mocks, causing a
+# late cascade of unrelated ``Too many open files`` errors. Raise only the
+# soft limit; never fail the run on platforms that do not permit it.
+_CURRENT_NOFILE="$(ulimit -Sn 2>/dev/null || printf 'unknown')"
+if [[ "$_CURRENT_NOFILE" =~ ^[0-9]+$ ]] && (( _CURRENT_NOFILE < 4096 )); then
+    ulimit -Sn 4096 2>/dev/null || true
+fi
+
 # ── Activate venv ───────────────────────────────────────────────────────────
-# Prefer a .venv in the current tree, fall back to the main checkout's venv
-# (useful for worktrees where we don't always duplicate the venv).
+# Prefer a venv in the current tree, then the primary checkout (for linked
+# worktrees), then the Sinria-owned runtime. Keep the legacy location only as
+# a final read-only compatibility fallback.
+SINRIA_RUNTIME_HOME="${SINRIA_HOME:-$HOME/.sinria}"
+GIT_COMMON_DIR="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null || true)"
+if [ -n "$GIT_COMMON_DIR" ] && [[ "$GIT_COMMON_DIR" != /* ]]; then
+  GIT_COMMON_DIR="$(cd "$REPO_ROOT/$GIT_COMMON_DIR" 2>/dev/null && pwd || true)"
+fi
+MAIN_CHECKOUT_ROOT=""
+if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
+  MAIN_CHECKOUT_ROOT="$(dirname "$GIT_COMMON_DIR")"
+fi
+
 VENV=""
-for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/sinria-agent/venv"; do
+VENV_CANDIDATES=("$REPO_ROOT/.venv" "$REPO_ROOT/venv")
+if [ -n "$MAIN_CHECKOUT_ROOT" ] && [ "$MAIN_CHECKOUT_ROOT" != "$REPO_ROOT" ]; then
+  VENV_CANDIDATES+=("$MAIN_CHECKOUT_ROOT/.venv" "$MAIN_CHECKOUT_ROOT/venv")
+fi
+VENV_CANDIDATES+=(
+  "$SINRIA_RUNTIME_HOME/sinria-agent/.venv"
+  "$SINRIA_RUNTIME_HOME/sinria-agent/venv"
+  "$HOME/.hermes/sinria-agent/venv"
+)
+for candidate in "${VENV_CANDIDATES[@]}"; do
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
@@ -35,7 +64,7 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/sinria-agen
 done
 
 if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+  echo "error: no virtualenv found in the worktree, primary checkout, or Sinria runtime" >&2
   exit 1
 fi
 
@@ -88,15 +117,22 @@ export LC_ALL=C.UTF-8
 export PYTHONHASHSEED=0
 
 # ── Live-gateway test guard (developer machines) ────────────────────────────
-# If a system-wide hermes pytest_live_guard plugin is installed at
-# $HOME/.hermes/pytest_live_guard.py, force-load it here so every test run
-# from this script gets the protection regardless of which worktree is
-# checked out (in-tree tests/conftest.py guard may be missing on stale
-# branches). Harmless on CI / fresh machines that don't have the file.
-if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
+# Prefer a Sinria runtime guard so distribution worktrees stay independent.
+# Keep the legacy location only as a final read-only compatibility fallback.
+LIVE_GUARD_FILE=""
+for candidate in \
+  "$SINRIA_RUNTIME_HOME/pytest_live_guard.py" \
+  "$HOME/.hermes/pytest_live_guard.py"; do
+  if [ -f "$candidate" ]; then
+    LIVE_GUARD_FILE="$candidate"
+    break
+  fi
+done
+if [ -n "$LIVE_GUARD_FILE" ]; then
+  LIVE_GUARD_DIR="$(dirname "$LIVE_GUARD_FILE")"
   case ":${PYTHONPATH:-}:" in
-    *":$HOME/.hermes:"*) ;;
-    *) export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$HOME/.hermes" ;;
+    *":$LIVE_GUARD_DIR:"*) ;;
+    *) export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$LIVE_GUARD_DIR" ;;
   esac
   if [[ ",${PYTEST_PLUGINS:-}," != *,pytest_live_guard,* ]]; then
     export PYTEST_PLUGINS="${PYTEST_PLUGINS:+$PYTEST_PLUGINS,}pytest_live_guard"

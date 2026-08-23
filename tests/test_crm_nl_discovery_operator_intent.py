@@ -3,7 +3,12 @@ import json
 import re
 from pathlib import Path
 
-from scripts.sales_agent.discover_planner import plan_from_natural_language
+import pytest
+
+plan_from_natural_language = pytest.importorskip(
+    "scripts.sales_agent.discover_planner",
+    reason="private sales workflow is not part of the sinria-agent distribution",
+).plan_from_natural_language
 
 
 def _load_daemon_module():
