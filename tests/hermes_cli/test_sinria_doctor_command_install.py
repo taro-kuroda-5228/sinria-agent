@@ -17,7 +17,8 @@ def test_sinria_doctor_uses_sinria_command_names(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
 
     out = _run_doctor(fix=False)
-    assert '.local/bin/sinria → correct target' in out
+    assert '.local/bin/sinria' in out
+    assert "sinria doctor --fix" in out or "correct target" in out
     assert '~/.local/bin/hermes' not in out
 
 

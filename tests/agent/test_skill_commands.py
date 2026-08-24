@@ -8,6 +8,7 @@ import tools.skills_tool as skills_tool_module
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    compose_auto_loaded_skill_message,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -46,6 +47,23 @@ def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Pat
     except (OSError, NotImplementedError) as exc:
         pytest.skip(f"symlinks unavailable in test environment: {exc}")
     return external_category
+
+
+def test_auto_loaded_skill_message_keeps_real_request_first():
+    result = compose_auto_loaded_skill_message(
+        "Diagnose the GPT-5.6 regression and fix it",
+        ["[IMPORTANT: skill-a]\nlarge skill payload", "[IMPORTANT: skill-b]"],
+    )
+
+    assert result.startswith("[User request]\nDiagnose the GPT-5.6 regression and fix it")
+    assert result.index("[User request]") < result.index("[Auto-loaded skill instructions]")
+    assert result.count("Diagnose the GPT-5.6 regression and fix it") == 1
+
+
+def test_supporting_file_inline_budget_stays_small():
+    from agent.skill_commands import _SUPPORTING_FILES_LIST_CAP
+
+    assert _SUPPORTING_FILES_LIST_CAP <= 12
 
 
 class TestScanSkillCommands:
@@ -603,7 +621,7 @@ class TestSkillDirectoryHeader:
         assert f"[Skill directory: {skill_dir}]" in msg
         assert "Resolve any relative paths" in msg
 
-    def test_supporting_files_shown_with_absolute_paths(self, tmp_path):
+    def test_supporting_files_shown_as_relative_paths(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             skill_dir = _make_skill(tmp_path, "scripted-skill")
             (skill_dir / "scripts").mkdir()
@@ -612,12 +630,33 @@ class TestSkillDirectoryHeader:
             msg = build_skill_invocation_message("/scripted-skill")
 
         assert msg is not None
-        # The supporting-files block must emit both the relative form (so the
-        # agent can call skill_view on it) and the absolute form (so it can
-        # run the script directly via terminal).
-        assert "scripts/run.js" in msg
-        assert str(skill_dir / "scripts" / "run.js") in msg
+        # The supporting-files block lists relative paths only; the absolute
+        # base is stated once as [Skill directory: ...] and per-file absolute
+        # duplication would bloat skills with large references/ trees.
+        assert "- scripts/run.js" in msg
+        assert f"- scripts/run.js  ->  {skill_dir}" not in msg
+        assert f"[Skill directory: {skill_dir}]" in msg
         assert f"node {skill_dir}/scripts/foo.js" in msg
+
+    def test_supporting_files_listing_is_capped(self, tmp_path):
+        from agent.skill_commands import _SUPPORTING_FILES_LIST_CAP
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "many-files-skill")
+            (skill_dir / "references").mkdir()
+            total = _SUPPORTING_FILES_LIST_CAP + 5
+            for i in range(total):
+                (skill_dir / "references" / f"doc-{i:03d}.md").write_text("x")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/many-files-skill")
+
+        assert msg is not None
+        listed = [
+            line for line in msg.splitlines()
+            if line.startswith("- references/doc-")
+        ]
+        assert len(listed) == _SUPPORTING_FILES_LIST_CAP
+        assert "more supporting files" in msg
 
 
 class TestTemplateVarSubstitution:

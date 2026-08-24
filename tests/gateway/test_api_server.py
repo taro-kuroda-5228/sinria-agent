@@ -14,6 +14,7 @@ Tests cover:
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -404,6 +405,30 @@ def auth_adapter():
 
 class TestAgentExecution:
     @pytest.mark.asyncio
+    async def test_disconnect_closes_response_store(self):
+        adapter = _make_adapter()
+        store = adapter._response_store
+
+        await adapter.disconnect()
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            len(store)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_response_store_when_site_stop_fails(self):
+        adapter = _make_adapter()
+        store = adapter._response_store
+        site = AsyncMock()
+        site.stop.side_effect = RuntimeError("site cleanup failed")
+        adapter._site = site
+
+        with pytest.raises(RuntimeError, match="site cleanup failed"):
+            await adapter.disconnect()
+
+        with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+            len(store)
+
+    @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "ok"}
@@ -543,7 +568,7 @@ class TestModelsEndpoint:
             assert data["object"] == "list"
             assert len(data["data"]) == 1
             assert data["data"][0]["id"] == "sinria-agent"
-            assert data["data"][0]["owned_by"] == "hermes"
+            assert data["data"][0]["owned_by"] == "sinria"
 
     @pytest.mark.asyncio
     async def test_models_returns_profile_name(self):
@@ -610,7 +635,7 @@ class TestCapabilitiesEndpoint:
             resp = await cli.get("/v1/capabilities")
             assert resp.status == 200
             data = await resp.json()
-            assert data["object"] == "hermes.api_server.capabilities"
+            assert data["object"] == "sinria.api_server.capabilities"
             assert data["platform"] == "sinria-agent"
             assert data["model"] == "sinria-agent"
             assert data["auth"]["type"] == "bearer"
@@ -622,7 +647,8 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
-            assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
+            assert data["features"]["session_continuity_header"] == "X-Sinria-Session-Id"
+            assert data["features"]["session_key_header"] == "X-Sinria-Session-Key"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
 
     @pytest.mark.asyncio
@@ -2664,11 +2690,11 @@ class TestChatCompletionsAgentIncomplete:
             data = await resp.json()
             assert data["choices"][0]["finish_reason"] == "length"
             assert data["choices"][0]["message"]["content"] == "Here is part one of the answer"
-            assert data["hermes"]["partial"] is True
-            assert data["hermes"]["completed"] is False
-            assert data["hermes"]["error_code"] == "output_truncated"
-            assert resp.headers.get("X-Hermes-Completed") == "false"
-            assert resp.headers.get("X-Hermes-Partial") == "true"
+            assert data["sinria"]["partial"] is True
+            assert data["sinria"]["completed"] is False
+            assert data["sinria"]["error_code"] == "output_truncated"
+            assert resp.headers.get("X-Sinria-Completed") == "false"
+            assert resp.headers.get("X-Sinria-Partial") == "true"
 
     @pytest.mark.asyncio
     async def test_failure_with_no_text_returns_502_error_envelope(self, adapter):
@@ -2700,9 +2726,9 @@ class TestChatCompletionsAgentIncomplete:
             data = await resp.json()
             assert data["error"]["code"] == "agent_incomplete"
             assert "truncated" in data["error"]["message"].lower()
-            assert data["error"]["hermes"]["partial"] is True
-            assert data["error"]["hermes"]["failed"] is True
-            assert resp.headers.get("X-Hermes-Completed") == "false"
+            assert data["error"]["sinria"]["partial"] is True
+            assert data["error"]["sinria"]["failed"] is True
+            assert resp.headers.get("X-Sinria-Completed") == "false"
 
     @pytest.mark.asyncio
     async def test_normal_completion_unchanged(self, adapter):
@@ -2728,8 +2754,8 @@ class TestChatCompletionsAgentIncomplete:
             data = await resp.json()
             assert data["choices"][0]["finish_reason"] == "stop"
             assert data["choices"][0]["message"]["content"] == "All good."
-            assert "hermes" not in data
-            assert "X-Hermes-Completed" not in resp.headers
+            assert "sinria" not in data
+            assert "X-Sinria-Completed" not in resp.headers
 
 
 # ---------------------------------------------------------------------------
@@ -3044,7 +3070,7 @@ class TestSessionIdHeader:
                     json={"model": "sinria-agent", "messages": [{"role": "user", "content": "Hi"}]},
                 )
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Id") is not None
+            assert resp.headers.get("X-Sinria-Session-Id") is not None
 
     @pytest.mark.asyncio
     async def test_provided_session_id_is_used_and_echoed(self, auth_adapter):
@@ -3068,7 +3094,7 @@ class TestSessionIdHeader:
                 )
 
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Id") == "my-session-123"
+            assert resp.headers.get("X-Sinria-Session-Id") == "my-session-123"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["session_id"] == "my-session-123"
 
@@ -3162,7 +3188,7 @@ class TestSessionKeyHeader:
                     json={"model": "sinria-agent", "messages": [{"role": "user", "content": "hi"}]},
                 )
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Key") == "webui:user-42"
+            assert resp.headers.get("X-Sinria-Session-Key") == "webui:user-42"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "webui:user-42"
 
@@ -3187,8 +3213,8 @@ class TestSessionKeyHeader:
                     json={"model": "sinria-agent", "messages": [{"role": "user", "content": "hi"}]},
                 )
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Key") == "channel-abc"
-            assert resp.headers.get("X-Hermes-Session-Id") == "transcript-xyz"
+            assert resp.headers.get("X-Sinria-Session-Key") == "channel-abc"
+            assert resp.headers.get("X-Sinria-Session-Id") == "transcript-xyz"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "channel-abc"
             assert call_kwargs["session_id"] == "transcript-xyz"
@@ -3298,7 +3324,7 @@ class TestSessionKeyHeader:
                     json={"model": "sinria-agent", "input": "hello", "store": False},
                 )
             assert resp.status == 200
-            assert resp.headers.get("X-Hermes-Session-Key") == "webui:chan-1"
+            assert resp.headers.get("X-Sinria-Session-Key") == "webui:chan-1"
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["gateway_session_key"] == "webui:chan-1"
 
@@ -3310,4 +3336,4 @@ class TestSessionKeyHeader:
             resp = await cli.get("/v1/capabilities")
             assert resp.status == 200
             data = await resp.json()
-            assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+            assert data["features"]["session_key_header"] == "X-Sinria-Session-Key"

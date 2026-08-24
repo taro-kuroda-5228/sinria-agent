@@ -169,7 +169,7 @@ class TestWebhookEnabledGate:
         webhook_command(_make_args(webhook_action="subscribe", name="blocked"))
         out = capsys.readouterr().out
         assert "not enabled" in out.lower()
-        assert "hermes gateway setup" in out
+        assert "sinria gateway setup" in out
         assert _load_subscriptions() == {}
 
     def test_sinria_disabled_hint_uses_sinria_commands(self, capsys, monkeypatch):

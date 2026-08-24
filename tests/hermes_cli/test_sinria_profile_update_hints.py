@@ -6,7 +6,7 @@ def test_profile_use_default_uses_sinria_home(monkeypatch, capsys):
 
     monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
     monkeypatch.setattr("hermes_cli.profiles.set_active_profile", lambda name: None)
-    monkeypatch.setattr("hermes_constants.display_hermes_home", lambda: "~/.sinria")
+    monkeypatch.setattr(main, "display_sinria_home", lambda: "~/.sinria")
 
     main.cmd_profile(SimpleNamespace(profile_action="use", profile_name="default"))
 

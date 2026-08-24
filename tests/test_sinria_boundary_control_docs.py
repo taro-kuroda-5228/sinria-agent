@@ -1,4 +1,10 @@
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not Path("docs/sinria-boundary-control-layer.md").exists(),
+    reason="Boundary Control product documentation is not included in this distribution",
+)
 
 
 def test_boundary_control_product_doc_names_modes_and_no_raw_data_boundary():

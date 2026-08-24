@@ -7,7 +7,7 @@ def test_format_banner_version_label_without_git_state():
     with patch.object(banner, "get_git_banner_state", return_value=None):
         value = banner.format_banner_version_label()
 
-    assert value == f"Sinria v{banner.VERSION} ({banner.RELEASE_DATE})"
+    assert value == f"Sinria Agent v{banner.VERSION} ({banner.RELEASE_DATE})"
 
 
 

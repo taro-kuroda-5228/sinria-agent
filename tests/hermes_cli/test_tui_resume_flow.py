@@ -391,7 +391,8 @@ def test_oneshot_rejects_disabled_mcp_toolset(monkeypatch, capsys):
     valid, error = _validate_explicit_toolsets("mcp-off")
 
     assert valid is None
-    assert error == "hermes -z: --toolsets did not contain any valid toolsets.\n"
+    # Brand-agnostic: the prefix uses the live CLI name (sinria in product).
+    assert error.endswith("-z: --toolsets did not contain any valid toolsets.\n")
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -580,8 +581,11 @@ def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, ca
     out = capsys.readouterr().out
 
     assert "Resume this session with:" in out
-    assert "hermes --tui --resume 20260409_000001_abc123" in out
-    assert 'hermes --tui -c "demo title"' in out
+    # Brand-agnostic: the hint uses the live CLI name (sinria in product,
+    # hermes only in legacy installs) — pin the command shape, not the brand.
+    cli = main_mod._cli_command_name()
+    assert f"{cli} --tui --resume 20260409_000001_abc123" in out
+    assert f'{cli} --tui -c "demo title"' in out
     assert "Tokens:         21 (in 10, out 6, cache 4, reasoning 1)" in out
 
 
@@ -620,5 +624,5 @@ def test_print_tui_exit_summary_prefers_actual_active_session_file(
     out = capsys.readouterr().out
 
     assert seen == ["actual_session"]
-    assert "hermes --tui --resume actual_session" in out
+    assert f"{main_mod._cli_command_name()} --tui --resume actual_session" in out
     assert "startup_resume" not in out

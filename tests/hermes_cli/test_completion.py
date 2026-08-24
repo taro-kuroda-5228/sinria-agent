@@ -95,7 +95,7 @@ class TestGenerateBash:
     def test_contains_completion_function_and_register(self):
         out = generate_bash(_make_parser())
         assert "_hermes_completion()" in out
-        assert "complete -F _hermes_completion hermes" in out
+        assert "complete -F _hermes_completion sinria" in out
 
     def test_sinria_branding(self, monkeypatch):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
@@ -137,7 +137,7 @@ class TestGenerateBash:
 class TestGenerateZsh:
     def test_contains_compdef_header(self):
         out = generate_zsh(_make_parser())
-        assert "#compdef hermes" in out
+        assert "#compdef sinria" in out
 
     def test_sinria_branding(self, monkeypatch):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
@@ -163,7 +163,7 @@ class TestGenerateZsh:
 
     def test_registers_compdef_instead_of_invoking_completion_function(self):
         out = generate_zsh(_make_parser())
-        assert 'compdef _hermes hermes' in out
+        assert 'compdef _hermes sinria' in out
         assert '_hermes "$@"' not in out
 
     def test_preserves_valid_zsh_arguments_alias_syntax(self):
@@ -199,7 +199,7 @@ class TestGenerateZsh:
                 [
                     "zsh",
                     "-fc",
-                    f"autoload -Uz compinit && compinit -D; source {path}; [[ ${{_comps[hermes]}} == _hermes ]]",
+                    f"autoload -Uz compinit && compinit -D; source {path}; [[ ${{_comps[sinria]}} == _hermes ]]",
                 ],
                 capture_output=True,
                 text=True,
@@ -217,7 +217,7 @@ class TestGenerateZsh:
 class TestGenerateFish:
     def test_disables_file_completion(self):
         out = generate_fish(_make_parser())
-        assert "complete -c hermes -f" in out
+        assert "complete -c sinria -f" in out
 
     def test_sinria_branding(self, monkeypatch):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
@@ -290,7 +290,7 @@ class TestProfileCompletion:
     def test_bash_has_profiles_helper(self):
         out = generate_bash(_make_parser())
         assert "_hermes_profiles()" in out
-        assert 'profiles_dir="$HOME/.hermes/profiles"' in out
+        assert 'profiles_dir="$HOME/.sinria/profiles"' in out
 
     def test_bash_completes_profiles_after_p_flag(self):
         out = generate_bash(_make_parser())
@@ -320,7 +320,7 @@ class TestProfileCompletion:
     def test_zsh_has_profiles_helper(self):
         out = generate_zsh(_make_parser())
         assert "_hermes_profiles()" in out
-        assert "$HOME/.hermes/profiles" in out
+        assert "$HOME/.sinria/profiles" in out
 
     def test_zsh_has_profile_flag_completion(self):
         out = generate_zsh(_make_parser())
@@ -334,7 +334,7 @@ class TestProfileCompletion:
     def test_fish_has_profiles_helper(self):
         out = generate_fish(_make_parser())
         assert "__hermes_profiles" in out
-        assert "$HOME/.hermes/profiles" in out
+        assert "$HOME/.sinria/profiles" in out
 
     def test_fish_has_profile_flag_completion(self):
         out = generate_fish(_make_parser())

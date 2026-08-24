@@ -64,7 +64,8 @@ def test_spotify_setup_saved_path_uses_sinria_home(monkeypatch, capsys):
 
     assert result == "client-id-123"
     out = capsys.readouterr().out
-    assert "Saved HERMES_SPOTIFY_CLIENT_ID to ~/.sinria/.env" in out
+    assert "Saved SINRIA_SPOTIFY_CLIENT_ID to ~/.sinria/.env" in out
+    assert "HERMES_SPOTIFY_CLIENT_ID" not in out
     assert "~/.hermes/.env" not in out
 
 

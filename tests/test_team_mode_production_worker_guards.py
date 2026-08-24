@@ -8,6 +8,10 @@ from unittest.mock import Mock
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "scripts/sinria-sales-bridge-daemon-v2.py").exists(),
+    reason="Sales bridge production overlay is not included in this distribution",
+)
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

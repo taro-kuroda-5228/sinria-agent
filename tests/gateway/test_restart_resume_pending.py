@@ -27,7 +27,8 @@ PRs #9850, #9934, #7536):
 
 import asyncio
 import time
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -977,7 +978,9 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     another message after the gateway came back.
     """
     runner, adapter = make_restart_runner()
-    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    source = make_restart_source(
+        chat_id="resume-chat", chat_type="group", thread_id="topic-1"
+    )
     pending_entry = SessionEntry(
         session_key="agent:main:telegram:group:resume-chat:topic-1",
         session_id="sid",
@@ -1010,38 +1013,70 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
-async def test_startup_auto_resume_defers_sibling_sessions_for_same_user():
-    """Only the freshest interrupted lane auto-runs per user/platform.
+async def test_startup_auto_resume_accepts_timezone_aware_marker():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-aware")
+    now = datetime.now(timezone.utc)
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-aware",
+        session_id="sid-aware",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
 
-    Regression for Discord dogfood: after a gateway restart, two active
-    channels for the same user both auto-resumed and made one channel look like
-    it received output from another.  Older sibling lanes should receive only a
-    direct status notice and remain resume_pending until a real message arrives.
+    assert runner._schedule_resume_pending_sessions() == 1
+    await asyncio.sleep(0)
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_schedules_all_sibling_sessions_for_same_user():
+    """Every fresh interrupted channel resumes without another user message.
+
+    Each internal event must retain its own SessionSource so concurrent Discord
+    lanes cannot be cross-routed even though all of them are resumed together.
     """
     runner, adapter = make_restart_runner()
-    older_source = make_restart_source(chat_id="main-chat")
-    newer_source = make_restart_source(chat_id="sidework-chat")
+    runner.adapters = {Platform.DISCORD: adapter}
+    # chat_type must match what the stored key encodes: the persisted key is
+    # derived from the persisted origin, so a fixture where they disagree is
+    # not a state the gateway can produce.
+    older_source = replace(
+        _make_source(platform=Platform.DISCORD, chat_id="main-chat"), chat_type="group"
+    )
+    newer_source = replace(
+        _make_source(platform=Platform.DISCORD, chat_id="sidework-chat"),
+        chat_type="group",
+    )
     older_marker = datetime.now() - timedelta(seconds=30)
     newer_marker = datetime.now()
     older_entry = SessionEntry(
-        session_key="agent:main:telegram:group:main-chat:u1",
+        session_key="agent:main:discord:group:main-chat:u1",
         session_id="sid-main",
         created_at=older_marker,
         updated_at=older_marker,
         origin=older_source,
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_type="group",
         resume_pending=True,
         resume_reason="restart_timeout",
         last_resume_marked_at=older_marker,
     )
     newer_entry = SessionEntry(
-        session_key="agent:main:telegram:group:sidework-chat:u1",
+        session_key="agent:main:discord:group:sidework-chat:u1",
         session_id="sid-side",
         created_at=newer_marker,
         updated_at=newer_marker,
         origin=newer_source,
-        platform=Platform.TELEGRAM,
+        platform=Platform.DISCORD,
         chat_type="group",
         resume_pending=True,
         resume_reason="restart_timeout",
@@ -1056,18 +1091,217 @@ async def test_startup_auto_resume_defers_sibling_sessions_for_same_user():
     scheduled = runner._schedule_resume_pending_sessions()
     await asyncio.sleep(0)
 
+    assert scheduled == 2
+    assert adapter.handle_message.await_count == 2
+    events = [call.args[0] for call in adapter.handle_message.await_args_list]
+    assert {event.source.chat_id for event in events} == {"main-chat", "sidework-chat"}
+    assert all(event.internal is True and event.text == "" for event in events)
+    assert getattr(adapter, "sent_calls") == []
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_deduplicates_inflight_session():
+    """Repeated readiness checks must not start the same lane twice."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    release = asyncio.Event()
+
+    async def block_until_released(_event):
+        await release.wait()
+
+    adapter.handle_message = AsyncMock(side_effect=block_until_released)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    assert runner._schedule_resume_pending_sessions() == 0
+    await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+
+    release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_bounds_parallel_dispatch(monkeypatch):
+    """All lanes are scheduled, but provider-facing work is concurrency-bounded."""
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "2")
+    runner, adapter = make_restart_runner()
+    now = datetime.now()
+    entries = []
+    for index in range(6):
+        lane_platform = Platform.TELEGRAM if index < 3 else Platform.DISCORD
+        source = SessionSource(
+            platform=lane_platform,
+            chat_id=f"resume-{index}",
+            chat_type="dm",
+            user_id="u1",
+        )
+        entries.append(
+            SessionEntry(
+                session_key=f"agent:main:{lane_platform.value}:dm:resume-{index}",
+                session_id=f"sid-{index}",
+                created_at=now,
+                updated_at=now,
+                origin=source,
+                platform=lane_platform,
+                chat_type="dm",
+                resume_pending=True,
+                resume_reason="restart_timeout",
+                last_resume_marked_at=now,
+            )
+        )
+    runner.session_store._entries = {entry.session_key: entry for entry in entries}
+
+    release = asyncio.Event()
+    active = 0
+    max_active = 0
+    started = []
+
+    adapter._session_tasks = {}
+
+    async def process_lane(event):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        started.append(event.source.chat_id)
+        await release.wait()
+        active -= 1
+
+    async def enqueue_like_real_adapter(event):
+        session_key = (
+            f"agent:main:{event.source.platform.value}:dm:{event.source.chat_id}"
+        )
+        adapter._session_tasks[session_key] = asyncio.create_task(process_lane(event))
+
+    adapter.handle_message = AsyncMock(side_effect=enqueue_like_real_adapter)
+    runner.adapters[Platform.DISCORD] = adapter
+
+    assert runner._schedule_resume_pending_sessions(platform=Platform.TELEGRAM) == 3
+    assert runner._schedule_resume_pending_sessions(platform=Platform.DISCORD) == 3
+    tasks = list(runner._background_tasks)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert len(started) == 2
+    assert max_active == 2
+
+    release.set()
+    await asyncio.gather(*tasks)
+    assert set(started) == {f"resume-{index}" for index in range(6)}
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_dedupes_until_real_adapter_task_finishes():
+    """Production adapters enqueue work; dedupe must outlive handle_message()."""
+    runner, adapter = make_restart_runner()
+    now = datetime.now()
+    source = make_restart_source(chat_id="resume-production-contract")
+    session_key = "agent:main:telegram:dm:resume-production-contract"
+    entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid-production-contract",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    runner.session_store._entries = {session_key: entry}
+
+    first_release = asyncio.Event()
+    successor_release = asyncio.Event()
+    adapter._session_tasks = {}
+
+    async def successor_lane():
+        await successor_release.wait()
+
+    async def process_lane():
+        await first_release.wait()
+        adapter._session_tasks[session_key] = asyncio.create_task(successor_lane())
+
+    async def enqueue_like_real_adapter(_event):
+        adapter._session_tasks[session_key] = asyncio.create_task(process_lane())
+
+    adapter.handle_message = AsyncMock(side_effect=enqueue_like_real_adapter)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    wrapper_task = next(iter(runner._background_tasks))
+    await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+    assert not wrapper_task.done()
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    assert adapter.handle_message.await_count == 1
+
+    first_release.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not wrapper_task.done()
+    assert runner._schedule_resume_pending_sessions() == 0
+
+    successor_release.set()
+    await wrapper_task
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_schedule_failure_does_not_block_other_lanes():
+    """A failure creating one lane task must not suppress later lanes."""
+    runner, adapter = make_restart_runner()
+    now = datetime.now()
+    entries = []
+    for index in range(2):
+        source = make_restart_source(chat_id=f"resume-{index}")
+        entries.append(
+            SessionEntry(
+                session_key=f"agent:main:telegram:dm:resume-{index}",
+                session_id=f"sid-{index}",
+                created_at=now,
+                updated_at=now,
+                origin=source,
+                platform=Platform.TELEGRAM,
+                chat_type="dm",
+                resume_pending=True,
+                resume_reason="restart_timeout",
+                last_resume_marked_at=now,
+            )
+        )
+    runner.session_store._entries = {entry.session_key: entry for entry in entries}
+    adapter.handle_message = AsyncMock()
+
+    real_create_task = asyncio.create_task
+    attempts = 0
+
+    def create_task_with_first_failure(coro):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("synthetic scheduling failure")
+        return real_create_task(coro)
+
+    with patch("gateway.run.asyncio.create_task", side_effect=create_task_with_first_failure):
+        scheduled = runner._schedule_resume_pending_sessions()
+
+    await asyncio.sleep(0)
+
     assert scheduled == 1
-    adapter.handle_message.assert_awaited_once()
-    await_args = adapter.handle_message.await_args
-    assert await_args is not None
-    event = await_args.args[0]
-    assert event.source == newer_source
-    assert event.text == ""
-    sent_calls = getattr(adapter, "sent_calls")
-    assert len(sent_calls) == 1
-    assert sent_calls[0][0] == "main-chat"
-    assert "left paused" in sent_calls[0][1]
-    assert older_entry.resume_pending is True
+    assert adapter.handle_message.await_count == 1
+    assert adapter.handle_message.await_args_list[0].args[0].source.chat_id == "resume-1"
 
 
 @pytest.mark.asyncio
@@ -1462,3 +1696,651 @@ class TestStuckLoopEscalation:
                 {"indent": None},
             )
         ]
+
+
+# ---------------------------------------------------------------------------
+# Startup auto-resume concurrency hardening
+#
+# The semaphore introduced for bounded dispatch means a lane can sit queued
+# for a long time between scheduling and dispatch.  Everything checked at
+# schedule time (marker set, lane idle, gateway running) can change while the
+# wrapper waits — these tests pin the dispatch-time revalidation contract.
+# ---------------------------------------------------------------------------
+
+
+def _make_pending_entry(source, session_key):
+    now = datetime.now()
+    return SessionEntry(
+        session_key=session_key,
+        session_id=f"sid-{session_key.rsplit(':', 1)[-1]}",
+        created_at=now,
+        updated_at=now,
+        origin=source,
+        platform=source.platform,
+        chat_type=source.chat_type or "dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+
+
+def _two_queued_lanes(runner):
+    """Two fresh pending lanes; lane-a's dispatch blocks until released."""
+    key_a = "agent:main:telegram:dm:lane-a"
+    key_b = "agent:main:telegram:dm:lane-b"
+    runner.session_store._entries = {
+        key_a: _make_pending_entry(make_restart_source(chat_id="lane-a"), key_a),
+        key_b: _make_pending_entry(make_restart_source(chat_id="lane-b"), key_b),
+    }
+    release = asyncio.Event()
+
+    async def hold_first_lane(event):
+        if event.source.chat_id == "lane-a":
+            await release.wait()
+
+    return key_a, key_b, release, hold_first_lane
+
+
+def _dispatched_chat_ids(adapter):
+    return {call.args[0].source.chat_id for call in adapter.handle_message.await_args_list}
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_lane_cleared_while_queued(monkeypatch):
+    """A queued wrapper must revalidate the marker after the semaphore wait.
+
+    While lane B waits for a dispatch slot, its resume obligation can be
+    fulfilled by a normal user turn (which clears resume_pending).  Dispatching
+    the stale empty internal event afterwards would run a bare LLM turn and
+    post an unprompted reply into the channel.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a, key_b, release, hold_first_lane = _two_queued_lanes(runner)
+    adapter.handle_message = AsyncMock(side_effect=hold_first_lane)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+
+    # Lane B's obligation is fulfilled elsewhere while its wrapper is queued.
+    runner.session_store._entries[key_b].resume_pending = False
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert _dispatched_chat_ids(adapter) == {"lane-a"}
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_lane_with_running_agent():
+    """Never synthesize a resume turn into a lane the runner already owns.
+
+    The live turn is resume-aware by itself (the _is_resume_pending branch
+    fires on any message while the marker is set), so dispatching here can
+    only interrupt the user's in-flight work.  The marker must survive.
+    """
+    runner, adapter = make_restart_runner()
+    key = "agent:main:telegram:dm:busy-runner"
+    runner.session_store._entries = {
+        key: _make_pending_entry(make_restart_source(chat_id="busy-runner"), key)
+    }
+    runner._running_agents[key] = MagicMock()
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert runner.session_store._entries[key].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_lane_already_active_in_adapter():
+    """Dispatching into an adapter-owned lane must not happen at all.
+
+    Without the guard the empty internal event goes down the busy path: it
+    replaces the user's queued follow-up, interrupts the live turn, and posts
+    a busy ack the user never asked for.  Uses the REAL handle_message so a
+    regression reproduces the full blast radius.
+    """
+    runner, adapter = make_restart_runner()
+    runner._busy_ack_ts = {}
+    source = make_restart_source(chat_id="busy-adapter")
+    key = "agent:main:telegram:dm:busy-adapter"
+    runner.session_store._entries = {key: _make_pending_entry(source, key)}
+
+    hold = asyncio.Event()
+    live_task = asyncio.create_task(hold.wait())
+    adapter._active_sessions[key] = asyncio.Event()
+    adapter._session_tasks[key] = live_task
+    queued_user_event = MessageEvent(
+        text="user follow-up", message_type=MessageType.TEXT, source=source
+    )
+    adapter._pending_messages[key] = queued_user_event
+    running_agent = MagicMock()
+    runner._running_agents[key] = running_agent
+
+    try:
+        scheduled = runner._schedule_resume_pending_sessions()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert scheduled == 0
+        assert adapter._pending_messages[key] is queued_user_event
+        running_agent.interrupt.assert_not_called()
+        assert adapter.sent_calls == []
+        assert runner.session_store._entries[key].resume_pending is True
+    finally:
+        hold.set()
+        live_task.cancel()
+        for task in list(runner._background_tasks):
+            task.cancel()
+        await asyncio.gather(*runner._background_tasks, live_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_rechecks_busy_lane_after_semaphore_wait(monkeypatch):
+    """The busy-lane guard must run again after the semaphore wait.
+
+    A user can start a turn on lane B while B's wrapper is still queued behind
+    the concurrency cap; dispatching then would interrupt that live turn.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a, key_b, release, hold_first_lane = _two_queued_lanes(runner)
+    adapter.handle_message = AsyncMock(side_effect=hold_first_lane)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+
+    # A real user message claims lane B while its wrapper is queued.
+    adapter._active_sessions[key_b] = asyncio.Event()
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert _dispatched_chat_ids(adapter) == {"lane-a"}
+    assert runner.session_store._entries[key_b].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_releases_slot_after_resume_obligation_ends(monkeypatch):
+    """The slot must not be pinned by unrelated follow-up user turns.
+
+    Once the lane's resume obligation is over (marker cleared by the resume
+    turn), a fresh task installed by new user traffic must not keep holding
+    the semaphore — that starves every still-pending lane behind it.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a = "agent:main:telegram:dm:lane-a"
+    key_b = "agent:main:telegram:dm:lane-b"
+    runner.session_store._entries = {
+        key_a: _make_pending_entry(make_restart_source(chat_id="lane-a"), key_a),
+        key_b: _make_pending_entry(make_restart_source(chat_id="lane-b"), key_b),
+    }
+
+    unrelated_hold = asyncio.Event()
+    b_dispatched = asyncio.Event()
+
+    async def resume_turn_for_lane_a():
+        # The resume turn completes successfully: the normal turn path clears
+        # the marker...
+        runner.session_store._entries[key_a].resume_pending = False
+        # ...and unrelated new user traffic takes over the lane's task slot.
+        adapter._session_tasks[key_a] = asyncio.create_task(unrelated_hold.wait())
+
+    async def enqueue_like_real_adapter(event):
+        if event.source.chat_id == "lane-a":
+            adapter._session_tasks[key_a] = asyncio.create_task(resume_turn_for_lane_a())
+        else:
+            b_dispatched.set()
+
+    adapter.handle_message = AsyncMock(side_effect=enqueue_like_real_adapter)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    try:
+        await asyncio.wait_for(b_dispatched.wait(), timeout=1.0)
+    finally:
+        unrelated_hold.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        leftover = adapter._session_tasks.get(key_a)
+        if leftover is not None and not leftover.done():
+            leftover.cancel()
+            await asyncio.gather(leftover, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_aborts_queued_wrapper_when_draining(monkeypatch):
+    """A queued wrapper must not dispatch into a gateway that is shutting down.
+
+    During a resume storm a re-restart flips _draining while wrappers are
+    still waiting for a slot; dispatching then creates dangling adapter tasks
+    and can post drain-refusal text into lanes where nobody typed anything.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a, key_b, release, hold_first_lane = _two_queued_lanes(runner)
+    adapter.handle_message = AsyncMock(side_effect=hold_first_lane)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+
+    runner._draining = True
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert _dispatched_chat_ids(adapter) == {"lane-a"}
+    assert runner.session_store._entries[key_b].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_wrapper_cancellation_wins_over_cancelled_lane_task():
+    """Cancelling the wrapper while it awaits an already-cancelled lane task
+    must cancel the wrapper itself.
+
+    Shutdown cancels _background_tasks fire-and-forget; if the wrapper
+    swallows its own cancellation because the lane task happened to be
+    cancelled in the same tick, it keeps running untracked through teardown.
+    """
+    runner, adapter = make_restart_runner()
+    key = "agent:main:telegram:dm:cancel-lane"
+    runner.session_store._entries = {
+        key: _make_pending_entry(make_restart_source(chat_id="cancel-lane"), key)
+    }
+
+    hold = asyncio.Event()
+
+    async def enqueue(event):
+        adapter._session_tasks[key] = asyncio.create_task(hold.wait())
+
+    adapter.handle_message = AsyncMock(side_effect=enqueue)
+
+    assert runner._schedule_resume_pending_sessions() == 1
+    wrapper_task = next(iter(runner._background_tasks))
+    for _ in range(3):
+        await asyncio.sleep(0)  # wrapper reaches the shielded await
+
+    processing = adapter._session_tasks[key]
+    processing.cancel()
+    await asyncio.sleep(0)  # lane task settles as cancelled
+    wrapper_task.cancel()
+    await asyncio.gather(wrapper_task, return_exceptions=True)
+
+    assert wrapper_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_preserves_same_parent_thread_isolation():
+    """Two Discord threads under the SAME parent channel resume independently
+    with their exact origins — replies must route back into each thread.
+
+    Sibling-thread session keys differ only in the thread_id segment (with
+    thread_sessions_per_user disabled the user id is deliberately not
+    appended), so thread_id is the only thing keeping these lanes apart.
+    """
+    runner, adapter = make_restart_runner()
+    runner.adapters = {Platform.DISCORD: adapter}
+    now = datetime.now()
+    entries = {}
+    for thread_id in ("T1", "T2"):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="parent-channel",
+            chat_type="group",
+            user_id="u1",
+            thread_id=thread_id,
+            parent_chat_id="parent-channel",
+        )
+        key = f"agent:main:discord:group:parent-channel:{thread_id}"
+        entries[key] = SessionEntry(
+            session_key=key,
+            session_id=f"sid-{thread_id}",
+            created_at=now,
+            updated_at=now,
+            origin=source,
+            platform=Platform.DISCORD,
+            chat_type="group",
+            resume_pending=True,
+            resume_reason="restart_timeout",
+            last_resume_marked_at=now,
+        )
+    runner.session_store._entries = entries
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 2
+    events = [call.args[0] for call in adapter.handle_message.await_args_list]
+    assert {event.source.thread_id for event in events} == {"T1", "T2"}
+    assert {event.source.chat_id for event in events} == {"parent-channel"}
+    assert {event.source.parent_chat_id for event in events} == {"parent-channel"}
+    assert all(event.internal is True and event.text == "" for event in events)
+    assert adapter.sent_calls == []
+
+
+class TestEmptyInternalResumeSinkGuard:
+    """Building blocks of the defensive sink guard: classify synthesized
+    auto-resume probe events, and consume markers that transcript freshness
+    has already proven dead (so reconnect passes stop re-dispatching them)."""
+
+    def _probe(self, **overrides):
+        from gateway.run import _INTERNAL_KIND_AUTO_RESUME
+
+        kwargs = dict(
+            text="",
+            message_type=MessageType.TEXT,
+            source=_make_source(),
+            internal=True,
+            internal_kind=_INTERNAL_KIND_AUTO_RESUME,
+        )
+        kwargs.update(overrides)
+        return MessageEvent(**kwargs)
+
+    def test_empty_internal_event_is_probe(self):
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert _is_empty_internal_resume_event(self._probe()) is True
+
+    def test_untagged_empty_internal_event_is_not_a_probe(self):
+        """Another synthesizer's empty internal event must still run.
+
+        Rendered webhook prompts (``msgraph_webhook._render_prompt``) and other
+        internal injections can legitimately come out empty.  Classifying those
+        as auto-resume probes would make the sink guard swallow them with no
+        reply and no error — a silent drop of a real notification.
+        """
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert _is_empty_internal_resume_event(self._probe(internal_kind=None)) is False
+        assert (
+            _is_empty_internal_resume_event(self._probe(internal_kind="watch_notice"))
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_scheduler_actually_produces_a_recognized_probe(self):
+        """Close the loop: the event the scheduler emits must arm the guard.
+
+        The tag and the classifier are useless if they disagree, and nothing
+        else in the pipeline would notice — the turn would simply run bare.
+        """
+        from gateway.run import _is_empty_internal_resume_event
+
+        runner, adapter = make_restart_runner()
+        source = make_restart_source(chat_id="probe-shape")
+        key = runner._session_key_for_source(source)
+        runner.session_store._entries = {key: _make_pending_entry(source, key)}
+        adapter.handle_message = AsyncMock()
+
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert _is_empty_internal_resume_event(event) is True
+
+    def test_whitespace_only_internal_event_is_probe(self):
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert _is_empty_internal_resume_event(self._probe(text=" \n\t")) is True
+
+    def test_user_event_is_not_probe(self):
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert _is_empty_internal_resume_event(self._probe(internal=False)) is False
+
+    def test_internal_event_with_text_is_not_probe(self):
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert _is_empty_internal_resume_event(self._probe(text="do the thing")) is False
+
+    def test_internal_event_with_media_is_not_probe(self):
+        from gateway.run import _is_empty_internal_resume_event
+
+        assert (
+            _is_empty_internal_resume_event(self._probe(media_urls=["/tmp/x.png"]))
+            is False
+        )
+
+    def test_sink_guard_truth_table(self):
+        """The full decision the guard makes before an unprompted turn.
+
+        This condition lives ~1500 lines into ``_run_agent``, which cannot be
+        driven without a live model, so the predicate is pinned here instead.
+        """
+        from gateway.run import _auto_resume_probe_has_no_work
+
+        def _decide(probe, resume_note, tool_tail):
+            return _auto_resume_probe_has_no_work(
+                is_auto_resume_probe=probe,
+                resume_note_will_fire=resume_note,
+                tool_tail_note_will_fire=tool_tail,
+            )
+
+        # A real user turn is never suppressed, whatever the notes say.
+        for resume_note in (True, False):
+            for tool_tail in (True, False):
+                assert _decide(False, resume_note, tool_tail) is False
+
+        # A probe with recovery work to do runs.
+        assert _decide(True, True, False) is False
+        assert _decide(True, False, True) is False, (
+            "an unanswered tool tail is recovery work even without the marker"
+        )
+        assert _decide(True, True, True) is False
+
+        # A probe with nothing to say must not reach the model.
+        assert _decide(True, False, False) is True
+
+    def test_noop_suppression_is_process_scoped_and_leaves_the_marker(self, tmp_path):
+        """A no-op probe must not retire the durable recovery marker.
+
+        ``resume_pending`` has a second job beyond the recovery note: it
+        short-circuits the reset policy in ``get_or_create_session``, keeping
+        an interrupted transcript alive across the 4am / idle boundary.  A
+        transient staleness verdict taken at gateway startup must not spend
+        it — only a completed turn may, per
+        ``_should_clear_resume_pending_after_turn``.
+        """
+        from gateway.run import _suppress_further_resume_probes
+
+        runner, _ = make_restart_runner()
+        runner._auto_resume_noop_lanes = set()
+        store = _make_store(tmp_path)
+        entry = store.get_or_create_session(_make_source())
+        store.mark_resume_pending(entry.session_key)
+
+        assert _suppress_further_resume_probes(runner, entry.session_key) is True
+        assert runner._auto_resume_noop_lanes == {entry.session_key}
+        assert store._entries[entry.session_key].resume_pending is True
+        # The transcript is still protected from the reset policy.
+        assert store.get_or_create_session(_make_source()).session_id == entry.session_id
+
+    def test_noop_suppression_tolerates_a_missing_key_or_runner_state(self):
+        from gateway.run import _suppress_further_resume_probes
+
+        runner, _ = make_restart_runner()
+        runner._auto_resume_noop_lanes = set()
+        assert _suppress_further_resume_probes(runner, None) is False
+        assert _suppress_further_resume_probes(object(), "some-key") is False
+
+    @pytest.mark.asyncio
+    async def test_a_noop_lane_is_not_re_probed_by_a_reconnect_pass(self):
+        """The suppression has to reach the scheduler, or nothing changed.
+
+        Adapter reconnects re-run the pass; without this the same dead lane
+        would be re-loaded and re-dispatched on every reconnect until its
+        marker aged out of the freshness window.
+        """
+        from gateway.run import _suppress_further_resume_probes
+
+        runner, adapter = make_restart_runner()
+        runner._auto_resume_noop_lanes = set()
+        source = make_restart_source(chat_id="noop-lane")
+        key = runner._session_key_for_source(source)
+        runner.session_store._entries = {key: _make_pending_entry(source, key)}
+        adapter.handle_message = AsyncMock()
+
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+
+        _suppress_further_resume_probes(runner, key)
+        assert runner._schedule_resume_pending_sessions() == 0
+        await asyncio.sleep(0)
+        assert adapter.handle_message.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Routing-key drift
+#
+# Auto-resume bookkeeping (per-lane task map, live-turn guard, marker re-read,
+# dedupe chase) is keyed by the PERSISTED ``entry.session_key``.  The turn it
+# dispatches runs under the key the pipeline recomputes from the persisted
+# origin.  When those two disagree the lane resumes into a different session,
+# never clears its own marker, and is invisible to every dedupe guard — so it
+# is re-dispatched by each later pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_lane_whose_origin_no_longer_maps_to_its_key():
+    """A lane stored under a key its origin no longer produces must be skipped.
+
+    Reachable by flipping ``group_sessions_per_user`` /
+    ``thread_sessions_per_user`` in config.yaml and restarting, or by binding
+    an interrupted channel to a Workspace conversation: the persisted key
+    stops matching the key the dispatch pipeline recomputes from the origin.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="drifted-chat")
+    routed_key = runner._session_key_for_source(source)
+    stored_key = routed_key + ":legacy-suffix"
+    assert stored_key != routed_key
+
+    runner.session_store._entries = {
+        stored_key: _make_pending_entry(source, stored_key)
+    }
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    # The marker survives: the user's next real message routes to the same new
+    # key the turn would have used, and recovers there.
+    assert runner.session_store._entries[stored_key].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_lane_whose_key_drifts_while_queued(monkeypatch):
+    """Key drift discovered after the semaphore wait must also abort dispatch.
+
+    Same hazard as above, in the window the concurrency cap opens: the lane
+    passed enumeration, then the derivation changed before it got a slot.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a, key_b, release, hold_first_lane = _two_queued_lanes(runner)
+    adapter.handle_message = AsyncMock(side_effect=hold_first_lane)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    assert adapter.handle_message.await_count == 1
+
+    # Lane B's origin stops mapping to its stored key while B is queued.
+    entry_b = runner.session_store._entries[key_b]
+    entry_b.origin = replace(entry_b.origin, chat_id="renamed-lane-b")
+    release.set()
+    await asyncio.gather(*tasks)
+
+    assert _dispatched_chat_ids(adapter) == {"lane-a"}
+    assert runner.session_store._entries[key_b].resume_pending is True
+
+
+def test_auto_resume_skip_reason_accepts_a_lane_whose_key_still_matches():
+    """The drift guard must not reject the ordinary case.
+
+    Every eligible lane goes through this predicate, so a false positive here
+    would disable startup auto-resume entirely.
+    """
+    from gateway.run import _auto_resume_skip_reason
+
+    runner, _ = make_restart_runner()
+    source = make_restart_source(chat_id="steady-chat")
+    key = runner._session_key_for_source(source)
+    entry = _make_pending_entry(source, key)
+
+    assert (
+        _auto_resume_skip_reason(
+            entry,
+            window=_auto_continue_freshness_window(),
+            resolve_session_key=runner._session_key_for_source,
+        )
+        is None
+    )
+
+
+def test_auto_resume_skip_reason_tolerates_a_failing_key_resolver():
+    """A resolver that raises must not veto an otherwise eligible lane.
+
+    The resolver reaches into the session store; a transient store error must
+    degrade to "no drift detected" rather than silently disabling recovery.
+    """
+    from gateway.run import _auto_resume_skip_reason
+
+    runner, _ = make_restart_runner()
+    source = make_restart_source(chat_id="resolver-boom")
+    key = runner._session_key_for_source(source)
+
+    def _boom(_source):
+        raise RuntimeError("session store unavailable")
+
+    assert (
+        _auto_resume_skip_reason(
+            _make_pending_entry(source, key),
+            window=_auto_continue_freshness_window(),
+            resolve_session_key=_boom,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_lane_failure_does_not_block_the_queue(monkeypatch):
+    """One lane raising inside dispatch must not strand the lanes behind it.
+
+    With the concurrency cap at 1, a wrapper that dies without releasing its
+    slot would deadlock every remaining lane for the rest of the process.
+    """
+    monkeypatch.setenv("SINRIA_AUTO_RESUME_MAX_CONCURRENT", "1")
+    runner, adapter = make_restart_runner()
+    key_a, key_b, _release, _hold = _two_queued_lanes(runner)
+
+    async def explode_on_first_lane(event):
+        if event.source.chat_id == "lane-a":
+            raise RuntimeError("adapter blew up")
+
+    adapter.handle_message = AsyncMock(side_effect=explode_on_first_lane)
+
+    assert runner._schedule_resume_pending_sessions() == 2
+    tasks = list(runner._background_tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert any(isinstance(r, RuntimeError) for r in results)
+    assert _dispatched_chat_ids(adapter) == {"lane-a", "lane-b"}
+    # The failed lane keeps its marker for the next pass; nothing was sent.
+    assert runner.session_store._entries[key_a].resume_pending is True
+    assert adapter.sent_calls == []

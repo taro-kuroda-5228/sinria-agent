@@ -18,7 +18,7 @@ def test_config_set_usage_marks_placeholders(capsys):
 
     assert exc.value.code == 1
     out = capsys.readouterr().out
-    assert "Usage: hermes config set <key> <value>" in out
+    assert "Usage: sinria config set <key> <value>" in out
 
 
 def test_sinria_config_set_usage_marks_placeholders(monkeypatch, capsys):
@@ -42,7 +42,7 @@ def test_config_unknown_command_help_marks_placeholders(capsys):
 
     assert exc.value.code == 1
     out = capsys.readouterr().out
-    assert "hermes config set <key> <value>   Set a config value" in out
+    assert "sinria config set <key> <value>   Set a config value" in out
 
 
 def test_sinria_config_unknown_command_help_marks_placeholders(monkeypatch, capsys):
@@ -63,7 +63,7 @@ def test_show_config_marks_placeholders(tmp_path, capsys):
         show_config()
 
     out = capsys.readouterr().out
-    assert "hermes config set <key> <value>" in out
+    assert "sinria config set <key> <value>" in out
 
 
 def test_sinria_show_config_marks_placeholders(tmp_path, capsys):
@@ -80,7 +80,7 @@ def test_setup_summary_marks_placeholders(tmp_path, capsys):
         _print_setup_summary({"tts": {"provider": "edge"}}, tmp_path)
 
     out = capsys.readouterr().out
-    assert "hermes config set <key> <value>" in out
+    assert "sinria config set <key> <value>" in out
 
 
 

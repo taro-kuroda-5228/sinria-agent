@@ -2041,10 +2041,15 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
-    until the TTL expires. Called from the payment-fallback branches in
-    ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+def _mark_provider_unhealthy(
+    provider: str,
+    ttl: Optional[float] = None,
+    reason: str = "payment / credit error",
+) -> None:
+    """Temporarily hide a provider after a terminal auxiliary failure.
+
+    The process-local TTL allows changed credentials or restored billing to
+    recover automatically without permanently disabling the provider.
     """
     label = _normalize_chain_label(provider)
     if not label:
@@ -2052,10 +2057,11 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+        "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        reason,
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
 
@@ -4754,6 +4760,7 @@ def call_llm(
         # against the same rate-limited endpoint.
         should_fallback = (
             _is_payment_error(first_err)
+            or _is_auth_error(first_err)
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_not_found_error(first_err)
@@ -4763,14 +4770,15 @@ def call_llm(
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in {"auto", "", None}
         if should_fallback and is_auto:
-            if _is_payment_error(first_err):
-                reason = "payment error"
+            if _is_payment_error(first_err) or _is_auth_error(first_err):
+                reason = "payment error" if _is_payment_error(first_err) else "authentication error"
                 # Resolve the actual provider label (resolved_provider may be
                 # "auto"; the client's base_url tells us which backend got the
-                # 402). Mark THAT label unhealthy so subsequent aux calls
-                # skip it instead of paying another doomed RTT.
+                # terminal error). Mark THAT label unhealthy so subsequent aux
+                # calls skip it instead of paying another doomed RTT.
                 _mark_provider_unhealthy(
-                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider
+                    _recoverable_pool_provider(resolved_provider, client) or resolved_provider,
+                    reason=reason,
                 )
             elif _is_rate_limit_error(first_err):
                 reason = "rate limit"

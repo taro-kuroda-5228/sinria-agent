@@ -172,7 +172,7 @@ class TestSystemdServiceRefresh:
         assert markers == [321]
         output = capsys.readouterr().out
         assert "still stopping after 90s" in output
-        assert "hermes gateway status" in output
+        assert "sinria gateway status" in output
 
     def test_systemd_restart_timeout_prints_status_guidance(self, monkeypatch, capsys):
         """`hermes gateway restart` must not surface a raw TimeoutExpired traceback.
@@ -211,7 +211,7 @@ class TestSystemdServiceRefresh:
 
         output = capsys.readouterr().out
         assert "still restarting after 90s" in output
-        assert "hermes gateway status" in output
+        assert "sinria gateway status" in output
 
     def test_run_gateway_refreshes_outdated_unit_on_boot(self, tmp_path, monkeypatch):
         """run_gateway() should refresh the systemd unit on boot so that
@@ -309,7 +309,7 @@ class TestRequireServiceInstalled:
         assert exc_info.value.code == 1
         out = capsys.readouterr().out
         assert "not installed" in out
-        assert "hermes gateway install" in out
+        assert "sinria gateway install" in out
 
     def test_passes_when_unit_exists(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "sinria-gateway.service"
@@ -619,14 +619,17 @@ class TestLaunchdServiceRecovery:
             ["launchctl", "kickstart", target],
         ]
 
-    def test_launchd_restart_drains_running_gateway_before_kickstart(self, monkeypatch):
+    def test_launchd_restart_uses_sigusr1_then_non_destructive_kickstart(self, monkeypatch):
         calls = []
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
-        monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("usr1", pid, timeout)) or True,
+        )
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
@@ -641,9 +644,31 @@ class TestLaunchdServiceRecovery:
         gateway_cli.launchd_restart()
 
         assert calls == [
-            ("term", 321, False),
-            ["launchctl", "kickstart", "-k", target],
+            # The CLI wait must include teardown headroom beyond the gateway's
+            # own drain timeout. Otherwise both timers expire together and a
+            # successful graceful restart is reported as a failure.
+            ("usr1", 321, 27.0),
+            ["launchctl", "kickstart", target],
         ]
+
+    def test_launchd_restart_timeout_aborts_without_force_or_kickstart(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
+        monkeypatch.setattr(gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: False)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="no force restart was issued"):
+            gateway_cli.launchd_restart()
+
+        assert calls == []
 
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
@@ -1148,7 +1173,7 @@ class TestGatewaySystemServiceRouting:
 
         out = capsys.readouterr().out
         assert "not supported on Termux" in out
-        assert "Run manually: hermes gateway run" in out
+        assert "Run manually: sinria gateway run" in out
 
     def test_install_on_termux_uses_sinria_manual_run_hint(self, monkeypatch, capsys):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
@@ -1238,7 +1263,7 @@ class TestGatewaySystemServiceRouting:
 
         out = capsys.readouterr().out
         assert "Gateway is not running" in out
-        assert "nohup hermes gateway" in out
+        assert "nohup sinria gateway" in out
         assert "install as user service" not in out
 
     def test_gateway_status_on_termux_uses_sinria_manual_guidance(self, monkeypatch, capsys):
@@ -1464,6 +1489,15 @@ class TestGeneratedUnitUsesDetectedVenv:
 
         monkeypatch.setattr(gateway_cli, "_detect_venv_dir", lambda: dot_venv)
         monkeypatch.setattr(gateway_cli, "get_python_path", lambda: str(dot_venv / "bin" / "python"))
+        # VIRTUAL_ENV is only emitted for the `python -m` module entrypoint
+        # (binary launchers bootstrap their own environment), so pin that
+        # entrypoint form hermetically — the real resolver would pick up a
+        # `sinria` launcher from the developer's PATH or the repo root.
+        monkeypatch.setattr(
+            gateway_cli,
+            "_service_entrypoint_argv",
+            lambda: [str(dot_venv / "bin" / "python"), "-m", "sinria_cli.main"],
+        )
 
         unit = gateway_cli.generate_systemd_unit(system=False)
 
@@ -1662,7 +1696,7 @@ class TestPreflightUserSystemd:
 
         msg = str(exc_info.value)
         assert "sudo loginctl enable-linger" in msg
-        assert "hermes gateway run" in msg  # foreground fallback mentioned
+        assert "sinria gateway run" in msg  # foreground fallback mentioned
         assert "Interactive authentication required" in msg
 
     def test_raises_when_loginctl_missing(self, monkeypatch):
@@ -1827,7 +1861,7 @@ class TestProfileArg:
 
         plist_path = gateway_cli.get_launchd_plist_path()
 
-        assert plist_path == machine_home / "Library" / "LaunchAgents" / "ai.hermes.gateway-orcha.plist"
+        assert plist_path == machine_home / "Library" / "LaunchAgents" / "ai.sinria.gateway-orcha.plist"
 
     def test_sinria_default_launchd_identity_does_not_collide_with_hermes(self, tmp_path, monkeypatch):
         machine_home = tmp_path / "machine-home"
@@ -1990,7 +2024,7 @@ class TestDockerAwareGateway:
         assert exc_info.value.code == 0
         out = capsys.readouterr().out
         assert "docker" in out.lower()
-        assert "hermes gateway run" in out
+        assert "sinria gateway run" in out
 
     def test_gateway_start_in_container_uses_sinria_run_hint(self, monkeypatch, capsys):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")
@@ -2174,7 +2208,7 @@ class TestLegacyHermesUnitDetection:
 
         assert "Legacy" in out
         assert "hermes.service" in out
-        assert "hermes gateway migrate-legacy" in out
+        assert "sinria gateway migrate-legacy" in out
 
     def test_print_legacy_unit_warning_uses_sinria_hint(self, tmp_path, monkeypatch, capsys):
         user_dir, _ = self._setup_search_paths(tmp_path, monkeypatch)
@@ -2289,7 +2323,7 @@ class TestRemoveLegacyHermesUnits:
         assert remaining == [legacy]
         assert legacy.exists()  # Not removed — requires sudo
         out = capsys.readouterr().out
-        assert "sudo hermes gateway migrate-legacy" in out
+        assert "sudo sinria gateway migrate-legacy" in out
 
     def test_system_scope_without_root_defers_removal_with_sinria_hint(self, tmp_path, monkeypatch, capsys):
         _, system_dir, calls = self._setup(tmp_path, monkeypatch, as_root=False)
@@ -2715,8 +2749,8 @@ class TestSystemScopeRemediationOutput:
         assert "system-wide service" in out
         assert "start requires root" in out
         assert "sudo systemctl start sinria-gateway" in out
-        assert "sudo hermes gateway uninstall --system" in out
-        assert "hermes gateway install" in out
+        assert "sudo sinria gateway uninstall --system" in out
+        assert "sinria gateway install" in out
 
     def test_restart_remediation_uses_systemctl_restart(self, capsys, monkeypatch):
         monkeypatch.setattr(gateway_cli, "get_service_name", lambda: "sinria-gateway")

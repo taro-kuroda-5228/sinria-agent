@@ -51,6 +51,19 @@ def _mock_mode(mode):
         yield
 
 
+@contextmanager
+def _workspace_cwd(value):
+    """Set and restore the current session workspace without leaking state."""
+    from gateway.session_context import set_session_vars
+
+    tokens = set_session_vars(workspace_cwd=value)
+    try:
+        yield
+    finally:
+        for token in reversed(tokens):
+            token.var.reset(token)
+
+
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
     """Minimal mock dispatcher reused across tests."""
     if function_name == "terminal":
@@ -200,24 +213,23 @@ class TestResolveChildCwd(unittest.TestCase):
         self.assertEqual(_resolve_child_cwd("strict", "/tmp/staging"), "/tmp/staging")
 
     def test_project_without_terminal_cwd_uses_getcwd(self):
-        env = {k: v for k, v in os.environ.items() if k != "TERMINAL_CWD"}
-        with patch.dict(os.environ, env, clear=True):
+        with _workspace_cwd(""):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
 
     def test_project_uses_terminal_cwd_when_set(self):
         import tempfile
         with tempfile.TemporaryDirectory() as td:
-            with patch.dict(os.environ, {"TERMINAL_CWD": td}):
+            with _workspace_cwd(td):
                 self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), td)
 
     def test_project_bogus_terminal_cwd_falls_back_to_getcwd(self):
-        with patch.dict(os.environ, {"TERMINAL_CWD": "/does/not/exist/anywhere"}):
+        with _workspace_cwd("/does/not/exist/anywhere"):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), os.getcwd())
 
     def test_project_expands_tilde(self):
         import pathlib
         home = str(pathlib.Path.home())
-        with patch.dict(os.environ, {"TERMINAL_CWD": "~"}):
+        with _workspace_cwd("~"):
             self.assertEqual(_resolve_child_cwd("project", "/tmp/staging"), home)
 
 
@@ -284,7 +296,9 @@ class TestExecuteCodeModeIntegration(unittest.TestCase):
     def _run(self, code, mode, enabled_tools=None, extra_env=None):
         env_overrides = extra_env or {}
         with _mock_mode(mode):
-            with patch.dict(os.environ, env_overrides):
+            with patch.dict(os.environ, env_overrides), _workspace_cwd(
+                env_overrides.get("TERMINAL_CWD", "")
+            ):
                 with patch("model_tools.handle_function_call",
                            side_effect=_mock_handle_function_call):
                     raw = execute_code(

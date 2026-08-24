@@ -96,7 +96,15 @@ class TestWorktreeIncludeSecurity:
     def test_allows_valid_file_include(self, git_repo):
         import cli as cli_mod
 
-        (git_repo / ".env").write_text("SECRET=***\n")
+        (git_repo / ".gitignore").write_text(".env\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "ignore local env"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        (git_repo / ".env").write_text("SECRET=[REDACTED]\n")
         (git_repo / ".worktreeinclude").write_text(".env\n")
 
         info = None
@@ -106,17 +114,53 @@ class TestWorktreeIncludeSecurity:
 
             copied = Path(info["path"]) / ".env"
             assert copied.exists()
-            assert copied.read_text() == "SECRET=***\n"
+            got = copied.read_text()
+            want = (git_repo / ".env").read_text()
+            assert got == want, f"got={got!r} want={want!r}"
         finally:
             _force_remove_worktree(info)
+
+    def test_rejects_unignored_include_and_rolls_back_worktree(self, git_repo):
+        import cli as cli_mod
+
+        (git_repo / "local.txt").write_text("local state\n")
+        (git_repo / ".worktreeinclude").write_text("local.txt\n")
+
+        info = cli_mod._setup_worktree(str(git_repo))
+
+        assert info is None
+        worktrees = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert worktrees.count("worktree ") == 1
+        branches = subprocess.run(
+            ["git", "branch", "--list", "sinria/sinria-*"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert branches == ""
 
     def test_allows_valid_directory_include(self, git_repo):
         import cli as cli_mod
 
-        assets_dir = git_repo / ".venv" / "lib"
-        assets_dir.mkdir(parents=True)
-        (assets_dir / "marker.txt").write_text("venv marker")
-        (git_repo / ".worktreeinclude").write_text(".venv\n")
+        (git_repo / ".gitignore").write_text(".venv\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=git_repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "ignore local venv"],
+            cwd=git_repo,
+            check=True,
+            capture_output=True,
+        )
+        source_dir = git_repo / ".venv" / "lib"
+        source_dir.mkdir(parents=True)
+        (source_dir / "marker.txt").write_text("venv marker")
+        (git_repo / ".worktreeinclude").write_text(".venv/\n")
 
         info = None
         try:

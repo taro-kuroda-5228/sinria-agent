@@ -43,7 +43,7 @@ def test_archive_refuses_pinned(monkeypatch, capsys):
     assert called == []
     out = capsys.readouterr().out
     assert "pinned" in out.lower()
-    assert "hermes curator unpin" in out
+    assert "sinria curator unpin" in out
 
 
 def test_archive_calls_archive_skill(monkeypatch, capsys):

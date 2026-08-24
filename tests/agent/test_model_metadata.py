@@ -131,10 +131,10 @@ class TestDefaultContextLengths:
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "claude" not in key:
                 continue
-            # Claude 4.6+ models (4.6, 4.7) and Fable 5 (claude-fable-5) have
-            # 1M context at standard API pricing (no long-context premium).
+            # Claude 4.6+ models (4.6, 4.7, 4.8) and Fable 5 (claude-fable-5)
+            # have 1M context at standard API pricing (no long-context premium).
             # Older Claude 4.x and 3.x models cap at 200k.
-            if any(tag in key for tag in ("4.6", "4-6", "4.7", "4-7", "fable")):
+            if any(tag in key for tag in ("4.6", "4-6", "4.7", "4-7", "4.8", "4-8", "fable")):
                 assert value == 1000000, f"{key} should be 1000000"
             else:
                 assert value == 200000, f"{key} should be 200000"
@@ -246,6 +246,24 @@ class TestDefaultContextLengths:
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
+
+    def test_kimi_k3_has_1m_context(self):
+        """Kimi K3 ships a 1M context window. The specific ``kimi-k3`` entry
+        must beat the generic ``kimi`` 256K catch-all via longest-substring-
+        first matching, without over-matching other kimi ids."""
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
+
+        assert DEFAULT_CONTEXT_LENGTHS.get("kimi-k3") == 1_000_000
+        assert DEFAULT_CONTEXT_LENGTHS["kimi-k3"] > DEFAULT_CONTEXT_LENGTHS["kimi"]
+
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            assert get_model_context_length("kimi-k3") == 1_000_000
+            # Other kimi ids still fall through to the 256K ``kimi`` catch-all
+            # (the specific k3 entry must not over-match).
+            assert get_model_context_length("kimi-k2-unknown-xyz") == 262144
 
     def test_all_values_positive(self):
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
