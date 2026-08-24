@@ -39,6 +39,12 @@ strength; the per-test docstrings call out the specific regression each catches.
 
 from pathlib import Path
 import json
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    not Path("apps/chatops-crm/package.json").exists(),
+    reason="Sales Agent OS app overlay is not included in this distribution",
+)
 
 # Standalone-boundary modules: the cloud-schema TypeScript mirror that USED to
 # live in the Sales app. The shipped architecture forbids them here (the cloud

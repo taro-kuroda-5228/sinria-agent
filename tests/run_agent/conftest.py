@@ -32,3 +32,31 @@ def _fast_retry_backoff(monkeypatch):
         return
 
     monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _clear_hard_usage_limit_state():
+    """Each run_agent test should start from a clean hard-quota gate state."""
+    from agent.provider_quota_guard import clear_hard_usage_limits
+
+    clear_hard_usage_limits()
+    yield
+    clear_hard_usage_limits()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_model_provider_boundary(monkeypatch):
+    """Keep provider unit tests independent of the production trust registry.
+
+    Tests in this directory mock transport and never perform real network I/O.
+    Boundary Control behavior is covered by dedicated integration tests outside
+    this directory. A test that needs the real resolver can monkeypatch it again
+    locally after this fixture is applied.
+    """
+    from agent import sinria_egress
+
+    monkeypatch.setattr(
+        sinria_egress,
+        "_load_sinria_boundary_config",
+        lambda _agent: None,
+    )

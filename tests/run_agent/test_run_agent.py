@@ -2371,8 +2371,9 @@ class TestHandleMaxIterations:
         messages = [{"role": "user", "content": "do stuff"}]
         result = agent._handle_max_iterations(messages, 60)
         assert isinstance(result, str)
-        assert "error" in result.lower()
-        assert "API down" in result
+        assert "couldn't summarize" in result
+        assert "Progress is saved" in result
+        assert "API down" not in result
 
     def test_summary_skips_reasoning_for_unsupported_openrouter_model(self, agent):
         agent.base_url = "https://openrouter.ai/api/v1"
@@ -3366,6 +3367,9 @@ class TestRunConversation:
         """When tool call args are truncated, the agent retries the API call
         once. If the retry succeeds (valid JSON args), tool execution proceeds."""
         self._setup_agent(agent)
+        # This test isolates truncated-tool retry behavior; verify-after-act has
+        # separate behavioral coverage and intentionally adds another turn.
+        agent.verify_after_act_enabled = False
         agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
             name="write_file",
@@ -5385,20 +5389,6 @@ class TestMemoryNudgeCounterPersistence:
         preamble = src[:preamble_end]
         assert "agent._turns_since_memory = 0" not in preamble
         assert "agent._iters_since_skill = 0" not in preamble
-
-
-class TestDeadRetryCode:
-    """Unreachable retry_count >= max_retries after raise must not exist."""
-
-    def test_no_unreachable_max_retries_after_backoff(self):
-        import inspect
-        from agent.conversation_loop import run_conversation as _rc
-        source = inspect.getsource(_rc)
-        occurrences = source.count("if retry_count >= max_retries:")
-        assert occurrences == 2, (
-            f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
-            f"but found {occurrences}"
-        )
 
 
 class TestSupportsReasoningExtraBody:

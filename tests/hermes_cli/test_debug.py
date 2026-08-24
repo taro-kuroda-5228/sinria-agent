@@ -790,7 +790,7 @@ class TestRunDebug:
         run_debug(args)
 
         out = capsys.readouterr().out
-        assert "hermes debug" in out
+        assert "sinria debug" in out
         assert "share" in out
         assert "delete" in out
 
@@ -1128,7 +1128,7 @@ class TestRunDebugSweepsOnInvocation:
 
         # Default subcommand still printed help
         out = capsys.readouterr().out
-        assert "Usage: hermes debug" in out
+        assert "Usage: sinria debug" in out
 
 
 class TestRunDebugDelete:

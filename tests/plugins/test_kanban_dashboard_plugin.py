@@ -19,6 +19,12 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 
+_DASHBOARD_BUNDLE = Path(__file__).resolve().parents[2] / "plugins/kanban/dashboard/dist/index.js"
+pytestmark = pytest.mark.skipif(
+    not _DASHBOARD_BUNDLE.exists(),
+    reason="Kanban dashboard frontend bundle is not included in this distribution",
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures

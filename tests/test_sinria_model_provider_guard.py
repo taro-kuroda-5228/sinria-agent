@@ -20,6 +20,7 @@ def _agent(tmp_path, *, base_url="https://api.openai.com/v1", provider="openai",
         provider=provider,
         model="gpt-test",
         session_id="test-session",
+        sinria_boundary_config=False,
         sinria_egress_config=egress or ASK_EGRESS,
         sinria_egress_audit_path=Path(tmp_path) / "sinria-egress-audit.jsonl",
     )

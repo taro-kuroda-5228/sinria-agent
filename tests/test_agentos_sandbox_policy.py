@@ -213,7 +213,10 @@ def test_sandbox_required_ids_match_cloud_boundary():
     The hard invariant lives in two languages (cloud plane + local plane);
     this test fails the build when one side adds/removes a healthcare id.
     """
-    mjs = (ROOT / "apps" / "company-os" / "lib" / "cloud-boundary.mjs").read_text(
+    boundary_path = ROOT / "apps" / "company-os" / "lib" / "cloud-boundary.mjs"
+    if not boundary_path.exists():
+        pytest.skip("Company OS cloud boundary overlay is not included in this distribution")
+    mjs = boundary_path.read_text(
         encoding="utf-8"
     )
     match = re.search(r"SANDBOX_REQUIRED_AGENT_OS_IDS\s*=\s*\[([^\]]*)\]", mjs)

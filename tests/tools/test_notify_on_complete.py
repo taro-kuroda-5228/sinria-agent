@@ -22,10 +22,21 @@ from tools.process_registry import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _refresh_registry_types_after_collection_reloads():
+    global ProcessRegistry, ProcessSession
+    import tools.process_registry as process_registry_module
+
+    ProcessRegistry = process_registry_module.ProcessRegistry
+    ProcessSession = process_registry_module.ProcessSession
+
+
 @pytest.fixture()
 def registry():
     """Create a fresh ProcessRegistry."""
-    return ProcessRegistry()
+    import tools.process_registry as process_registry_module
+
+    return process_registry_module.ProcessRegistry()
 
 
 def _make_session(
@@ -36,8 +47,10 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
-) -> ProcessSession:
-    s = ProcessSession(
+):
+    import tools.process_registry as process_registry_module
+
+    s = process_registry_module.ProcessSession(
         id=sid,
         command=command,
         task_id=task_id,

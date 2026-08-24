@@ -449,6 +449,91 @@ def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(mon
     assert response.output[0].content[0].text == "create fallback ok"
 
 
+def test_large_codex_transport_failure_does_not_reupload_via_create_fallback(
+    monkeypatch,
+):
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        raise httpx.ReadTimeout("synthetic large-request timeout")
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("must not be sent")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(stream=_fake_stream, create=_fake_create)
+    )
+    kwargs = _codex_request_kwargs()
+    kwargs["input"][0]["content"] = "x" * 300_001
+
+    with pytest.raises(httpx.ReadTimeout, match="large-request timeout"):
+        agent._run_codex_stream(kwargs)
+
+    assert calls == {"stream": 1, "create": 0}
+
+
+def test_large_codex_incomplete_stream_does_not_reupload_via_create_fallback(
+    monkeypatch,
+):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Didn't receive a `response.completed` event.")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("must not be sent")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(stream=_fake_stream, create=_fake_create)
+    )
+    kwargs = _codex_request_kwargs()
+    kwargs["input"][0]["content"] = "x" * 300_001
+
+    with pytest.raises(RuntimeError, match="response.completed"):
+        agent._run_codex_stream(kwargs)
+
+    assert calls == {"stream": 1, "create": 0}
+
+
+def test_codex_create_stream_fallback_guards_final_retry_payload_before_send(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    sends = []
+    guarded = []
+
+    def fake_prepare(guard_agent, payload):
+        assert guard_agent is agent
+        guarded.append(payload)
+        assert payload["stream"] is True
+        raise RuntimeError("synthetic exact-payload guard failure")
+
+    monkeypatch.setattr(
+        "agent.sinria_egress.prepare_model_provider_payload",
+        fake_prepare,
+    )
+    client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: sends.append(kwargs))
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic exact-payload guard failure"):
+        agent._run_codex_create_stream_fallback(
+            _codex_request_kwargs(),
+            client=client,
+        )
+
+    assert len(guarded) == 1
+    assert sends == []
+
+
 def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0, "create": 0}
@@ -1035,17 +1120,79 @@ def test_preflight_codex_api_kwargs_rejects_unsupported_request_fields(monkeypat
 def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch):
     agent = _build_agent(monkeypatch)
     kwargs = _codex_request_kwargs()
-    kwargs["reasoning"] = {"effort": "high", "summary": "auto"}
+    kwargs["reasoning"] = {"effort": "max", "summary": "auto", "context": "auto", "mode": "pro"}
+    kwargs["text"] = {"verbosity": "high"}
     kwargs["include"] = ["reasoning.encrypted_content"]
     kwargs["temperature"] = 0.7
     kwargs["max_output_tokens"] = 4096
 
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs
     result = _preflight_codex_api_kwargs(kwargs)
-    assert result["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert result["reasoning"] == {"effort": "max", "summary": "auto", "context": "auto", "mode": "pro"}
+    assert result["text"] == {"verbosity": "high"}
     assert result["include"] == ["reasoning.encrypted_content"]
     assert result["temperature"] == 0.7
     assert result["max_output_tokens"] == 4096
+
+
+def test_preflight_codex_api_kwargs_allows_programmatic_tool_calling_opt_in(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["tools"] = [
+        {
+            "type": "function",
+            "name": "lookup_inventory",
+            "description": "Return stock for a SKU.",
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": {"sku": {"type": "string"}},
+                "required": ["sku"],
+                "additionalProperties": False,
+            },
+            "output_schema": {
+                "type": "object",
+                "properties": {"available_units": {"type": "number"}},
+                "required": ["available_units"],
+                "additionalProperties": False,
+            },
+            "allowed_callers": ["programmatic"],
+        },
+        {"type": "programmatic_tool_calling"},
+    ]
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+    assert result["tools"][0]["allowed_callers"] == ["programmatic"]
+    assert result["tools"][0]["output_schema"]["required"] == ["available_units"]
+    assert result["tools"][1] == {"type": "programmatic_tool_calling"}
+
+
+def test_preflight_codex_api_kwargs_rejects_invalid_text_verbosity(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["text"] = {"verbosity": "max"}
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    with pytest.raises(ValueError, match="text.verbosity"):
+        _preflight_codex_api_kwargs(kwargs)
+
+
+def test_preflight_codex_api_kwargs_rejects_invalid_programmatic_allowed_caller(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["tools"] = [
+        {
+            "type": "function",
+            "name": "lookup_inventory",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+            "allowed_callers": ["network"],
+        }
+    ]
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    with pytest.raises(ValueError, match="allowed_callers"):
+        _preflight_codex_api_kwargs(kwargs)
 
 
 def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
@@ -1563,8 +1710,8 @@ def test_run_conversation_codex_continues_after_ack_for_directory_listing_prompt
     assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1" for msg in result["messages"])
 
 
-def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
-    """Debug dumps should show /responses URL when in codex_responses mode."""
+def test_dump_api_request_debug_uses_responses_endpoint(monkeypatch, tmp_path):
+    """Metadata dumps identify /responses without retaining a full endpoint URL."""
     import json
     agent = _build_agent(monkeypatch)
     agent.base_url = "http://127.0.0.1:9208/v1"
@@ -1573,17 +1720,19 @@ def test_dump_api_request_debug_uses_responses_url(monkeypatch, tmp_path):
     dump_file = agent._dump_api_request_debug(_codex_request_kwargs(), reason="preflight")
 
     payload = json.loads(dump_file.read_text())
-    assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/responses"
+    assert payload["request"]["endpoint"] == "/responses"
+    assert "url" not in payload["request"]
 
 
-def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path):
-    """Debug dumps should show /chat/completions URL for chat_completions mode."""
+def test_dump_api_request_debug_uses_chat_completions_endpoint(monkeypatch, tmp_path):
+    """Metadata dumps identify /chat/completions without retaining a full URL."""
     import json
     _patch_agent_bootstrap(monkeypatch)
+    synthetic_credential = "synthetic" + "-credential"
     agent = run_agent.AIAgent(
         model="gpt-4o",
         base_url="http://127.0.0.1:9208/v1",
-        api_key="test-key",
+        api_key=synthetic_credential,
         quiet_mode=True,
         max_iterations=1,
         skip_context_files=True,
@@ -1597,7 +1746,8 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     )
 
     payload = json.loads(dump_file.read_text())
-    assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
+    assert payload["request"]["endpoint"] == "/chat/completions"
+    assert "url" not in payload["request"]
 
 
 # --- Reasoning-only response tests (fix for empty content retry loop) ---

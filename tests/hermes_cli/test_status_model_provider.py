@@ -98,9 +98,10 @@ def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path
     status_mod.show_status(SimpleNamespace(all=False, deep=False))
 
     out = capsys.readouterr().out
-    assert "Nous Tool Gateway" in out
+    # Default CLI name is sinria, which renders the Medical Horizon labels.
+    assert "Medical Horizon Tool Gateway" in out
     assert "Browser automation" in out
-    assert "active via Nous subscription" in out
+    assert "active via Medical Horizon subscription" in out
 
 
 def test_show_status_reports_managed_nous_features_with_sinria_branding(monkeypatch, capsys, tmp_path):

@@ -144,7 +144,7 @@ def test_nous_adapter_get_credential_refreshes_and_persists(tmp_path, monkeypatc
 def test_nous_adapter_get_credential_raises_when_not_logged_in(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = NousPortalAdapter()
-    with pytest.raises(RuntimeError, match="hermes login nous"):
+    with pytest.raises(RuntimeError, match="sinria login nous"):
         adapter.get_credential()
 
 
@@ -519,7 +519,7 @@ def test_cmd_proxy_start_refuses_when_unauthenticated(capsys, tmp_path, monkeypa
     rc = cmd_proxy_start(args)
     assert rc == 2
     err = capsys.readouterr().err
-    assert "hermes login nous" in err
+    assert "sinria login nous" in err
 
 
 def test_cmd_proxy_start_refuses_when_unauthenticated_uses_sinria(capsys, tmp_path, monkeypatch):

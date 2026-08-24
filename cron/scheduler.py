@@ -545,6 +545,8 @@ def _format_actionable_delivery(content: str) -> str:
     that needs the user's attention.
     """
     issue = str(content or "").strip() or "結果の本文がありません。"
+    if issue.startswith("☀️ Morning decision digest") or issue.startswith("☀️ 今日の確認"):
+        return issue
     return (
         f"**問題**\n{issue}\n\n"
         "**影響**\n"

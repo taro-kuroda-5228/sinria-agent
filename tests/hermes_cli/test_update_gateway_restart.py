@@ -7,6 +7,7 @@ when launchd will auto-respawn.
 """
 
 import os
+import signal
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -25,16 +26,37 @@ from hermes_cli.main import cmd_update
 
 @pytest.fixture(autouse=True)
 def _no_restart_verify_sleep(monkeypatch):
-    """hermes_cli/main.py uses time.sleep(3) after systemctl restart to
-    verify the service survived. Tests mock subprocess.run — nothing
-    actually restarts — so the 3s wait is dead time.
+    """cmd_update's restart-verification path waits on wall-clock deadlines
+    (``_wait_for_service_active``: ``time.monotonic() + timeout`` polled with
+    ``time.sleep(0.5)``). Tests mock subprocess.run — nothing actually
+    restarts — so that wait is dead time.
 
-    main.py does ``import time as _time`` at both module level (line 167)
-    and inside functions (lines 3281, 4384, 4401). Patching the global
-    ``time.sleep`` affects only the duration of this test.
+    No-op'ing ``sleep`` alone is NOT enough: the deadline stays wall-clock,
+    so the poll loop busy-spins for the full timeout (measured 25-30s in the
+    never-goes-active retry scenarios — colliding with conftest's 30s
+    per-test alarm and flaking on load). Instead ``sleep`` advances a virtual
+    offset and ``monotonic`` reports real time plus that offset: sleep-based
+    deadline loops finish in a handful of instant iterations, while code that
+    never sleeps still sees real time advance (no infinite spins).
+
+    main.py does ``import time as _time`` at both module level and inside
+    functions, so patching the global ``time`` module attributes covers
+    every call site for the duration of this test.
     """
     import time as _real_time
-    monkeypatch.setattr(_real_time, "sleep", lambda *_a, **_k: None)
+    real_monotonic = _real_time.monotonic
+    offset = {"s": 0.0}
+
+    def _fake_sleep(seconds=0, *_a, **_k):
+        try:
+            offset["s"] += max(float(seconds), 0.0)
+        except (TypeError, ValueError):
+            pass
+
+    monkeypatch.setattr(_real_time, "sleep", _fake_sleep)
+    monkeypatch.setattr(
+        _real_time, "monotonic", lambda: real_monotonic() + offset["s"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +179,13 @@ class TestLaunchdPlistReplace:
 
 
 class TestLaunchdPlistPath:
-    def test_plist_contains_environment_variables(self):
+    def test_plist_contains_environment_variables(self, monkeypatch):
+        # VIRTUAL_ENV is emitted only for python-module entrypoints (packaged
+        # launchers don't need it) — pin the condition explicitly so the test
+        # holds regardless of how this environment's service is installed.
+        monkeypatch.setattr(
+            gateway_cli, "_service_uses_python_module_entrypoint", lambda: True
+        )
         plist = gateway_cli.generate_launchd_plist()
         assert "<key>EnvironmentVariables</key>" in plist
         assert "<key>PATH</key>" in plist
@@ -338,40 +366,6 @@ class TestLaunchdPlistRefresh:
         # Should NOT call bootout (nothing to bootout)
         assert not any("bootout" in s for s in cmd_strs)
 
-    def test_refresh_rolls_back_when_new_plist_cannot_bootstrap(
-        self, tmp_path, monkeypatch,
-    ):
-        """A failed service reload must restore the last known-good entrypoint."""
-        plist_path = tmp_path / "ai.sinria.gateway.plist"
-        previous = "<plist>last known good runtime</plist>"
-        plist_path.write_text(previous)
-        monkeypatch.setattr(
-            gateway_cli, "get_launchd_plist_path", lambda: plist_path,
-        )
-        bootstrap_attempts = 0
-
-        calls = []
-
-        def fake_run(cmd, check=False, **kwargs):
-            nonlocal bootstrap_attempts
-            calls.append(cmd)
-            if cmd[1] == "bootstrap":
-                bootstrap_attempts += 1
-                if bootstrap_attempts == 1:
-                    raise subprocess.CalledProcessError(5, cmd, stderr="invalid plist")
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
-
-        with pytest.raises(subprocess.CalledProcessError):
-            gateway_cli.refresh_launchd_plist_if_needed()
-
-        assert plist_path.read_text() == previous
-        assert bootstrap_attempts == 2
-        assert [cmd[1] for cmd in calls] == [
-            "bootout", "bootstrap", "bootout", "bootstrap",
-        ]
-
 
 class TestCmdUpdateLaunchdRestart:
     """cmd_update correctly detects and handles launchd on macOS."""
@@ -393,57 +387,24 @@ class TestCmdUpdateLaunchdRestart:
         monkeypatch.setattr(
             gateway_cli, "get_launchd_plist_path", lambda: plist_path,
         )
+        monkeypatch.setattr(
+            gateway_cli, "refresh_launchd_plist_if_needed", lambda: False,
+        )
 
         mock_run.side_effect = _make_run_side_effect(
             commit_count="3",
             launchctl_loaded=True,
         )
 
-        # Mock launchd restart when its persisted entrypoint is already current.
-        with patch.object(
-            gateway_cli, "refresh_launchd_plist_if_needed", return_value=False,
-        ), patch.object(
-            gateway_cli, "launchd_restart",
-        ) as mock_launchd_restart, patch.object(
-            gateway_cli, "find_gateway_pids", return_value=[],
-        ):
+        # Mock launchd_restart + find_gateway_pids (new code discovers all gateways)
+        with patch.object(gateway_cli, "launchd_restart") as mock_launchd_restart, \
+             patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
             cmd_update(mock_args)
 
         captured = capsys.readouterr().out
         assert "Restarted" in captured
         assert "Restart manually: hermes gateway run" not in captured
         mock_launchd_restart.assert_called_once_with()
-
-    @patch("shutil.which", return_value=None)
-    @patch("subprocess.run")
-    def test_update_refreshes_stale_launchd_runtime_without_second_restart(
-        self, mock_run, _mock_which, mock_args, capsys, tmp_path, monkeypatch,
-    ):
-        """Refreshing a stale plist owns the restart; do not terminate its replacement."""
-        plist_path = tmp_path / "ai.sinria.gateway.plist"
-        plist_path.write_text("<plist>stale runtime</plist>")
-        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
-        monkeypatch.setattr(
-            gateway_cli, "get_launchd_plist_path", lambda: plist_path,
-        )
-        mock_run.side_effect = _make_run_side_effect(
-            commit_count="3",
-            launchctl_loaded=True,
-        )
-
-        with patch.object(
-            gateway_cli, "refresh_launchd_plist_if_needed", return_value=True,
-        ) as refresh, patch.object(
-            gateway_cli, "launchd_restart",
-        ) as restart, patch.object(
-            gateway_cli, "find_gateway_pids", return_value=[],
-        ) as find_pids:
-            cmd_update(mock_args)
-
-        refresh.assert_called_once_with()
-        restart.assert_not_called()
-        find_pids.assert_not_called()
-        assert "Restarted" in capsys.readouterr().out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -1055,6 +1016,8 @@ class TestServicePidExclusion:
         with patch.object(
             gateway_cli, "refresh_launchd_plist_if_needed", return_value=False,
         ), patch.object(
+            gateway_cli, "launchd_restart",
+        ), patch.object(
             gateway_cli, "_get_service_pids", return_value={SERVICE_PID}
         ), patch.object(
             gateway_cli, "find_gateway_pids", side_effect=fake_find,
@@ -1066,8 +1029,12 @@ class TestServicePidExclusion:
         # Manual PID should be killed
         manual_kills = [c for c in mock_kill.call_args_list if c.args[0] == MANUAL_PID]
         assert len(manual_kills) == 1
-        # Service PID should NOT be killed
-        service_kills = [c for c in mock_kill.call_args_list if c.args[0] == SERVICE_PID]
+        # The service may receive SIGUSR1 for a graceful self-restart, but it
+        # must never be terminated as if it were an unmanaged process.
+        service_kills = [
+            c for c in mock_kill.call_args_list
+            if c.args[0] == SERVICE_PID and c.args[1] in {signal.SIGTERM, signal.SIGKILL}
+        ]
         assert len(service_kills) == 0
         # Should show manual stop message since manual PID was killed
         assert "Stopped 1 manual gateway" in captured

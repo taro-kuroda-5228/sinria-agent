@@ -213,8 +213,10 @@ class TestInstallHangupProtection:
         try:
             # On Windows (no SIGHUP) we still wrap stdio and create the log.
             assert state["installed"] is True
-            assert isinstance(sys.stdout, _UpdateOutputStream)
-            assert isinstance(sys.stderr, _UpdateOutputStream)
+            import hermes_cli.main as current_main
+
+            assert isinstance(sys.stdout, current_main._UpdateOutputStream)
+            assert isinstance(sys.stderr, current_main._UpdateOutputStream)
             assert state["log_file"] is not None
 
             sys.stdout.write("checking mirror\n")
@@ -224,7 +226,9 @@ class TestInstallHangupProtection:
             assert log_path.exists()
             contents = log_path.read_text(encoding="utf-8")
             assert "checking mirror" in contents
-            assert "hermes update started" in contents
+            # Brand-agnostic: the banner uses the live CLI name (sinria in
+            # product, hermes only in legacy installs).
+            assert "update started" in contents
         finally:
             _finalize_update_output(state)
             # Sanity-check restoration

@@ -117,6 +117,11 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_developer_runtime_mode_not_exposed_by_distribution(self):
+        """The employee/customer distribution does not expose developer mode."""
+        resp = self.client.get("/api/runtime-mode")
+        assert resp.status_code == 404
+
     def test_get_status(self):
         resp = self.client.get("/api/status")
         assert resp.status_code == 200
@@ -667,7 +672,8 @@ class TestNewEndpoints:
         assert resp.status_code == 200
         assert resp.json()["command"] == "coder setup"
 
-    def test_profile_setup_command_uses_hermes_for_default_profile(self):
+    def test_profile_setup_command_uses_base_cli_for_default_profile(self):
+        """Default profile uses the base CLI command (sinria) with no env override."""
         from hermes_constants import get_hermes_home
 
         get_hermes_home().mkdir(parents=True, exist_ok=True)
@@ -675,7 +681,7 @@ class TestNewEndpoints:
         resp = self.client.get("/api/profiles/default/setup-command")
 
         assert resp.status_code == 200
-        assert resp.json()["command"] == "hermes setup"
+        assert resp.json()["command"] == "sinria setup"
 
     def test_profile_setup_command_uses_sinria_for_default_profile(self, monkeypatch):
         from hermes_constants import get_hermes_home
@@ -703,7 +709,7 @@ class TestNewEndpoints:
         assert resp.status_code == 200
         wrapper_path = wrapper_dir / "writer"
         assert wrapper_path.exists()
-        assert wrapper_path.read_text() == '#!/bin/sh\nexec hermes -p writer "$@"\n'
+        assert wrapper_path.read_text() == '#!/bin/sh\nexec sinria -p writer "$@"\n'
 
     def test_profiles_create_uses_sinria_wrapper_alias_when_safe(self, monkeypatch, tmp_path):
         import hermes_cli.profiles as profiles_mod
@@ -1677,6 +1683,18 @@ class TestNormaliseThemeDefinition:
             "palette": {"background": {"hex": "#000", "alpha": "not a number"}},
         })
         assert r["palette"]["background"]["alpha"] == 1.0
+
+
+class TestBuiltInThemeIdentity:
+    def test_user_visible_labels_use_sinria_identity(self):
+        from hermes_cli.web_server import _BUILTIN_DASHBOARD_THEMES
+
+        rendered_metadata = " ".join(
+            f"{theme['label']} {theme['description']}"
+            for theme in _BUILTIN_DASHBOARD_THEMES
+        )
+        assert "Hermes" not in rendered_metadata
+        assert _BUILTIN_DASHBOARD_THEMES[0]["label"].startswith("Sinria")
 
 
 class TestDiscoverUserThemes:

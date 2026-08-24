@@ -96,13 +96,22 @@ def test_codex_picker_uses_live_codex_catalog(hermes_auth_only_env, tmp_path, mo
         lambda access_token: [],
     )
 
+    # max_models must comfortably exceed the curated Codex catalog (12 as of
+    # the GPT-5.6 family addition) so total_models == len(models) stays a
+    # meaningful no-inflation check rather than tripping on truncation.
     providers = list_authenticated_providers(
         current_provider="openai-codex",
-        max_models=10,
+        max_models=32,
     )
 
     codex = next(p for p in providers if p["slug"] == "openai-codex")
     assert "gpt-5.3-codex-spark" in codex["models"]
+    # GPT-5.6 family is surfaced via forward-compat templates / curated list
+    # (live-verified against chatgpt.com/backend-api/codex on 2026-07-11:
+    # sol/terra/luna all accept requests; bare "gpt-5.6" must be renamed to
+    # gpt-5.6-sol on the wire by the transport).
+    for slug in ("gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        assert slug in codex["models"]
     assert codex["total_models"] == len(codex["models"])
 
 

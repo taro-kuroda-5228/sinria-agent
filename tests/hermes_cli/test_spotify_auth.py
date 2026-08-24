@@ -7,6 +7,41 @@ import pytest
 from hermes_cli import auth as auth_mod
 
 
+def test_spotify_client_id_prefers_sinria_env_over_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SINRIA_SPOTIFY_CLIENT_ID", "sinria-client")
+    monkeypatch.setenv("HERMES_SPOTIFY_CLIENT_ID", "legacy-client")
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "generic-client")
+
+    assert auth_mod._spotify_client_id() == "sinria-client"
+
+
+def test_spotify_client_id_keeps_legacy_env_as_hidden_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SINRIA_SPOTIFY_CLIENT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SPOTIFY_CLIENT_ID", "legacy-client")
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "generic-client")
+
+    assert auth_mod._spotify_client_id() == "legacy-client"
+
+
+def test_spotify_redirect_uri_prefers_sinria_env_over_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "SINRIA_SPOTIFY_REDIRECT_URI",
+        "http://127.0.0.1:43827/sinria/callback",
+    )
+    monkeypatch.setenv(
+        "HERMES_SPOTIFY_REDIRECT_URI",
+        "http://127.0.0.1:43827/legacy/callback",
+    )
+
+    assert auth_mod._spotify_redirect_uri() == "http://127.0.0.1:43827/sinria/callback"
+
+
 def test_store_provider_state_can_skip_active_provider() -> None:
     auth_store = {"active_provider": "nous", "providers": {}}
 
@@ -162,7 +197,7 @@ def test_spotify_interactive_setup_persists_client_id(
     monkeypatch: pytest.MonkeyPatch,
     capsys,
 ) -> None:
-    """The wizard writes HERMES_SPOTIFY_CLIENT_ID to .env and returns the value."""
+    """The wizard writes SINRIA_SPOTIFY_CLIENT_ID to .env and returns the value."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("builtins.input", lambda prompt="": "wizard-client-123")
     # Prevent actually opening the browser during tests.
@@ -177,8 +212,10 @@ def test_spotify_interactive_setup_persists_client_id(
     env_path = tmp_path / ".env"
     assert env_path.exists()
     env_text = env_path.read_text()
-    assert "HERMES_SPOTIFY_CLIENT_ID=wizard-client-123" in env_text
+    assert "SINRIA_SPOTIFY_CLIENT_ID=wizard-client-123" in env_text
+    assert "HERMES_SPOTIFY_CLIENT_ID" not in env_text
     # Default redirect URI should NOT be persisted.
+    assert "SINRIA_SPOTIFY_REDIRECT_URI" not in env_text
     assert "HERMES_SPOTIFY_REDIRECT_URI" not in env_text
 
     # Docs URL should appear in wizard output so users can find the guide.
@@ -203,4 +240,6 @@ def test_spotify_interactive_setup_empty_aborts(
 
     env_path = tmp_path / ".env"
     if env_path.exists():
-        assert "HERMES_SPOTIFY_CLIENT_ID" not in env_path.read_text()
+        env_text = env_path.read_text()
+        assert "SINRIA_SPOTIFY_CLIENT_ID" not in env_text
+        assert "HERMES_SPOTIFY_CLIENT_ID" not in env_text

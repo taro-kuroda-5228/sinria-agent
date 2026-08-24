@@ -44,8 +44,10 @@ dependencies = [
   "jinja2==3.1.6",
   "pydantic==2.12.5",
   "cryptography==46.0.7",
-  # Interactive CLI (prompt_toolkit is used directly by cli.py)
-  "prompt_toolkit==3.0.52",
+  "packaging==26.0",
+  # Native vision validates complete image containers before attaching bytes.
+  "pillow==12.3.0",
+  "prompt-toolkit==3.0.52",
   # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
   "croniter==6.0.0",
   # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)

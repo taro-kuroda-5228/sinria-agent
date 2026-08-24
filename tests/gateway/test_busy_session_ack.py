@@ -113,10 +113,41 @@ class TestBusySessionAck:
         result = await GatewayRunner._handle_message(runner, event)
 
         assert result is None
-        assert sk in adapter._pending_messages
-        assert adapter._pending_messages[sk] is event
+        adapter.enqueue_pending_message.assert_called_once_with(sk, event)
         assert sk not in runner._pending_messages
         running_agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_to_notification_interrupts_active_run_in_interrupt_mode(self):
+        """Anchored actions must not starve behind an unrelated active run."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter(platform_val="discord")
+        adapter.enqueue_pending_message = MagicMock()
+
+        event = _make_event(
+            text="2",
+            platform_val="discord",
+        )
+        event.reply_to_message_id = "notification-42"
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        handled = await GatewayRunner._handle_active_session_busy_message(
+            runner, event, sk
+        )
+
+        assert handled is True
+        adapter.enqueue_pending_message.assert_not_called()
+        assert adapter._pending_messages[sk] is event
+        running_agent.interrupt.assert_called_once_with("2")
+        ack = adapter._send_with_retry.call_args.kwargs["content"]
+        assert "Interrupting" in ack
 
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
@@ -233,13 +264,12 @@ class TestBusySessionAck:
         agent.steer = MagicMock(return_value=False)  # rejected
         runner._running_agents[sk] = agent
 
-        with patch("gateway.run.merge_pending_message_event") as mock_merge:
-            await runner._handle_active_session_busy_message(event, sk)
+        await runner._handle_active_session_busy_message(event, sk)
 
         agent.steer.assert_called_once()
         agent.interrupt.assert_not_called()
-        # Fell back to queue semantics: event was merged into pending messages
-        mock_merge.assert_called_once()
+        # Fell back to FIFO queue semantics without replacing earlier actions.
+        adapter.enqueue_pending_message.assert_called_once_with(sk, event)
 
         # Ack uses queue-mode wording (not steer, not interrupt)
         call_kwargs = adapter._send_with_retry.call_args
@@ -261,11 +291,10 @@ class TestBusySessionAck:
         # Agent is still being set up — sentinel in place
         runner._running_agents[sk] = sentinel
 
-        with patch("gateway.run.merge_pending_message_event") as mock_merge:
-            await runner._handle_active_session_busy_message(event, sk)
+        await runner._handle_active_session_busy_message(event, sk)
 
-        # Event was queued instead of steered
-        mock_merge.assert_called_once()
+        # Event was queued instead of steered.
+        adapter.enqueue_pending_message.assert_called_once_with(sk, event)
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")

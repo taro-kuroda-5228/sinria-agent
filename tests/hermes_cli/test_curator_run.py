@@ -84,7 +84,7 @@ def test_dry_run_default_reports_synchronous_wording(monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "When the report lands" not in out
-    assert "Read the report with `hermes curator status`" in out
+    assert "Read the report with `sinria curator status`" in out
 
 
 

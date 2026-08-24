@@ -812,7 +812,7 @@ class TestAuxiliaryPoolAwareness:
             patch("agent.auxiliary_client._resolve_nous_runtime_api", return_value=("fresh-agent-key", "https://inference-api.nousresearch.com/v1")),
         ):
             result = call_llm(
-                task="compression",
+                task="generic",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -1081,7 +1081,7 @@ class TestCallLlmPaymentFallback:
                     return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
-                    task="compression",
+                    task="generic",
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
@@ -2806,8 +2806,42 @@ class TestAuxUnhealthyCache:
                     return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
             assert _is_provider_unhealthy("openrouter") is False
             call_llm(
-                task="compression",
+                task="generic",
                 messages=[{"role": "user", "content": "hi"}],
             )
             # After the 402, OpenRouter is in the unhealthy cache.
+            assert _is_provider_unhealthy("openrouter") is True
+
+    def test_call_llm_marks_auto_provider_unhealthy_on_401(self, monkeypatch):
+        """Terminal auth failures enter the same process-local circuit breaker."""
+        from agent.auxiliary_client import call_llm, _is_provider_unhealthy
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        primary_client = MagicMock()
+        primary_client.base_url = "https://openrouter.ai/api/v1/"
+        class AuthError(Exception):
+            status_code = 401
+
+        err = AuthError("Authentication failed")
+        primary_client.chat.completions.create.side_effect = err
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock()
+        fallback_response.choices = [MagicMock(message=MagicMock(content="ok"))]
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "google/gemini-3-flash-preview")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(fallback_client, "n-model", "nous")), \
+             patch("agent.auxiliary_client._build_call_kwargs",
+                   return_value={"model": "n-model", "messages": [{"role": "user", "content": "hi"}]}):
+            assert _is_provider_unhealthy("openrouter") is False
+            response = call_llm(
+                task="generic",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            assert response is fallback_response
             assert _is_provider_unhealthy("openrouter") is True

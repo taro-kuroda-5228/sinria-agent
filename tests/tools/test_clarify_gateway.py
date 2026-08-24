@@ -57,20 +57,25 @@ class TestClarifyPrimitive:
         assert pending is not None
         assert pending.clarify_id == "id2"
 
-    def test_button_choice_does_not_auto_await(self):
-        """Multi-choice clarify should NOT be in text-capture mode initially."""
+    def test_button_choice_accepts_direct_typed_reply(self):
+        """A typed reply unblocks a choice prompt without clicking Other."""
         from tools import clarify_gateway as cm
 
         entry = cm.register("id3", "sk3", "Pick", ["X", "Y"])
         assert entry.awaiting_text is False
-        assert cm.get_pending_for_session("sk3") is None
+        pending = cm.get_pending_for_session("sk3")
+        assert pending is not None
+        assert pending.clarify_id == "id3"
+
+        assert cm.resolve_gateway_clarify("id3", "進めて") is True
+        assert cm.wait_for_response("id3", timeout=0.1) == "進めて"
 
     def test_other_button_flips_to_text_mode(self):
         """mark_awaiting_text makes get_pending_for_session find the entry."""
         from tools import clarify_gateway as cm
 
         cm.register("id4", "sk4", "Pick", ["X", "Y"])
-        assert cm.get_pending_for_session("sk4") is None
+        assert cm.get_pending_for_session("sk4") is not None
 
         flipped = cm.mark_awaiting_text("id4")
         assert flipped is True
@@ -167,6 +172,58 @@ class TestClarifyPrimitive:
         assert a is not None and a.clarify_id == "idA"
         assert b is not None and b.clarify_id == "idB"
 
+    def test_pending_text_reply_is_bound_to_requesting_user(self):
+        """Another participant in a shared channel cannot answer someone else's prompt."""
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "owned", "shared-session", "Proceed?", ["Yes"],
+            requester_user_id="user-a",
+        )
+
+        assert cm.get_pending_for_session(
+            "shared-session", requester_user_id="user-b",
+        ) is None
+        pending = cm.get_pending_for_session(
+            "shared-session", requester_user_id="user-a",
+        )
+        assert pending is not None
+        assert pending.clarify_id == "owned"
+
+    def test_owned_button_resolution_rejects_other_or_unknown_user(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "button-owned", "shared-session", "Proceed?", ["Yes"],
+            requester_user_id="user-a",
+        )
+
+        assert cm.resolve_gateway_clarify(
+            "button-owned", "Yes", requester_user_id="user-b",
+        ) is False
+        assert cm.resolve_gateway_clarify("button-owned", "Yes") is False
+        assert cm.resolve_gateway_clarify(
+            "button-owned", "Yes", requester_user_id="user-a",
+        ) is True
+
+    def test_missing_owner_id_fails_closed(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "missing-owner", "shared-session", "Proceed?", ["Yes"],
+            requester_user_id="",
+        )
+
+        assert cm.get_pending_for_session(
+            "shared-session", requester_user_id="",
+        ) is None
+        assert cm.resolve_gateway_clarify(
+            "missing-owner", "Yes", requester_user_id="",
+        ) is False
+        assert cm.mark_awaiting_text(
+            "missing-owner", requester_user_id="",
+        ) is False
+
     def test_clarify_timeout_config_default(self):
         """get_clarify_timeout returns 600 by default."""
         from tools import clarify_gateway as cm
@@ -184,9 +241,8 @@ class TestGatewayTextIntercept:
     def setup_method(self):
         _clear_clarify_state()
 
-    def test_get_pending_for_session_returns_oldest_text_awaiting(self):
-        """When two clarifies are pending, get_pending_for_session returns the
-        first that is awaiting_text (the older one if both)."""
+    def test_get_pending_for_session_returns_oldest_unresolved(self):
+        """When two clarifies are pending, return the oldest unresolved one."""
         from tools import clarify_gateway as cm
 
         # Older multi-choice (not awaiting text)
@@ -197,7 +253,7 @@ class TestGatewayTextIntercept:
         pending = cm.get_pending_for_session("sk")
         # The newer one is awaiting text; the older isn't.
         assert pending is not None
-        assert pending.clarify_id == "second"
+        assert pending.clarify_id == "first"
 
         # Now flip the first to text mode too.  Both are awaiting text,
         # FIFO returns the older one.

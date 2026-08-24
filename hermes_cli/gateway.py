@@ -3232,6 +3232,9 @@ def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
+    # Leave teardown headroom beyond the gateway-owned drain deadline so a
+    # successful graceful restart is not misreported as a timeout.
+    restart_wait_timeout = drain_timeout + 15.0
     from gateway.status import get_running_pid
 
     try:
@@ -3240,11 +3243,11 @@ def launchd_restart():
             print("✓ Service restart requested")
             return
         if pid is not None:
-            exited = _graceful_restart_via_sigusr1(pid, drain_timeout)
+            exited = _graceful_restart_via_sigusr1(pid, restart_wait_timeout)
             if not exited:
                 raise RuntimeError(
                     f"Gateway PID {pid} did not complete graceful restart within "
-                    f"{drain_timeout:.0f}s; no force restart was issued"
+                    f"{restart_wait_timeout:.0f}s; no force restart was issued"
                 )
         subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service restarted")

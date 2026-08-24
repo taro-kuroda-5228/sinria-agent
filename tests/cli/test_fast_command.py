@@ -410,10 +410,13 @@ class TestAnthropicFastModeAdapter(unittest.TestCase):
     """Verify build_anthropic_kwargs handles fast_mode parameter."""
 
     def test_fast_mode_adds_speed_and_beta(self):
+        # Opus 4.8 is the durable fast-capable tier; Opus 4.6 fast has been
+        # retired (sending speed:"fast" to 4.6 now 400s and is no longer
+        # allow-listed in _FAST_MODE_SUPPORTED_SUBSTRINGS).
         from agent.anthropic_adapter import build_anthropic_kwargs, _FAST_MODE_BETA
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-4-8",
             messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
             tools=None,
             max_tokens=None,
@@ -461,7 +464,7 @@ class TestAnthropicFastModeAdapter(unittest.TestCase):
         from agent.anthropic_adapter import build_anthropic_kwargs
 
         kwargs = build_anthropic_kwargs(
-            model="claude-opus-4-6",
+            model="claude-opus-4-8",
             messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
             tools=None,
             max_tokens=None,

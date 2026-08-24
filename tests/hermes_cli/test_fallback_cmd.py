@@ -133,7 +133,7 @@ class TestListCommand:
         cmd_fallback_list(types.SimpleNamespace())
         out = capsys.readouterr().out
         assert "No fallback providers configured" in out
-        assert "hermes fallback add" in out
+        assert "sinria fallback add" in out
 
     def test_list_empty_uses_sinria_hint(self, isolated_home, capsys, monkeypatch):
         monkeypatch.setenv("HERMES_CLI_NAME", "sinria")

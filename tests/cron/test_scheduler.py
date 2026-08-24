@@ -3,13 +3,36 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _finalize_notification_state,
+    _format_actionable_delivery,
+    _plan_cron_notification,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    run_job,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+def test_structured_morning_digest_is_not_wrapped_in_generic_decision_copy():
+    digest = """☀️ 今日の確認 1件
+
+**提案資料の外部送信**
+- 求める判断: 外部送信を実行してよいか
+- 判断材料: 顧客候補へ送信する前の確認です。
+- 選択後: 承認 → 外部送信を実行 / 却下 → 実行せず終了"""
+
+    assert _format_actionable_delivery(digest) == digest
 
 
 class TestResolveOrigin:
@@ -441,10 +464,10 @@ class TestRoutingIntents:
 
 
 class TestDeliverResultWrapping:
-    """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
+    """Verify that cron deliveries lead with the decision, not scheduler internals."""
 
-    def test_delivery_wraps_content_with_header_and_footer(self):
-        """Delivered content should include task name header and agent-invisible note."""
+    def test_delivery_wraps_content_with_actionable_headings(self):
+        """Default delivery should expose the issue, impact, and required decision first."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -464,14 +487,120 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
-        assert "Here is today's summary." in sent_content
-        assert "To stop or manage this job" in sent_content
+        assert sent_content.startswith("**問題**\nHere is today's summary.")
+        assert "**影響**" in sent_content
+        assert "**必要判断**" in sent_content
+        assert "Cronjob Response" not in sent_content
+        assert "job_id" not in sent_content
+        assert "To stop or manage this job" not in sent_content
 
-    def test_delivery_uses_job_id_when_no_name(self):
-        """When a job has no name, the wrapper should fall back to job id."""
+    def test_live_discord_adapter_receives_bound_action_context(self):
+        """Discord live delivery must bind buttons to the complete visible notification."""
+        from gateway.config import Platform
+
+        class ActionableAdapter:
+            async def send_cron_action(self, chat_id, content, action_context, metadata=None):
+                return MagicMock(success=True)
+
+        adapter = ActionableAdapter()
+        adapter.send_cron_action = AsyncMock(return_value=MagicMock(success=True))
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock(platforms={Platform.DISCORD: pconfig})
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        job = {
+            "id": "job-42",
+            "name": "system-check",
+            "deliver": "discord:12345",
+            "decision_required": True,
+            "resume_instruction": "Complete every unfinished work item and verify each result.",
+            "origin": {"platform": "discord", "chat_id": "12345", "user_id": "77"},
+        }
+
+        future = MagicMock()
+        future.result.return_value = MagicMock(success=True)
+        def schedule(coro, _loop):
+            coro.close()
+            return future
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("hermes_cli.profiles.get_active_profile_name", return_value="work"), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=schedule):
+
+            from cron.scheduler import _deliver_result
+            error = _deliver_result(
+                job,
+                "Database connection failed",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+            )
+
+        assert error is None
+        from cron.action_runtime import CronActionState, CronActionStore
+
+        action_store = CronActionStore()
+        try:
+            work_actions = action_store.list_actions(
+                states={CronActionState.AWAITING_DECISION},
+                profile="work",
+            )
+        finally:
+            action_store.close()
+        assert len(work_actions) == 1
+        kwargs = adapter.send_cron_action.call_args.kwargs
+        assert kwargs["action_context"]["job_id"] == "job-42"
+        assert kwargs["action_context"]["job_name"] == "system-check"
+        assert kwargs["action_context"]["resume_instruction"] == (
+            "Complete every unfinished work item and verify each result."
+        )
+        assert kwargs["action_context"]["notification"] == adapter.send_cron_action.call_args.args[1]
+        assert "Database connection failed" in kwargs["action_context"]["notification"]
+
+    def test_live_discord_informational_delivery_has_no_action_buttons(self):
+        """Successful informational output must use the ordinary transport."""
+        from gateway.config import Platform
+
+        class Adapter:
+            async def send(self, chat_id, content, metadata=None):
+                return MagicMock(success=True, message_id="m-1")
+
+            async def send_cron_action(self, chat_id, content, action_context, metadata=None):
+                raise AssertionError("informational deliveries must not create actions")
+
+        adapter = Adapter()
+        adapter.send = AsyncMock(return_value=MagicMock(success=True, message_id="m-1"))
+        adapter.send_cron_action = AsyncMock()
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock(platforms={Platform.DISCORD: pconfig})
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        job = {
+            "id": "job-info",
+            "name": "daily-summary",
+            "deliver": "discord:12345",
+            "decision_required": False,
+        }
+
+        future = MagicMock()
+        future.result.return_value = MagicMock(success=True, message_id="m-1")
+        def schedule(coro, _loop):
+            coro.close()
+            return future
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=schedule):
+            from cron.scheduler import _deliver_result
+            assert _deliver_result(
+                job,
+                "Daily summary complete",
+                adapters={Platform.DISCORD: adapter},
+                loop=loop,
+            ) is None
+
+        adapter.send.assert_called_once()
+        adapter.send_cron_action.assert_not_called()
+
+    def test_delivery_without_name_still_hides_scheduler_metadata(self):
+        """Unnamed jobs should not leak internal identifiers into the user-facing result."""
         from gateway.config import Platform
 
         pconfig = MagicMock()
@@ -489,7 +618,8 @@ class TestDeliverResultWrapping:
             _deliver_result(job, "Output.")
 
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: abc-123" in sent_content
+        assert sent_content.startswith("**問題**\nOutput.")
+        assert "abc-123" not in sent_content
 
     def test_delivery_skips_wrapping_when_config_disabled(self):
         """When cron.wrap_response is false, deliver raw content without header/footer."""
@@ -882,6 +1012,55 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_run_job_resumes_exact_source_session_without_rerunning_script(self, tmp_path):
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "original",
+            "script": "collector.py",
+        }
+        fake_db = MagicMock()
+        history = [{"role": "user", "content": "original"}, {"role": "assistant", "content": "blocked"}]
+        fake_db.get_messages_as_conversation.return_value = history
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("cron.scheduler._run_job_script") as run_script, \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "SINRIA_ACTION_VERIFIED"}
+            mock_agent_cls.return_value = mock_agent
+            success, _output, final_response, error = run_job(
+                job,
+                resume_session_id="cron_test-job_source",
+                continuation_prompt="continue exact workflow",
+                skip_delivery=True,
+            )
+
+        assert success is True
+        assert error is None
+        assert final_response == "SINRIA_ACTION_VERIFIED"
+        run_script.assert_not_called()
+        assert mock_agent_cls.call_args.kwargs["session_id"] == "cron_test-job_source"
+        fake_db.get_messages_as_conversation.assert_called_once_with(
+            "cron_test-job_source",
+            include_ancestors=True,
+        )
+        call = mock_agent.run_conversation.call_args
+        assert call.args[0] == "continue exact workflow"
+        assert call.kwargs["conversation_history"] == history
 
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
@@ -2419,3 +2598,249 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+class TestCronNotificationPolicy:
+    NOW = datetime(2026, 7, 28, 6, 0, tzinfo=timezone.utc)
+
+    def test_first_failure_is_immediate_and_actionable(self):
+        plan = _plan_cron_notification(
+            {"id": "bridge", "name": "Company OS Bridge", "last_status": "ok"},
+            success=False,
+            content="",
+            error="connection refused",
+            now=self.NOW,
+        )
+
+        assert plan["deliver"] is True
+        assert plan["kind"] == "failure"
+        assert plan["content"].splitlines() == [
+            "🔴 **Company OS Bridgeが失敗**",
+            "connection refused",
+            "自動再試行を継続します",
+        ]
+        assert plan["state"]["failure_count"] == 1
+
+    def test_identical_repeated_failure_is_deduplicated(self):
+        job = {
+            "id": "bridge",
+            "name": "Company OS Bridge",
+            "last_status": "error",
+            "notification_state": {
+                "kind": "failure",
+                "fingerprint": "8d3f6b37b9b8e3dd",
+                "failure_count": 1,
+                "first_seen_at": "2026-07-28T05:00:00+00:00",
+                "last_notified_at": "2026-07-28T05:00:00+00:00",
+            },
+        }
+        with patch("cron.scheduler._notification_fingerprint", return_value="8d3f6b37b9b8e3dd"):
+            plan = _plan_cron_notification(
+                job,
+                success=False,
+                content="",
+                error="connection refused",
+                now=self.NOW,
+            )
+
+        assert plan["deliver"] is False
+        assert plan["kind"] == "failure"
+        assert plan["state"]["failure_count"] == 2
+        assert plan["state"]["last_notified_at"] == "2026-07-28T05:00:00+00:00"
+
+    def test_changed_failure_is_not_hidden_by_deduplication(self):
+        job = {
+            "id": "bridge",
+            "name": "Company OS Bridge",
+            "last_status": "error",
+            "notification_state": {
+                "kind": "failure",
+                "fingerprint": "old",
+                "failure_count": 2,
+                "first_seen_at": "2026-07-28T04:00:00+00:00",
+                "last_notified_at": "2026-07-28T05:00:00+00:00",
+            },
+        }
+
+        plan = _plan_cron_notification(
+            job,
+            success=False,
+            content="",
+            error="authentication failed",
+            now=self.NOW,
+        )
+
+        assert plan["deliver"] is True
+        assert "authentication failed" in plan["content"]
+        assert plan["state"]["failure_count"] == 1
+
+    def test_recovery_is_delivered_even_when_success_output_is_silent(self):
+        job = {
+            "id": "bridge",
+            "name": "Company OS Bridge",
+            "last_status": "error",
+            "notification_state": {
+                "kind": "failure",
+                "fingerprint": "old",
+                "failure_count": 3,
+                "first_seen_at": "2026-07-28T05:00:00+00:00",
+                "last_notified_at": "2026-07-28T05:00:00+00:00",
+            },
+        }
+
+        plan = _plan_cron_notification(
+            job,
+            success=True,
+            content=SILENT_MARKER,
+            error=None,
+            now=self.NOW,
+        )
+
+        assert plan["deliver"] is True
+        assert plan["kind"] == "recovery"
+        assert plan["content"].splitlines() == [
+            "✅ **Company OS Bridgeが復旧**",
+            "3回の失敗後に正常へ戻りました",
+        ]
+        assert plan["state"]["kind"] == "ok"
+
+    def test_recovery_preserves_meaningful_terminal_result(self):
+        job = {
+            "id": "bridge",
+            "name": "Company OS Bridge",
+            "last_status": "error",
+            "notification_state": {"kind": "failure", "failure_count": 2},
+        }
+
+        plan = _plan_cron_notification(
+            job,
+            success=True,
+            content="未処理1件を再開し、完了しました。",
+            error=None,
+            now=self.NOW,
+        )
+
+        assert plan["content"].splitlines() == [
+            "✅ **Company OS Bridgeが復旧**",
+            "2回の失敗後に正常へ戻りました",
+            "未処理1件を再開し、完了しました。",
+        ]
+
+    def test_failed_delivery_does_not_start_deduplication_window(self):
+        job = {"notification_state": {"kind": "failure", "last_notified_at": "2026-07-28T04:00:00+00:00"}}
+        plan = {
+            "deliver": True,
+            "state": {
+                "kind": "failure",
+                "fingerprint": "new",
+                "failure_count": 2,
+                "last_notified_at": "2026-07-28T06:00:00+00:00",
+            },
+        }
+
+        state = _finalize_notification_state(job, plan, delivery_error="discord unavailable")
+
+        assert state["last_notified_at"] == "2026-07-28T04:00:00+00:00"
+
+    def test_first_failed_delivery_removes_unreceived_notification_timestamp(self):
+        plan = {
+            "deliver": True,
+            "state": {
+                "kind": "failure",
+                "fingerprint": "new",
+                "failure_count": 1,
+                "last_notified_at": "2026-07-28T06:00:00+00:00",
+            },
+        }
+
+        state = _finalize_notification_state({}, plan, delivery_error="discord unavailable")
+
+        assert "last_notified_at" not in state
+
+    def test_explicit_approval_is_compact_and_never_claims_execution(self):
+        plan = _plan_cron_notification(
+            {
+                "id": "release",
+                "name": "Release",
+                "last_status": "ok",
+                "decision_required": True,
+            },
+            success=True,
+            content="外部公開は承認待ちです。承認または却下してください。",
+            error=None,
+            now=self.NOW,
+        )
+
+        assert plan["deliver"] is True
+        assert plan["kind"] == "approval"
+        assert plan["content"].splitlines() == [
+            "🔐 **Release — 承認が必要**",
+            "外部公開は承認待ちです。承認または却下してください。",
+            "未承認の操作は実行しません",
+        ]
+
+    def test_repeated_identical_approval_is_collapsed_until_reminder_window(self):
+        content = "外部公開は承認待ちです。承認または却下してください。"
+        job = {
+            "id": "release",
+            "name": "Release",
+            "decision_required": True,
+            "notification_state": {
+                "kind": "approval",
+                "fingerprint": "approval-hash",
+                "last_notified_at": "2026-07-28T05:00:00+00:00",
+            },
+        }
+        with patch("cron.scheduler._notification_fingerprint", return_value="approval-hash"):
+            plan = _plan_cron_notification(
+                job,
+                success=True,
+                content=content,
+                error=None,
+                now=self.NOW,
+            )
+
+        assert plan["kind"] == "approval"
+        assert plan["deliver"] is False
+        assert plan["state"]["last_notified_at"] == "2026-07-28T05:00:00+00:00"
+
+    def test_legacy_approval_words_do_not_create_executable_authority(self):
+        report = "\n".join(
+            [
+                "**何の報告**: Company OS Bridge Worker",
+                "**判定**: 🟡注意 — 1件を承認待ちで安全停止しました",
+                "**問題**: 外部送信を未実行で停止しています。",
+                "**数値の解釈**: 対象1件、未承認実行0件です。",
+                "**次に行うこと**: 承認または却下してください。",
+            ]
+        )
+
+        plan = _plan_cron_notification(
+            {"id": "bridge", "name": "Company OS Bridge"},
+            success=True,
+            content=report,
+            error=None,
+            now=self.NOW,
+        )
+
+        assert plan["kind"] == "info"
+        assert plan["content"].splitlines() == [
+            "🟡 **Company OS Bridge Worker — 確認が必要**",
+            "外部送信を未実行で停止しています。",
+            "対象1件、未承認実行0件です。",
+            "承認または却下してください。",
+        ]
+
+    def test_informational_report_keeps_full_body_under_compact_heading(self):
+        body = "対象12件を確認しました。\n詳細: 変更2件"
+        plan = _plan_cron_notification(
+            {"id": "daily", "name": "日次レポート", "last_status": "ok"},
+            success=True,
+            content=body,
+            error=None,
+            now=self.NOW,
+        )
+
+        assert plan["deliver"] is True
+        assert plan["kind"] == "info"
+        assert plan["content"] == "ℹ️ **日次レポート**\n" + body

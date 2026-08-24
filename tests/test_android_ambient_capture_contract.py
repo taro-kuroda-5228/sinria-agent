@@ -1,10 +1,17 @@
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "apps" / "android-ambient-capture"
 DOC_DIR = ROOT / "docs" / "ambient-capture"
 AGENT_DIR = ROOT / "agent" / "ambient_capture"
+
+pytestmark = pytest.mark.skipif(
+    not (APP_DIR.exists() and DOC_DIR.exists() and AGENT_DIR.exists()),
+    reason="ambient-capture product overlay is not included in the public distribution",
+)
 
 
 def read_text(path: Path) -> str:
@@ -69,6 +76,32 @@ def test_android_smoke_script_exports_only_encrypted_bundles_then_runs_local_ing
     assert "--local-only" in script
     assert "temp-recordings" not in script
     assert "pull" not in script
+
+
+def test_android_smoke_uses_debug_only_control_activity_not_exported_microphone_service():
+    script = read_text(ROOT / "scripts" / "sinria_ambient_capture_android_smoke.sh")
+    main_manifest = read_text(APP_DIR / "app" / "src" / "main" / "AndroidManifest.xml")
+    debug_manifest = read_text(APP_DIR / "app" / "src" / "debug" / "AndroidManifest.xml")
+    smoke_activity = read_text(
+        APP_DIR
+        / "app"
+        / "src"
+        / "debug"
+        / "java"
+        / "com"
+        / "sinria"
+        / "ambientcapture"
+        / "SmokeControlActivity.kt"
+    )
+
+    assert 'android:name=".AmbientCaptureService"' in main_manifest
+    assert 'android:exported="false"' in main_manifest
+    assert 'android:name=".SmokeControlActivity"' in debug_manifest
+    assert 'android:exported="true"' in debug_manifest
+    assert "/.SmokeControlActivity" in script
+    assert "start-foreground-service -n \"$SERVICE\"" not in script
+    assert "Intent(this, AmbientCaptureService::class.java)" in smoke_activity
+    assert "startForegroundService" in smoke_activity
 
 
 def test_local_runtime_layout_is_outside_git_and_data_classes_are_guarded():

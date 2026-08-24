@@ -497,7 +497,9 @@ class TestBlockingApprovalE2E:
         t.join(timeout=10)
 
         assert result_holder[0]["approved"] is False
-        assert "timed out" in result_holder[0]["message"]
+        assert result_holder[0]["status"] == "approval_required"
+        assert result_holder[0]["reason_code"] == "approval_wait_timeout"
+        assert "timed out" not in result_holder[0]["message"]
         unregister_gateway_notify(session_key)
 
     def test_parallel_subagent_approvals(self):

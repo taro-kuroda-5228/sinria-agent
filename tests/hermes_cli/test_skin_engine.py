@@ -37,7 +37,9 @@ class TestSkinConfig:
     def test_get_branding_with_fallback(self):
         from hermes_cli.skin_engine import load_skin
         skin = load_skin("default")
-        assert skin.get_branding("agent_name") == "Sinria"
+        # The default CLI name is "sinria", so the shipped default branding is
+        # rewritten by _apply_cli_branding_aliases to "Sinria Agent".
+        assert skin.get_branding("agent_name") == "Sinria Agent"
         assert skin.get_branding("nonexistent", "fallback") == "fallback"
 
     def test_get_spinner_wings_empty_for_default(self):
@@ -158,27 +160,29 @@ class TestSkinManagement:
         assert get_active_skin_name() == "ares"
 
     def test_init_skin_from_empty_config(self):
+        # Under the default "sinria" CLI name, an unset skin resolves to the
+        # builtin "sinria" skin instead of "default".
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({})
-        assert get_active_skin_name() == "default"
+        assert get_active_skin_name() == "sinria"
 
     def test_init_skin_from_null_display(self):
-        """display: null should fall back to default, not crash."""
+        """display: null should fall back to the CLI default skin, not crash."""
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({"display": None})
-        assert get_active_skin_name() == "default"
+        assert get_active_skin_name() == "sinria"
 
     def test_init_skin_from_non_dict_display(self):
-        """display: <non-dict> should fall back to default."""
+        """display: <non-dict> should fall back to the CLI default skin."""
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin_name
         init_skin_from_config({"display": "invalid"})
-        assert get_active_skin_name() == "default"
+        assert get_active_skin_name() == "sinria"
 
         init_skin_from_config({"display": 42})
-        assert get_active_skin_name() == "default"
+        assert get_active_skin_name() == "sinria"
 
         init_skin_from_config({"display": []})
-        assert get_active_skin_name() == "default"
+        assert get_active_skin_name() == "sinria"
 
 
 class TestUserSkins:
@@ -264,7 +268,9 @@ class TestUserSkins:
 
         assert skin.name == "broken"
         assert skin.get_color("banner_title") == "#FFD700"
-        assert skin.get_branding("agent_name") == "Sinria"
+        # Invalid branding section falls back to the shipped default branding,
+        # which the default "sinria" CLI name aliases to "Sinria Agent".
+        assert skin.get_branding("agent_name") == "Sinria Agent"
         assert skin.spinner.get("waiting_faces", []) == []
         assert skin.tool_emojis == {}
         assert skin.tool_prefix == "!"

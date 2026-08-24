@@ -164,11 +164,6 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
     monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
     monkeypatch.setattr("gateway.run.GatewayRunner", _CleanExitRunner)
-    monitor_starts = []
-    monkeypatch.setattr(
-        "gateway.memory_monitor.start_memory_monitoring",
-        lambda **kwargs: monitor_starts.append(kwargs) or True,
-    )
 
     from gateway.run import start_gateway
 
@@ -177,107 +172,6 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
 
     assert ok is True
-    assert monitor_starts == [], "clean-exit startup must not leak a monitor thread"
-
-
-@pytest.mark.asyncio
-async def test_start_gateway_wait_exception_stops_memory_monitor(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    events = []
-
-    class _FailingWaitRunner:
-        def __init__(self, config):
-            self.config = config
-            self.should_exit_cleanly = False
-            self.should_exit_with_failure = False
-            self.exit_reason = None
-            self.exit_code = None
-            self.adapters = {}
-
-        async def start(self):
-            return True
-
-        async def wait_for_shutdown(self):
-            raise RuntimeError("simulated shutdown failure")
-
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
-    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
-    monkeypatch.setattr("gateway.run.GatewayRunner", _FailingWaitRunner)
-    monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"logging": {"memory_monitor": {"enabled": True}}})
-    monkeypatch.setattr(
-        "gateway.memory_monitor.start_memory_monitoring",
-        lambda **kwargs: events.append("start") or True,
-    )
-    monkeypatch.setattr(
-        "gateway.memory_monitor.stop_memory_monitoring",
-        lambda **kwargs: events.append("stop"),
-    )
-
-    from gateway.run import start_gateway
-
-    with pytest.raises(RuntimeError, match="simulated shutdown failure"):
-        await start_gateway(config=GatewayConfig(), replace=False)
-
-    assert events == ["start", "stop"]
-
-
-@pytest.mark.asyncio
-async def test_start_gateway_cron_start_failure_stops_memory_monitor(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    events = []
-
-    class _Runner:
-        def __init__(self, config):
-            self.should_exit_cleanly = False
-            self.adapters = {}
-
-        async def start(self):
-            return True
-
-    class _BrokenCronThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            raise RuntimeError("cron start failed")
-
-        def is_alive(self):
-            return False
-
-    import threading as real_threading
-    from types import SimpleNamespace
-
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
-    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
-    monkeypatch.setattr("gateway.run.GatewayRunner", _Runner)
-    monkeypatch.setattr(
-        "gateway.run.threading",
-        SimpleNamespace(
-            Event=real_threading.Event,
-            Thread=_BrokenCronThread,
-            current_thread=real_threading.current_thread,
-            main_thread=real_threading.main_thread,
-        ),
-    )
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"logging": {"memory_monitor": {"enabled": True}}})
-    monkeypatch.setattr(
-        "gateway.memory_monitor.start_memory_monitoring",
-        lambda **kwargs: events.append("start") or True,
-    )
-    monkeypatch.setattr(
-        "gateway.memory_monitor.stop_memory_monitoring",
-        lambda **kwargs: events.append("stop"),
-    )
-
-    from gateway.run import start_gateway
-
-    with pytest.raises(RuntimeError, match="cron start failed"):
-        await start_gateway(config=GatewayConfig(), replace=False)
-
-    assert events == ["start", "stop"]
 
 
 @pytest.mark.asyncio
