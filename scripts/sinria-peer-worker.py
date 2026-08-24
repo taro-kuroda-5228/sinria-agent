@@ -45,12 +45,33 @@ def command_adapter(name, *, mode):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--once', action='store_true')
+    p.add_argument('--preflight', action='store_true', help='verify transport identity and polling without executing work')
     p.add_argument('--mode', choices=('executor','validator'), default=os.environ.get('PEER_MODE','executor'))
     a = p.parse_args()
-    required = ('COMPANY_OS_BASE_URL','COMPANY_OS_MEMBER_ID','COMPANY_OS_INSTANCE_ID','COMPANY_OS_TRANSPORT_SUBJECT')
+    required = ('COMPANY_OS_BASE_URL','COMPANY_OS_MEMBER_ID','COMPANY_OS_INSTANCE_ID','COMPANY_OS_TRANSPORT_SUBJECT','SINRIA_COMPANY_OS_TRANSPORT_TOKEN')
     if not all(os.environ.get(x) for x in required): p.error('peer worker requires explicit Company OS identity configuration')
-    client = CompanyOsTransportClient(os.environ['COMPANY_OS_BASE_URL'])
+    client = CompanyOsTransportClient(
+        os.environ['COMPANY_OS_BASE_URL'],
+        token_env='SINRIA_COMPANY_OS_TRANSPORT_TOKEN',
+    )
     ident = CompanyOsTransportIdentity(os.environ['COMPANY_OS_TRANSPORT_SUBJECT'], os.environ['COMPANY_OS_MEMBER_ID'], os.environ['COMPANY_OS_INSTANCE_ID'])
+    if a.preflight:
+        canary = client.canary(ident)
+        listed = client.list_conversation_runs(
+            ident,
+            targetMemberId=ident.member_id,
+            targetInstanceId=ident.instance_id,
+        )
+        resolved = canary.get('resolvedIdentity') or canary.get('identity') or {}
+        runs = listed.get('runs') or []
+        print(json.dumps({
+            'ok': bool(canary.get('ok')),
+            'memberId': resolved.get('memberId', ident.member_id),
+            'instanceId': resolved.get('instanceId', ident.instance_id),
+            'workspaceId': resolved.get('workspaceId'),
+            'queuedRuns': sum(1 for run in runs if run.get('status') in {'queued', 'failed_recoverable'}),
+        }, ensure_ascii=False))
+        return
     command = command_adapter('PEER_EXECUTOR_COMMAND' if a.mode == 'executor' else 'PEER_VALIDATOR_COMMAND', mode=a.mode)
     runner = PeerCollaborationRunner(client, ident, target_member_id=ident.member_id, target_instance_id=ident.instance_id,
                                      executor=command, validator=command, mode=a.mode)
