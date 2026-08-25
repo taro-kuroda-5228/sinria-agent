@@ -64,10 +64,12 @@ def test_decision_required_stops_without_creating_revision_run():
     store.runs.append(run_payload('r1', 'taro', 'taro-1', 'e1'))
     validator = PeerCollaborationRunner(store, Identity('taro', 'taro-1'), target_member_id='taro', target_instance_id='taro-1', executor=lambda r,e: {}, validator=lambda r,e: 'decision_required', mode='validator')
     before = len(store.runs)
+    before_events = len(store.events)
     result = validator.run_once()
     assert result is not None
     assert result['status'] == 'decision_required'
     assert len(store.runs) == before
+    assert len(store.events) == before_events
     assert store.calls == ['claim', 'complete']
 
 

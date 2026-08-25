@@ -189,7 +189,6 @@ class PeerCollaborationRunner:
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
                 return {"runId": run.run_id, "status": "accepted"}
             if verdict == "decision_required":
-                self._append(run, "system", "Decision required: validator stopped collaboration", "decision", attempt)
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
                 return {"runId": run.run_id, "status": verdict}
             events = self.transport.list_conversation_events(self.identity, conversationId=run.conversation_id).get("events", [])
@@ -203,7 +202,6 @@ class PeerCollaborationRunner:
                     idempotencyKey=self._key(run.run_id, "revision-run", attempt))
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
                 return {"runId": run.run_id, "status": verdict, "nextRunId": created.get("run", created).get("runId")}
-            self._append(run, "system", "Decision required: collaboration round limit reached", "decision", attempt)
             self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="decision_required", idempotencyKey=self._key(run.run_id, "complete", attempt))
             return {"runId": run.run_id, "status": "decision_required"}
         except Exception as exc:
