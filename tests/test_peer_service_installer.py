@@ -56,3 +56,14 @@ def test_primary_checkout_resolution_uses_git_common_dir(tmp_path, monkeypatch):
     linked.mkdir(); primary.mkdir(); (primary / ".git").mkdir()
     monkeypatch.setattr(module, "git_common_dir", lambda _: primary / ".git")
     assert module.resolve_primary_checkout(linked) == primary
+
+
+def test_python_path_keeps_venv_symlink_instead_of_resolving_base_interpreter(tmp_path):
+    module = load_service()
+    root = tmp_path / "sinria-agent"
+    base = tmp_path / "python3"
+    base.write_text("")
+    venv = root / ".venv/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").symlink_to(base)
+    assert module.python_path(root) == venv / "python"
