@@ -22,7 +22,15 @@ def command_adapter(name, *, mode):
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("local peer command timed out") from exc
         if proc.returncode != 0:
-            raise RuntimeError("local peer command exited nonzero")
+            reason = ""
+            try:
+                parsed = json.loads(proc.stdout)
+                if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
+                    reason = parsed["error"][:160]
+            except (TypeError, json.JSONDecodeError):
+                pass
+            suffix = f": {reason}" if reason else ""
+            raise RuntimeError(f"local peer command exited {proc.returncode}{suffix}")
         try:
             value = json.loads(proc.stdout)
         except (TypeError, json.JSONDecodeError) as exc:

@@ -12,12 +12,14 @@ def run(payload):
 
 
 def test_accepts_only_synthetic_metadata_event():
-    result = run({"eventId": "evt_1", "sanitizedPreview": "Synthetic metadata-only task: verify", "bodyRef": None})
-    assert result.returncode == 0
-    body = json.loads(result.stdout)
-    assert body["rawContextStored"] is False
-    assert body["externalActionPerformed"] is False
-    assert body["refs"] == ["run://event/evt_1"]
+    event = {"eventId": "evt_1", "sanitizedPreview": "Synthetic metadata-only task: verify", "bodyRef": None}
+    for payload in (event, {"run": {"runId": "run_1", "status": "claimed"}, "event": event}):
+        result = run(payload)
+        assert result.returncode == 0
+        body = json.loads(result.stdout)
+        assert body["rawContextStored"] is False
+        assert body["externalActionPerformed"] is False
+        assert body["refs"] == ["run://event/evt_1"]
 
 
 def test_rejects_body_ref_and_raw_keys():
