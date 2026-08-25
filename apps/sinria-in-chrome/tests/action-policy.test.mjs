@@ -4,11 +4,11 @@ import { validateAction, isSensitiveField, isWritableField } from "../src/action
 
 test("action policy rejects unsafe navigation and malformed refs", () => {
   for (const url of ["javascript:alert(1)", "data:text/html,x", "file:///tmp/x", "chrome://settings"]) {
-    assert.equal(validateAction({ type: "navigate", url }).ok, false);
+    assert.equal(validateAction({ type: "navigate", tabId: 1, url }).ok, false);
   }
-  assert.equal(validateAction({ type: "navigate", url: "https://example.com" }).ok, true);
-  assert.equal(validateAction({ type: "click", ref: "x-1" }).ok, false);
-  assert.equal(validateAction({ type: "click", ref: "e12" }).ok, true);
+  assert.equal(validateAction({ type: "navigate", tabId: 1, url: "https://example.com" }).ok, true);
+  assert.equal(validateAction({ type: "click", tabId: 1, ref: "x-1" }).ok, false);
+  assert.equal(validateAction({ type: "click", tabId: 1, ref: "e12" }).ok, true);
 });
 
 test("typing is blocked for sensitive fields", () => {

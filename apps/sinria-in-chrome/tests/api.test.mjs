@@ -9,7 +9,8 @@ test("run request binds session and strict browser instructions", () => {
   assert.equal(request.input, "summarize");
   assert.match(request.instructions, /JSON/);
   assert.match(request.instructions, /actions/);
-  assert.equal(request.require_approval, true);
+  assert.equal(request.require_approval, false);
+  assert.match(request.instructions, /consequential actions still require confirmation/);
 });
 
 test("SSE parser handles split chunks", () => {
@@ -20,6 +21,26 @@ test("SSE parser handles split chunks", () => {
 test("assistant envelope accepts fenced JSON and defaults safely", () => {
   assert.deepEqual(parseAssistantEnvelope('```json\n{"message":"ok","actions":[]}\n```'), { message: "ok", actions: [] });
   assert.deepEqual(parseAssistantEnvelope("plain answer"), { message: "plain answer", actions: [] });
+});
+
+test("assistant envelope recovers a pending action from a completion-guard wrapper", () => {
+  const output = `状態: 部分完了
+停止点: readback未確認
+
+報告内容（未検証）:
+{"message":"候補1名を確認。次を検索します。","actions":[{"type":"keypress","tabId":441320252,"ref":"e36","key":"Enter"}]}`;
+  assert.deepEqual(parseAssistantEnvelope(output), {
+    message: "候補1名を確認。次を検索します。",
+    actions: [{ type: "keypress", tabId: 441320252, ref: "e36", key: "Enter" }],
+  });
+});
+
+test("assistant envelope recovers one pending action when prose trails JSON", () => {
+  const output = `{"message":"候補3名を確認。次を検索します。","actions":[{"type":"type","tabId":441320252,"ref":"e36","text":"Daniel Nadler OpenEvidence"}]} Do one action at a time.`;
+  assert.deepEqual(parseAssistantEnvelope(output), {
+    message: "候補3名を確認。次を検索します。",
+    actions: [{ type: "type", tabId: 441320252, ref: "e36", text: "Daniel Nadler OpenEvidence" }],
+  });
 });
 
 test("run client streams gateway events and resolves approval choices", async () => {

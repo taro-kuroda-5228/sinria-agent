@@ -1,0 +1,33 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Sinria advanced fixture</title><style>#shadow-host,#nested-host,iframe,canvas,svg{display:block;margin:12px 0;min-width:120px;min-height:24px}</style></head>
+<body>
+<main>
+  <h1>Advanced fixture</h1>
+  <div id="shadow-host"></div>
+  <iframe id="same-origin-frame" title="same origin" srcdoc='<!doctype html><button id="frame-button">Frame button</button>'></iframe>
+  <iframe id="cross-origin-frame" title="cross origin" src="https://example.invalid/frame"></iframe>
+  <canvas id="trend-canvas" width="320" height="160" aria-label="Monthly patient wait-time trend"></canvas>
+  <figure><svg role="img" aria-label="Quarterly cases chart"><title>Quarterly cases</title><text x="10" y="20">Q1 12 Q2 18</text></svg><figcaption>Quarterly cases</figcaption></figure>
+  <input id="upload" type="file" aria-label="Select approved document">
+  <a id="download" href="download.txt" download="sinria-download.txt">Download report</a>
+  <a id="navigate" href="navigated.html">Navigate</a>
+  <section id="result-card" role="listitem">
+    <div class="selection-cell"><ul><li><input type="checkbox" aria-label="Example Candidate is reachable"></li></ul></div>
+    <div class="identity-cell">
+      <a href="/sales/lead/example,TEST">Example Candidate</a>
+      <div>Chief Executive Officer</div>
+      <div>Example Health Systems</div>
+      <div>Boston, Massachusetts</div>
+    </div>
+  </section>
+</main>
+<script>
+  const root = document.querySelector('#shadow-host').attachShadow({mode:'open'});
+  root.innerHTML = `<style>#nested-host{display:block;min-width:120px;min-height:24px}</style><button id="shadow-button">Shadow button</button><div id="nested-host"></div>`;
+  root.querySelector('#shadow-button').onclick = (event) => { event.target.textContent = 'Shadow clicked'; };
+  const nested = root.querySelector('#nested-host').attachShadow({mode:'open'});
+  nested.innerHTML = `<input id="nested-input" aria-label="Nested shadow input">`;
+  const ctx = document.querySelector('#trend-canvas').getContext('2d');
+  ctx.fillStyle = '#0f766e'; ctx.fillRect(20, 100, 50, 40); ctx.fillRect(100, 70, 50, 70); ctx.fillRect(180, 30, 50, 110);
+</script>
+</body></html>

@@ -503,6 +503,12 @@ def run_conversation(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
+    external_browser_receipts = getattr(agent, "_external_browser_receipts", ())
+    if external_browser_receipts:
+        from agent.browser_receipts import build_browser_receipt_messages
+
+        messages.extend(build_browser_receipt_messages(external_browser_receipts))
+
     # Hybrid strategist routing: for complex practical tasks, side-call the
     # strategist once for a plan and inject it as a synthetic user message.
     # The executor model and the byte-stable system prompt never change
