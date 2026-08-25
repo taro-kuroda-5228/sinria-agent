@@ -11,15 +11,20 @@ def main() -> int:
     except Exception:
         return 2
     forbidden = {"body", "prompt", "rawPrompt", "rawContext", "credentials"}
+    preview = event.get("sanitizedPreview") if isinstance(event, dict) else None
     if (
         not isinstance(event, dict)
-        or event.get("sanitizedPreview") != "Synthetic peer task executed; sanitized completion receipt returned."
         or event.get("bodyRef") is not None
         or forbidden.intersection(event)
     ):
-        print(json.dumps({"verdict": "decision_required"}))
-        return 0
-    print(json.dumps({"verdict": "accepted"}))
+        verdict = "decision_required"
+    elif preview == "Synthetic peer task executed; sanitized completion receipt returned.":
+        verdict = "accepted"
+    elif preview == "Synthetic revision-requested canary":
+        verdict = "revision_requested"
+    else:
+        verdict = "decision_required"
+    print(json.dumps({"verdict": verdict}))
     return 0
 
 
