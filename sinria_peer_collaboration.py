@@ -131,6 +131,7 @@ class PeerCollaborationRunner:
         return hashlib.sha256(f"sinria-peer:{run_id}:{action}:{attempt}".encode()).hexdigest()
 
     def poll(self) -> list[ConversationRun]:
+        self.transport.sweep_conversation_runs(self.identity)
         result = self.transport.list_conversation_runs(self.identity, targetMemberId=self.target_member_id, targetInstanceId=self.target_instance_id)
         rows = result.get("runs")
         if not isinstance(rows, list):

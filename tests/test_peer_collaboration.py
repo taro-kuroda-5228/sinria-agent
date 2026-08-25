@@ -34,6 +34,9 @@ class Store:
         self.runs = [run_payload('r0', 'kikuchi', 'k-1', 'e0')]
         self.calls = []
         self.n = 1
+    def sweep_conversation_runs(self, identity, **kw):
+        self.calls.append('sweep')
+        return {'swept': 0, 'runs': []}
     def list_conversation_runs(self, identity, **kw):
         if identity.member_id != kw.get('targetMemberId') or identity.instance_id != kw.get('targetInstanceId'): return {'runs': []}
         return {'runs': [r for r in self.runs if r['targetMemberId'] == kw.get('targetMemberId') and r['targetInstanceId'] == kw.get('targetInstanceId')]}
@@ -66,11 +69,12 @@ def test_decision_required_stops_without_creating_revision_run():
     before = len(store.runs)
     before_events = len(store.events)
     result = validator.run_once()
+    assert store.calls[0] == 'sweep'
     assert result is not None
     assert result['status'] == 'decision_required'
     assert len(store.runs) == before
     assert len(store.events) == before_events
-    assert store.calls == ['claim', 'complete']
+    assert store.calls == ['sweep', 'claim', 'complete']
 
 
 def test_executor_and_validator_flow_with_wrong_instance_rejection():
@@ -80,4 +84,4 @@ def test_executor_and_validator_flow_with_wrong_instance_rejection():
     result = executor.run_once(); assert result['validationRunId']
     validator = PeerCollaborationRunner(store, Identity('taro', 'taro-1'), target_member_id='taro', target_instance_id='taro-1', executor=lambda r,e: {}, validator=lambda r,e: 'accepted', mode='validator')
     assert validator.run_once()['status'] == 'accepted'
-    assert store.calls == ['claim', 'complete', 'claim', 'complete']
+    assert store.calls == ['sweep', 'sweep', 'claim', 'complete', 'sweep', 'claim', 'complete']
