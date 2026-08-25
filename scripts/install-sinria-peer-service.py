@@ -28,7 +28,9 @@ def resolve_primary_checkout(root: Path) -> Path:
 def python_path(root: Path) -> Path:
     for candidate in (root / ".venv/bin/python", root / "venv/bin/python", Path.home() / ".sinria/sinria-agent/venv/bin/python"):
         if candidate.exists():
-            return candidate.resolve()
+            # Keep the venv entrypoint path. Resolving its symlink to the base
+            # interpreter disables venv dependency discovery under launchd.
+            return candidate.absolute()
     raise SystemExit("Sinria Python environment not found")
 
 
@@ -83,7 +85,11 @@ def main() -> None:
         env = os.environ.copy(); env.update(plist["EnvironmentVariables"])
         command = plist["ProgramArguments"][:2] + ["--preflight", "--mode", a.mode]
         result = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=60)
-        print(json.dumps({"exit": result.returncode, "result": json.loads(result.stdout) if result.stdout else None}))
+        print(json.dumps({
+            "exit": result.returncode,
+            "result": json.loads(result.stdout) if result.stdout else None,
+            "error": result.stderr[-500:] if result.stderr else None,
+        }))
         raise SystemExit(result.returncode)
     launch_agents = Path.home() / "Library/LaunchAgents"
     logs = Path.home() / ".sinria/logs"
