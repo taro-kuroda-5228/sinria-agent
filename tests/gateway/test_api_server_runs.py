@@ -146,6 +146,53 @@ class TestStartRun:
                 assert status["object"] == "sinria.run"
 
     @pytest.mark.asyncio
+    async def test_start_attaches_sanitized_browser_receipts_to_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={
+                        "input": "continue browser workflow",
+                        "browser_receipts": [
+                            {
+                                "receipt_id": "wf-1:3:abc12345",
+                                "action_type": "keypress",
+                                "verified": True,
+                                "readback_label": "Search | Sales Navigator",
+                                "url": "https://example.invalid/secret",
+                            },
+                            {
+                                "receipt_id": "bad",
+                                "action_type": "click",
+                                "verified": False,
+                            },
+                        ],
+                    },
+                )
+                assert resp.status == 202
+                for _ in range(20):
+                    if hasattr(mock_agent, "_external_browser_receipts"):
+                        break
+                    await asyncio.sleep(0.01)
+
+                assert mock_agent._external_browser_receipts == (
+                    {
+                        "receipt_id": "wf-1:3:abc12345",
+                        "action_type": "keypress",
+                        "verified": True,
+                        "readback_label": "Search | Sales Navigator",
+                    },
+                )
+
+    @pytest.mark.asyncio
     async def test_start_accepts_legacy_session_key_but_emits_sinria_header(self, auth_adapter):
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:

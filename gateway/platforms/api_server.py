@@ -3382,6 +3382,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
+        from agent.browser_receipts import sanitize_browser_receipts
+
+        browser_receipts = sanitize_browser_receipts(body.get("browser_receipts"))
+
         run_max_iterations = body.get("max_iterations")
         if run_max_iterations is not None and (
             isinstance(run_max_iterations, bool)
@@ -3563,6 +3567,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     enabled_toolsets=run_enabled_toolsets,
                     skip_memory=is_voice_profile,
                 )
+                agent._external_browser_receipts = browser_receipts
                 self._stamp_workspace_channel(agent, gateway_session_key, workspace_boundary)
                 self._active_run_agents[run_id] = agent
 
