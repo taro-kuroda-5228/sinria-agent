@@ -9,7 +9,8 @@ test("run request binds session and strict browser instructions", () => {
   assert.equal(request.input, "summarize");
   assert.match(request.instructions, /JSON/);
   assert.match(request.instructions, /actions/);
-  assert.equal(request.require_approval, true);
+  assert.equal(request.require_approval, false);
+  assert.match(request.instructions, /consequential actions still require confirmation/);
 });
 
 test("SSE parser handles split chunks", () => {
