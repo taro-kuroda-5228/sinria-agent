@@ -8,8 +8,17 @@ import sys
 
 def main() -> int:
     try:
-        event = json.load(sys.stdin)
+        envelope = json.load(sys.stdin)
     except Exception:
+        print(json.dumps({"error": "invalid event envelope"}))
+        return 2
+    if not isinstance(envelope, dict):
+        print(json.dumps({"error": "invalid event envelope"}))
+        return 2
+    # Peer workers send a metadata-only callback envelope containing the run
+    # receipt and event. Direct event input remains supported for local smoke.
+    event = envelope.get("event", envelope)
+    if not isinstance(event, dict):
         print(json.dumps({"error": "invalid event envelope"}))
         return 2
     preview = event.get("sanitizedPreview")
