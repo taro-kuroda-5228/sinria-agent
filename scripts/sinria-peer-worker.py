@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""One-run peer worker. Commands receive only validated metadata JSON on stdin."""
-import argparse, json, os, shlex, subprocess, sys
+"""Persistent peer worker. Commands receive only validated metadata JSON on stdin."""
+import argparse, json, os, shlex, subprocess, sys, time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
 from sinria_peer_collaboration import PeerCollaborationRunner
@@ -51,11 +52,16 @@ def command_adapter(name, *, mode):
 
 
 def main():
+    load_dotenv(Path.home() / '.sinria' / '.env', override=False)
+    if os.environ.get('SINRIA_COMPANY_OS_TRANSPORT_SUBJECT'):
+        os.environ.setdefault('COMPANY_OS_TRANSPORT_SUBJECT', os.environ['SINRIA_COMPANY_OS_TRANSPORT_SUBJECT'])
     p = argparse.ArgumentParser()
     p.add_argument('--once', action='store_true')
     p.add_argument('--preflight', action='store_true', help='verify transport identity and polling without executing work')
+    p.add_argument('--poll-interval', type=float, default=float(os.environ.get('PEER_POLL_INTERVAL', '15')))
     p.add_argument('--mode', choices=('executor','validator'), default=os.environ.get('PEER_MODE','executor'))
     a = p.parse_args()
+    if a.poll_interval <= 0: p.error('--poll-interval must be positive')
     required = ('COMPANY_OS_BASE_URL','COMPANY_OS_MEMBER_ID','COMPANY_OS_INSTANCE_ID','COMPANY_OS_TRANSPORT_SUBJECT','SINRIA_COMPANY_OS_TRANSPORT_TOKEN')
     if not all(os.environ.get(x) for x in required): p.error('peer worker requires explicit Company OS identity configuration')
     client = CompanyOsTransportClient(
@@ -83,5 +89,12 @@ def main():
     command = command_adapter('PEER_EXECUTOR_COMMAND' if a.mode == 'executor' else 'PEER_VALIDATOR_COMMAND', mode=a.mode)
     runner = PeerCollaborationRunner(client, ident, target_member_id=ident.member_id, target_instance_id=ident.instance_id,
                                      executor=command, validator=command, mode=a.mode)
-    print(json.dumps(runner.run_once(), ensure_ascii=False))
+    if a.once:
+        print(json.dumps(runner.run_once(), ensure_ascii=False), flush=True)
+        return
+    while True:
+        result = runner.run_once()
+        if result is not None:
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+        time.sleep(a.poll_interval)
 if __name__ == '__main__': main()
