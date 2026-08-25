@@ -21,6 +21,7 @@ def test_worker_has_persistent_loop_and_loads_sinria_env():
     assert "while True:" in source
     assert "--poll-interval" in source
     assert "if a.once:" in source
+    assert '"status": "poll_error"' in source
 
 
 def test_plist_pins_primary_checkout_and_contains_no_token(tmp_path, monkeypatch):

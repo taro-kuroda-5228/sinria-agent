@@ -123,11 +123,12 @@ class PeerCollaborationRunner:
         self.transport, self.identity = transport, identity
         self.target_member_id, self.target_instance_id = target_member_id, target_instance_id
         self.executor, self.validator, self.heartbeat, self.mode, self.max_rounds = executor, validator, heartbeat, mode, max_rounds
+        self._attempts: dict[str, int] = {}
 
 
     @staticmethod
-    def _key(run_id: str, action: str) -> str:
-        return hashlib.sha256(f"sinria-peer:{run_id}:{action}".encode()).hexdigest()
+    def _key(run_id: str, action: str, attempt: int) -> str:
+        return hashlib.sha256(f"sinria-peer:{run_id}:{action}:{attempt}".encode()).hexdigest()
 
     def poll(self) -> list[ConversationRun]:
         result = self.transport.list_conversation_runs(self.identity, targetMemberId=self.target_member_id, targetInstanceId=self.target_instance_id)
@@ -149,9 +150,9 @@ class PeerCollaborationRunner:
             raise ValueError("triggering event metadata does not match run")
         return event
 
-    def _append(self, run: ConversationRun, kind: str, preview: str, action: str, *, body_ref: Any = None) -> ConversationEvent:
+    def _append(self, run: ConversationRun, kind: str, preview: str, action: str, attempt: int, *, body_ref: Any = None) -> ConversationEvent:
         result = self.transport.append_conversation_event(self.identity, spaceId=run.space_id, conversationId=run.conversation_id,
-            kind=kind, sanitizedPreview=sanitize_summary(preview), bodyRef=body_ref, idempotencyKey=self._key(run.run_id, action))
+            kind=kind, sanitizedPreview=sanitize_summary(preview), bodyRef=body_ref, idempotencyKey=self._key(run.run_id, action, attempt))
         return ConversationEvent.from_payload(result.get("event", result))
 
     def run_once(self) -> Optional[dict[str, Any]]:
@@ -159,9 +160,11 @@ class PeerCollaborationRunner:
         if not candidates:
             return None
         run = candidates[0]
+        attempt = self._attempts.get(run.run_id, 0) + 1
+        self._attempts[run.run_id] = attempt
 
         try:
-            claimed = self.transport.claim_conversation_run(self.identity, runId=run.run_id, idempotencyKey=self._key(run.run_id, "claim"))
+            claimed = self.transport.claim_conversation_run(self.identity, runId=run.run_id, idempotencyKey=self._key(run.run_id, "claim", attempt))
             run = ConversationRun.from_payload(claimed.get("run", claimed))
             event = self._load_event(run)
             if self.heartbeat: self.heartbeat(run)
@@ -169,13 +172,13 @@ class PeerCollaborationRunner:
                 result = self.executor(run, event.callback_payload())
                 if not isinstance(result, Mapping): raise ValueError("executor must return an object")
                 payload = safe_metadata(result)
-                assistant = self._append(run, "assistant_message", payload["summary"], "assistant", body_ref=payload.get("bodyRef"))
+                assistant = self._append(run, "assistant_message", payload["summary"], "assistant", attempt, body_ref=payload.get("bodyRef"))
                 author = event.author_member_id
                 if not author: raise ValueError("validation target author identity is absent")
                 validation = self.transport.create_conversation_run(self.identity, spaceId=run.space_id, conversationId=run.conversation_id,
                     triggeredByEventId=assistant.event_id, targetMemberId=author, targetInstanceId=event.author_instance_id,
-                    idempotencyKey=self._key(run.run_id, "validation"))
-                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=payload["summary"], idempotencyKey=self._key(run.run_id, "complete"))
+                    idempotencyKey=self._key(run.run_id, "validation", attempt))
+                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=payload["summary"], idempotencyKey=self._key(run.run_id, "complete", attempt))
                 created = validation.get("run", validation)
                 return {"runId": run.run_id, "status": "completed", "validationRunId": created.get("runId"), **payload}
             if event.kind != "assistant_message": raise ValueError("validator run must target assistant_message")
@@ -183,23 +186,27 @@ class PeerCollaborationRunner:
             if isinstance(verdict, Mapping): verdict = verdict.get("verdict")
             if verdict not in {"accepted", "revision_requested", "decision_required"}: raise ValueError("invalid validator verdict")
             if verdict == "accepted":
-                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete"))
+                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
                 return {"runId": run.run_id, "status": "accepted"}
+            if verdict == "decision_required":
+                self._append(run, "system", "Decision required: validator stopped collaboration", "decision", attempt)
+                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
+                return {"runId": run.run_id, "status": verdict}
             events = self.transport.list_conversation_events(self.identity, conversationId=run.conversation_id).get("events", [])
             revision_count = sum(1 for item in events if isinstance(item, Mapping) and item.get("kind") == "user_message"
-                                 and item.get("sanitizedPreview") == "Revision requested by validator")
-            if verdict == "revision_requested" and revision_count < self.max_rounds:
+                                 and "revision requested" in str(item.get("sanitizedPreview", "")).lower())
+            if revision_count < self.max_rounds:
                 if not event.author_member_id: raise ValueError("revision target author identity is absent")
-                revision = self._append(run, "user_message", "Revision requested by validator", "revision")
+                revision = self._append(run, "user_message", "Revision requested by validator", "revision", attempt)
                 created = self.transport.create_conversation_run(self.identity, spaceId=run.space_id, conversationId=run.conversation_id,
                     triggeredByEventId=revision.event_id, targetMemberId=event.author_member_id, targetInstanceId=event.author_instance_id,
-                    idempotencyKey=self._key(run.run_id, "revision-run"))
-                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete"))
+                    idempotencyKey=self._key(run.run_id, "revision-run", attempt))
+                self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
                 return {"runId": run.run_id, "status": verdict, "nextRunId": created.get("run", created).get("runId")}
-            self._append(run, "system", "Decision required: collaboration round limit reached", "decision")
-            self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="decision_required", idempotencyKey=self._key(run.run_id, "complete"))
+            self._append(run, "system", "Decision required: collaboration round limit reached", "decision", attempt)
+            self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="decision_required", idempotencyKey=self._key(run.run_id, "complete", attempt))
             return {"runId": run.run_id, "status": "decision_required"}
         except Exception as exc:
-            try: self.transport.fail_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="peer execution failed", idempotencyKey=self._key(run.run_id, "fail"))
+            try: self.transport.fail_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="peer execution failed", idempotencyKey=self._key(run.run_id, "fail", attempt))
             except Exception: pass
             return {"runId": run.run_id, "status": "failed", "error": sanitize_summary(exc)}

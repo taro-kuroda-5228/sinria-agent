@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
-from sinria_peer_collaboration import PeerCollaborationRunner
+from sinria_peer_collaboration import PeerCollaborationRunner, sanitize_summary
 
 
 def command_adapter(name, *, mode):
@@ -93,8 +93,11 @@ def main():
         print(json.dumps(runner.run_once(), ensure_ascii=False), flush=True)
         return
     while True:
-        result = runner.run_once()
-        if result is not None:
-            print(json.dumps(result, ensure_ascii=False), flush=True)
+        try:
+            result = runner.run_once()
+            if result is not None:
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            print(json.dumps({"status": "poll_error", "error": sanitize_summary(exc)}, ensure_ascii=False), flush=True)
         time.sleep(a.poll_interval)
 if __name__ == '__main__': main()

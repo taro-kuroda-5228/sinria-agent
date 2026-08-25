@@ -52,6 +52,25 @@ class Identity:
     def __init__(self, member, instance): self.member_id, self.instance_id = member, instance
 
 
+def test_retry_attempts_get_distinct_idempotency_keys():
+    runner = PeerCollaborationRunner(None, None, target_member_id='taro', target_instance_id='taro-1', executor=lambda *_: {}, validator=lambda *_: 'accepted')
+    assert runner._key('run-1', 'complete', 1) == runner._key('run-1', 'complete', 1)
+    assert runner._key('run-1', 'complete', 1) != runner._key('run-1', 'complete', 2)
+
+
+def test_decision_required_stops_without_creating_revision_run():
+    store = Store()
+    store.events.append(event('e1', kind='assistant_message', author='kikuchi', instance='k-1'))
+    store.runs.append(run_payload('r1', 'taro', 'taro-1', 'e1'))
+    validator = PeerCollaborationRunner(store, Identity('taro', 'taro-1'), target_member_id='taro', target_instance_id='taro-1', executor=lambda r,e: {}, validator=lambda r,e: 'decision_required', mode='validator')
+    before = len(store.runs)
+    result = validator.run_once()
+    assert result is not None
+    assert result['status'] == 'decision_required'
+    assert len(store.runs) == before
+    assert store.calls == ['claim', 'complete']
+
+
 def test_executor_and_validator_flow_with_wrong_instance_rejection():
     store = Store(); wrong = PeerCollaborationRunner(store, Identity('kikuchi', 'wrong'), target_member_id='kikuchi', target_instance_id='k-1', executor=lambda r,e: {}, validator=lambda r,e: 'accepted')
     assert wrong.run_once() is None
