@@ -77,6 +77,22 @@ def test_decision_required_stops_without_creating_revision_run():
     assert store.calls == ['sweep', 'claim', 'complete']
 
 
+def test_runner_fail_closed_filters_cross_member_runs_returned_by_backend():
+    store = Store()
+    store.list_conversation_runs = lambda identity, **kw: {'runs': list(store.runs)}
+    runner = PeerCollaborationRunner(
+        store,
+        Identity('alice', 'alice-1'),
+        target_member_id='alice',
+        target_instance_id='alice-1',
+        executor=lambda run, event: {'summary': 'must not execute'},
+        validator=lambda run, event: 'accepted',
+    )
+    assert runner.run_once() is None
+    assert store.calls == ['sweep']
+    assert store.runs[0]['status'] == 'queued'
+
+
 def test_executor_and_validator_flow_with_wrong_instance_rejection():
     store = Store(); wrong = PeerCollaborationRunner(store, Identity('kikuchi', 'wrong'), target_member_id='kikuchi', target_instance_id='k-1', executor=lambda r,e: {}, validator=lambda r,e: 'accepted')
     assert wrong.run_once() is None
