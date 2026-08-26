@@ -93,6 +93,21 @@ def test_runner_fail_closed_filters_cross_member_runs_returned_by_backend():
     assert store.runs[0]['status'] == 'queued'
 
 
+def test_poll_prioritizes_queued_run_over_older_recoverable_failure():
+    store = Store()
+    store.runs[0]['status'] = 'failed_recoverable'
+    store.runs.append(run_payload('r2', 'kikuchi', 'k-1', 'e1'))
+    runner = PeerCollaborationRunner(
+        store,
+        Identity('kikuchi', 'k-1'),
+        target_member_id='kikuchi',
+        target_instance_id='k-1',
+        executor=lambda run, event: {'summary': 'answer'},
+        validator=lambda run, event: 'accepted',
+    )
+    assert [run.run_id for run in runner.poll()] == ['r2', 'r0']
+
+
 def test_executor_and_validator_flow_with_wrong_instance_rejection():
     store = Store(); wrong = PeerCollaborationRunner(store, Identity('kikuchi', 'wrong'), target_member_id='kikuchi', target_instance_id='k-1', executor=lambda r,e: {}, validator=lambda r,e: 'accepted')
     assert wrong.run_once() is None

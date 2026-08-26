@@ -136,13 +136,14 @@ class PeerCollaborationRunner:
         rows = result.get("runs")
         if not isinstance(rows, list):
             raise ValueError("run list response is invalid")
-        return [
+        matching = [
             run
             for row in rows
             for run in [ConversationRun.from_payload(row)]
             if run.target_member_id == self.target_member_id
             and (run.target_instance_id is None or run.target_instance_id == self.target_instance_id)
         ]
+        return sorted(matching, key=lambda run: 0 if run.status == "queued" else 1)
 
     def _load_event(self, run: ConversationRun) -> ConversationEvent:
         result = self.transport.list_conversation_events(self.identity, conversationId=run.conversation_id)
