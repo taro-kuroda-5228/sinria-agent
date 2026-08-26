@@ -97,6 +97,20 @@ def main():
             result = runner.run_once()
             if result is not None:
                 print(json.dumps(result, ensure_ascii=False), flush=True)
+                notify_target = os.environ.get('PEER_NOTIFY_TARGET', '').strip()
+                if a.mode == 'validator' and notify_target:
+                    notifier = Path(__file__).resolve().with_name('sinria-peer-notify.py')
+                    completed = subprocess.run(
+                        [sys.executable, str(notifier)],
+                        input=json.dumps(result, ensure_ascii=False),
+                        text=True,
+                        capture_output=True,
+                        env={**os.environ, 'PEER_NOTIFY_TARGET': notify_target},
+                        timeout=30,
+                        check=False,
+                    )
+                    if completed.returncode != 0:
+                        print(json.dumps({'status': 'notify_error', 'error': 'peer notification delivery failed'}, ensure_ascii=False), flush=True)
         except Exception as exc:
             print(json.dumps({"status": "poll_error", "error": sanitize_summary(exc)}, ensure_ascii=False), flush=True)
         time.sleep(a.poll_interval)

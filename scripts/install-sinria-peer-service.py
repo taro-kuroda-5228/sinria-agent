@@ -35,7 +35,7 @@ def python_path(root: Path) -> Path:
 
 
 def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
-                subject: str, base_url: str, poll_interval: int) -> dict:
+                subject: str, base_url: str, poll_interval: int, notify_target: str = "") -> dict:
     root = root.resolve()
     python = python_path(root)
     worker = root / "scripts/sinria-peer-worker.py"
@@ -57,6 +57,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
             "COMPANY_OS_TRANSPORT_SUBJECT": subject,
             command_env: f"{python} {command_script}",
             "PYTHONUNBUFFERED": "1",
+            **({"PEER_NOTIFY_TARGET": notify_target} if mode == "validator" and notify_target else {}),
         },
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -74,13 +75,15 @@ def main() -> None:
     p.add_argument("--subject", required=True)
     p.add_argument("--base-url", default="https://medical-horizon-company-os.vercel.app")
     p.add_argument("--poll-interval", type=int, default=15)
+    p.add_argument("--notify-target", default="", help="validator-only Sinria message target")
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     p.add_argument("--no-load", action="store_true")
     p.add_argument("--preflight", action="store_true")
     a = p.parse_args()
     root = resolve_primary_checkout(a.root)
     plist = build_plist(root=root, mode=a.mode, member_id=a.member_id, instance_id=a.instance_id,
-                        subject=a.subject, base_url=a.base_url, poll_interval=a.poll_interval)
+                        subject=a.subject, base_url=a.base_url, poll_interval=a.poll_interval,
+                        notify_target=a.notify_target)
     if a.preflight:
         env = os.environ.copy(); env.update(plist["EnvironmentVariables"])
         command = plist["ProgramArguments"][:2] + ["--preflight", "--mode", a.mode]
