@@ -32,7 +32,7 @@ def test_plist_pins_primary_checkout_and_contains_no_token(tmp_path, monkeypatch
     (primary / ".venv" / "bin").mkdir(parents=True)
     (primary / ".venv" / "bin" / "python").write_text("")
     (primary / "scripts" / "sinria-peer-worker.py").write_text("")
-    (primary / "scripts" / "synthetic-peer-executor.py").write_text("")
+    (primary / "scripts" / "peer-consultation-executor.py").write_text("")
     plist = module.build_plist(
         root=primary,
         mode="executor",

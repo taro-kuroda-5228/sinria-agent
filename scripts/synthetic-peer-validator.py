@@ -2,6 +2,9 @@
 """Accept only sanitized synthetic completion receipts."""
 import json
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sinria_consultation import validate_consultation
 
 
 def main() -> int:
@@ -18,6 +21,12 @@ def main() -> int:
         or forbidden.intersection(event)
     ):
         verdict = "decision_required"
+    elif event.get("consultationMetadata") is not None:
+        try:
+            meta = validate_consultation(event["consultationMetadata"])
+            verdict = "accepted" if meta and meta["type"] == "consultation_response" else "decision_required"
+        except ValueError:
+            verdict = "decision_required"
     elif preview == "Synthetic peer task executed; sanitized completion receipt returned.":
         verdict = "accepted"
     elif preview == "Synthetic revision-requested canary":

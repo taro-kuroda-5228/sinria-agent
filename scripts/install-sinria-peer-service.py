@@ -40,7 +40,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
     python = python_path(root)
     worker = root / "scripts/sinria-peer-worker.py"
     command_script = root / "scripts" / (
-        "synthetic-peer-executor.py" if mode == "executor" else "synthetic-peer-validator.py"
+        "peer-consultation-executor.py" if mode == "executor" else "synthetic-peer-validator.py"
     )
     if not worker.exists() or not command_script.exists():
         raise SystemExit("peer worker scripts not found in primary checkout")
@@ -56,6 +56,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
             "COMPANY_OS_INSTANCE_ID": instance_id,
             "COMPANY_OS_TRANSPORT_SUBJECT": subject,
             command_env: f"{python} {command_script}",
+            **({"SINRIA_PROFILE": subject} if mode == "executor" and subject.startswith("profile-") else {}),
             "PYTHONUNBUFFERED": "1",
             **({"PEER_NOTIFY_TARGET": notify_target} if mode == "validator" and notify_target else {}),
         },
@@ -101,7 +102,7 @@ def main() -> None:
     temporary = path.with_suffix(".plist.tmp")
     temporary.write_bytes(plistlib.dumps(plist)); os.chmod(temporary, 0o600); temporary.replace(path)
     if not a.no_load:
-        domain = f"gui/{os.getuid()}"
+        domain = f"gui/{os.getuid()}"  # windows-footgun: ok - LaunchAgent installer is macOS-only
         subprocess.run(["launchctl", "bootout", domain, str(path)], capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
         subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{plist['Label']}"], check=True)
