@@ -12,14 +12,26 @@ def run(payload):
 
 
 def test_accepts_only_synthetic_metadata_event():
-    event = {"eventId": "evt_1", "sanitizedPreview": "Synthetic metadata-only task: verify", "bodyRef": None}
-    for payload in (event, {"run": {"runId": "run_1", "status": "claimed"}, "event": event}):
-        result = run(payload)
-        assert result.returncode == 0
-        body = json.loads(result.stdout)
-        assert body["rawContextStored"] is False
-        assert body["externalActionPerformed"] is False
-        assert body["refs"] == ["run://event/evt_1"]
+    events = (
+        {"eventId": "evt_1", "sanitizedPreview": "Synthetic metadata-only task: verify", "bodyRef": None},
+        {
+            "eventId": "evt_2",
+            "kind": "user_message",
+            "authorKind": "sinria",
+            "sanitizedPreview": "Synthetic metadata-only post-recovery peer connectivity canary.",
+            "bodyRef": None,
+            "rawBodyStored": False,
+            "externalActionPerformed": False,
+        },
+    )
+    for event in events:
+        for payload in (event, {"run": {"runId": "run_1", "status": "claimed"}, "event": event}):
+            result = run(payload)
+            assert result.returncode == 0
+            body = json.loads(result.stdout)
+            assert body["rawContextStored"] is False
+            assert body["externalActionPerformed"] is False
+            assert body["refs"] == [f"run://event/{event['eventId']}"]
 
 
 def test_rejects_body_ref_and_raw_keys():

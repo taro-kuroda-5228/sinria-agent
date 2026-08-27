@@ -25,7 +25,7 @@ def main() -> int:
     forbidden = {"body", "prompt", "rawPrompt", "rawContext"}
     if (
         not isinstance(preview, str)
-        or not preview.startswith("Synthetic metadata-only task:")
+        or not preview.startswith("Synthetic metadata-only")
         or event.get("bodyRef") is not None
         or forbidden.intersection(event)
     ):
