@@ -5,6 +5,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
+from sinria_consultation import validate_consultation
 
 _SECRET = re.compile(r"(?i)(?:sk-[A-Za-z0-9_-]+|(?:token|secret|password|credential|authorization|bearer|api[_-]?key)\s*[:=]?\s*[^\s,;]+)")
 _PHI = re.compile(r"(?is)\b(?:patient|medical\s+record|diagnosis|ssn|social\s+security|dob|date\s+of\s+birth|mrn)\s*[:#-]?[^\n;,.]{0,240}")
@@ -28,6 +29,7 @@ def _refs(value: Any) -> list[str]:
 def safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     """Build the only result shape allowed to cross the cloud boundary."""
     refs = _refs(value.get("refs"))
+    consultation = validate_consultation(value.get("consultationMetadata"))
     body_ref = value.get("bodyRef")
     if isinstance(body_ref, Mapping):
         mode = body_ref.get("mode")
@@ -46,6 +48,7 @@ def safe_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "summary": sanitize_summary(value.get("summary", value.get("result", ""))),
         "refs": refs,
+        **({"consultationMetadata": consultation} if consultation else {}),
         **({"bodyRef": body_ref} if body_ref else {}),
         # A sanitizer cannot prove absence of PHI. These are explicit provenance facts only.
         "safetyFlags": {"rawPrompt": False, "credentials": False, "rawContextStored": bool(value.get("rawContextStored", False)),
@@ -64,6 +67,7 @@ class ConversationEvent:
     author_member_id: Optional[str]
     author_instance_id: Optional[str]
     sanitized_preview: str
+    consultation: Any = None
     body_ref: Any = None
 
     @classmethod
@@ -77,13 +81,14 @@ class ConversationEvent:
             raise ValueError("raw event content is forbidden")
         return cls(payload["eventId"], payload["workspaceId"], payload["spaceId"], payload["conversationId"],
                    payload["kind"], payload["authorKind"], payload.get("authorMemberId"), payload.get("authorInstanceId"),
-                   sanitize_summary(payload["sanitizedPreview"]), payload.get("bodyRef"))
+                   sanitize_summary(payload["sanitizedPreview"]), validate_consultation(payload.get("consultationMetadata")), payload.get("bodyRef"))
 
     def callback_payload(self) -> dict[str, Any]:
         return {"eventId": self.event_id, "workspaceId": self.workspace_id, "spaceId": self.space_id,
                 "conversationId": self.conversation_id, "kind": self.kind, "authorKind": self.author_kind,
                 "authorMemberId": self.author_member_id, "authorInstanceId": self.author_instance_id,
-                "sanitizedPreview": self.sanitized_preview, **({"bodyRef": self.body_ref} if self.body_ref else {})}
+                "sanitizedPreview": self.sanitized_preview, **({"consultationMetadata": self.consultation} if self.consultation else {}),
+                **({"bodyRef": self.body_ref} if self.body_ref else {})}
 
 
 @dataclass(frozen=True)
@@ -158,9 +163,9 @@ class PeerCollaborationRunner:
             raise ValueError("triggering event metadata does not match run")
         return event
 
-    def _append(self, run: ConversationRun, kind: str, preview: str, action: str, attempt: int, *, body_ref: Any = None) -> ConversationEvent:
+    def _append(self, run: ConversationRun, kind: str, preview: str, action: str, attempt: int, *, body_ref: Any = None, consultation: Any = None) -> ConversationEvent:
         result = self.transport.append_conversation_event(self.identity, spaceId=run.space_id, conversationId=run.conversation_id,
-            kind=kind, sanitizedPreview=sanitize_summary(preview), bodyRef=body_ref, idempotencyKey=self._key(run.run_id, action, attempt))
+            kind=kind, sanitizedPreview=sanitize_summary(preview), consultationMetadata=consultation, bodyRef=body_ref, idempotencyKey=self._key(run.run_id, action, attempt))
         return ConversationEvent.from_payload(result.get("event", result))
 
     def run_once(self) -> Optional[dict[str, Any]]:
@@ -180,7 +185,7 @@ class PeerCollaborationRunner:
                 result = self.executor(run, event.callback_payload())
                 if not isinstance(result, Mapping): raise ValueError("executor must return an object")
                 payload = safe_metadata(result)
-                assistant = self._append(run, "assistant_message", payload["summary"], "assistant", attempt, body_ref=payload.get("bodyRef"))
+                assistant = self._append(run, "assistant_message", payload["summary"], "assistant", attempt, body_ref=payload.get("bodyRef"), consultation=payload.get("consultationMetadata"))
                 author = event.author_member_id
                 if not author: raise ValueError("validation target author identity is absent")
                 validation = self.transport.create_conversation_run(self.identity, spaceId=run.space_id, conversationId=run.conversation_id,
