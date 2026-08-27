@@ -36,3 +36,11 @@ def test_executor_resolves_workspace_locally_and_returns_no_body(monkeypatch):
     assert result['consultationMetadata']['type'] == 'consultation_response'
     assert result['consultationMetadata']['confidence'] == .9
     assert 'body' not in result and result['rawContextStored'] is False
+
+def test_queue_prefers_subject_scoped_transport_token(monkeypatch):
+    path = ROOT/'scripts/queue-peer-consultation.py'
+    spec = importlib.util.spec_from_file_location('consult_queue', path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    monkeypatch.setenv('SINRIA_COMPANY_OS_TRANSPORT_TOKEN', 'present')
+    assert mod.transport_token_env() == 'SINRIA_COMPANY_OS_TRANSPORT_TOKEN'

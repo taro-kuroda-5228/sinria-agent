@@ -9,6 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
 from sinria_consultation import validate_consultation
 
+def transport_token_env() -> str:
+    if os.environ.get('SINRIA_COMPANY_OS_TRANSPORT_TOKEN'):
+        return 'SINRIA_COMPANY_OS_TRANSPORT_TOKEN'
+    return 'COMPANY_OS_BRIDGE_TOKEN'
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument('--space-id', required=True); p.add_argument('--conversation-id', required=True)
@@ -24,7 +29,7 @@ def main() -> int:
         'sourceRefs':[{'provider':'google_workspace','resourceId':a.resource_id,'range':a.range,**({'version':a.version} if a.version else {})}],
         'humanDecisionRequired':False,'allowedOperations':['read','draft'],'sensitivity':'internal','rawContextStored':False,'externalActionPerformed':False})
     identity = CompanyOsTransportIdentity(os.environ['COMPANY_OS_TRANSPORT_SUBJECT'], os.environ['COMPANY_OS_MEMBER_ID'], os.environ.get('COMPANY_OS_INSTANCE_ID'))
-    client = CompanyOsTransportClient(os.environ['COMPANY_OS_BASE_URL'])
+    client = CompanyOsTransportClient(os.environ['COMPANY_OS_BASE_URL'], token_env=transport_token_env())
     key = f'{cid}:{int(time.time())}'
     out = client.append_conversation_event(identity, spaceId=a.space_id, conversationId=a.conversation_id, kind='user_message',
         sanitizedPreview='Internal consultation request queued.', consultationMetadata=meta, bodyRef=None, idempotencyKey=key+':event')
