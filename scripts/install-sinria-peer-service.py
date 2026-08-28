@@ -56,7 +56,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
             "COMPANY_OS_INSTANCE_ID": instance_id,
             "COMPANY_OS_TRANSPORT_SUBJECT": subject,
             command_env: f"{python} {command_script}",
-            **({"SINRIA_PROFILE": subject} if mode == "executor" and subject.startswith("profile-") else {}),
+
             "PYTHONUNBUFFERED": "1",
             **({"PEER_NOTIFY_TARGET": notify_target} if mode == "validator" and notify_target else {}),
         },
