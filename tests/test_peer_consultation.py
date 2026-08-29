@@ -44,3 +44,30 @@ def test_queue_prefers_subject_scoped_transport_token(monkeypatch):
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
     monkeypatch.setenv('SINRIA_COMPANY_OS_TRANSPORT_TOKEN', 'present')
     assert mod.transport_token_env() == 'SINRIA_COMPANY_OS_TRANSPORT_TOKEN'
+
+
+def test_workspace_preflight_returns_only_safe_machine_codes(monkeypatch):
+    path = ROOT / 'scripts/peer-consultation-executor.py'
+    spec = importlib.util.spec_from_file_location('consult_executor_preflight', path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    monkeypatch.setattr(mod, '_sheet_values', lambda *_: [["private cell text"]])
+    assert mod.workspace_preflight() == {
+        'ok': True,
+        'workspaceAccess': True,
+        'resourceId': mod.DASHBOARD_ID,
+        'range': mod.PREFLIGHT_RANGE,
+        'rawContextStored': False,
+    }
+
+    def reject(*_):
+        raise mod.WorkspaceResolverError('workspace_token_missing')
+
+    monkeypatch.setattr(mod, '_sheet_values', reject)
+    assert mod.workspace_preflight() == {
+        'ok': False,
+        'workspaceAccess': False,
+        'errorCode': 'workspace_token_missing',
+        'rawContextStored': False,
+    }

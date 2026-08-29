@@ -5,31 +5,69 @@ Only bounded consultation metadata crosses Company OS. Google Workspace source
 bodies are fetched and reduced locally; cell contents are never printed.
 """
 from __future__ import annotations
-import json, os, sys
+import argparse, json, os, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sinria_consultation import validate_consultation
 
 DASHBOARD_ID = "1D6SACTdRdCtAaXcQcLYqohJg8ncKwAKFekr9DfDSHbc"
+PREFLIGHT_RANGE = "📱 今日の進捗!A1:E8"
+
+
+class WorkspaceResolverError(RuntimeError):
+    """Safe machine-readable resolver failure without credential/source detail."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
 
 def _sheet_values(resource_id: str, range_name: str) -> list[list[object]]:
     if resource_id != DASHBOARD_ID:
-        raise ValueError("workspace resource is not allowlisted")
+        raise WorkspaceResolverError("workspace_resource_not_allowlisted")
     import urllib.error, urllib.parse, urllib.request
     from sinria_constants import get_sinria_home
     token_path = Path(get_sinria_home()) / "google_token.json"
-    payload = json.loads(token_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise WorkspaceResolverError("workspace_token_missing") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkspaceResolverError("workspace_token_invalid") from exc
+    required = ("client_id", "client_secret", "refresh_token")
+    if not all(isinstance(payload.get(key), str) and payload[key] for key in required):
+        raise WorkspaceResolverError("workspace_token_invalid")
     refresh = urllib.parse.urlencode({"client_id": payload["client_id"], "client_secret": payload["client_secret"],
         "refresh_token": payload["refresh_token"], "grant_type": "refresh_token"}).encode()
     request = urllib.request.Request("https://oauth2.googleapis.com/token", data=refresh, method="POST")
-    with urllib.request.urlopen(request, timeout=30) as response:
-        access_token = json.loads(response.read())["access_token"]
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            access_token = json.loads(response.read())["access_token"]
+    except Exception as exc:
+        raise WorkspaceResolverError("workspace_token_refresh_failed") from exc
     encoded_range = urllib.parse.quote(range_name, safe="")
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{resource_id}/values/{encoded_range}"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        result = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        code = "workspace_source_access_denied" if exc.code in {401, 403} else "workspace_source_unavailable"
+        raise WorkspaceResolverError(code) from exc
+    except Exception as exc:
+        raise WorkspaceResolverError("workspace_source_unavailable") from exc
     return result.get("values", [])
+
+
+def workspace_preflight() -> dict:
+    try:
+        _sheet_values(DASHBOARD_ID, PREFLIGHT_RANGE)
+    except WorkspaceResolverError as exc:
+        return {"ok": False, "workspaceAccess": False, "errorCode": exc.code, "rawContextStored": False}
+    except Exception:
+        return {"ok": False, "workspaceAccess": False, "errorCode": "workspace_source_unavailable", "rawContextStored": False}
+    return {"ok": True, "workspaceAccess": True, "resourceId": DASHBOARD_ID,
+            "range": PREFLIGHT_RANGE, "rawContextStored": False}
 
 def execute(envelope: dict) -> dict:
     event = envelope.get("event", envelope)
@@ -67,11 +105,21 @@ def execute(envelope: dict) -> dict:
             "rawContextStored": False, "externalActionPerformed": False}
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--preflight", action="store_true")
+    args = parser.parse_args()
+    if args.preflight:
+        result = workspace_preflight()
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["ok"] else 2
     try:
         value = json.load(sys.stdin)
         print(json.dumps(execute(value), ensure_ascii=False))
         return 0
+    except WorkspaceResolverError as exc:
+        print(json.dumps({"error": "consultation execution rejected", "errorCode": exc.code}))
+        return 2
     except Exception:
-        print(json.dumps({"error": "consultation execution rejected"}))
+        print(json.dumps({"error": "consultation execution rejected", "errorCode": "consultation_execution_rejected"}))
         return 2
 if __name__ == "__main__": raise SystemExit(main())

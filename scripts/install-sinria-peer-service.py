@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -68,6 +69,26 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
     }
 
 
+def run_workspace_preflight(plist: dict, root: Path) -> dict:
+    command_text = plist.get("EnvironmentVariables", {}).get("PEER_EXECUTOR_COMMAND", "")
+    command = shlex.split(command_text)
+    if not command:
+        return {"exit": 2, "result": {"ok": False, "errorCode": "workspace_preflight_not_configured"}, "error": None}
+    env = os.environ.copy(); env.update(plist["EnvironmentVariables"])
+    try:
+        completed = subprocess.run(
+            command + ["--preflight"], cwd=root, env=env, text=True,
+            capture_output=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"exit": 2, "result": {"ok": False, "errorCode": "workspace_preflight_unavailable"}, "error": None}
+    try:
+        payload = json.loads(completed.stdout) if completed.stdout else None
+    except json.JSONDecodeError:
+        payload = {"ok": False, "errorCode": "workspace_preflight_invalid_output"}
+    return {"exit": completed.returncode, "result": payload, "error": None}
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=("executor", "validator"), required=True)
@@ -85,16 +106,24 @@ def main() -> None:
     plist = build_plist(root=root, mode=a.mode, member_id=a.member_id, instance_id=a.instance_id,
                         subject=a.subject, base_url=a.base_url, poll_interval=a.poll_interval,
                         notify_target=a.notify_target)
+    workspace_preflight = run_workspace_preflight(plist, root) if a.mode == "executor" else None
     if a.preflight:
         env = os.environ.copy(); env.update(plist["EnvironmentVariables"])
         command = plist["ProgramArguments"][:2] + ["--preflight", "--mode", a.mode]
         result = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=60)
+        exit_code = result.returncode
+        if workspace_preflight is not None and workspace_preflight["exit"] != 0:
+            exit_code = workspace_preflight["exit"]
         print(json.dumps({
-            "exit": result.returncode,
+            "exit": exit_code,
             "result": json.loads(result.stdout) if result.stdout else None,
+            "workspacePreflight": workspace_preflight,
             "error": result.stderr[-500:] if result.stderr else None,
         }))
-        raise SystemExit(result.returncode)
+        raise SystemExit(exit_code)
+    if workspace_preflight is not None and workspace_preflight["exit"] != 0:
+        print(json.dumps({"installed": False, "workspacePreflight": workspace_preflight}))
+        raise SystemExit(workspace_preflight["exit"])
     launch_agents = Path.home() / "Library/LaunchAgents"
     logs = Path.home() / ".sinria/logs"
     launch_agents.mkdir(parents=True, exist_ok=True); logs.mkdir(parents=True, exist_ok=True)
