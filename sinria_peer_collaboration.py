@@ -10,6 +10,19 @@ from sinria_consultation import validate_consultation
 _SECRET = re.compile(r"(?i)(?:sk-[A-Za-z0-9_-]+|(?:token|secret|password|credential|authorization|bearer|api[_-]?key)\s*[:=]?\s*[^\s,;]+)")
 _PHI = re.compile(r"(?is)\b(?:patient|medical\s+record|diagnosis|ssn|social\s+security|dob|date\s+of\s+birth|mrn)\s*[:#-]?[^\n;,.]{0,240}")
 _ALLOWED_REF = re.compile(r"^(?:local|run)://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,200}$")
+SAFE_PEER_ERROR_CODES = frozenset({
+    "workspace_token_missing",
+    "workspace_token_invalid",
+    "workspace_token_refresh_failed",
+    "workspace_source_access_denied",
+    "workspace_source_unavailable",
+    "consultation_execution_rejected",
+})
+
+
+def safe_failure_note(value: Any) -> str:
+    code = str(value)
+    return code if code in SAFE_PEER_ERROR_CODES else "peer execution failed"
 
 
 def sanitize_summary(value: Any, *, limit: int = 500) -> str:
@@ -218,6 +231,6 @@ class PeerCollaborationRunner:
             self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="decision_required", idempotencyKey=self._key(run.run_id, "complete", attempt))
             return {"runId": run.run_id, "status": "decision_required"}
         except Exception as exc:
-            try: self.transport.fail_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="peer execution failed", idempotencyKey=self._key(run.run_id, "fail", attempt))
+            try: self.transport.fail_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=safe_failure_note(exc), idempotencyKey=self._key(run.run_id, "fail", attempt))
             except Exception: pass
             return {"runId": run.run_id, "status": "failed", "error": sanitize_summary(exc)}

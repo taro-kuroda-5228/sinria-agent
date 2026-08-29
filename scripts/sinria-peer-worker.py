@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
-from sinria_peer_collaboration import PeerCollaborationRunner, sanitize_summary
+from sinria_peer_collaboration import PeerCollaborationRunner, SAFE_PEER_ERROR_CODES, sanitize_summary
 
 
 def command_adapter(name, *, mode):
@@ -23,15 +23,14 @@ def command_adapter(name, *, mode):
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("local peer command timed out") from exc
         if proc.returncode != 0:
-            reason = ""
             try:
                 parsed = json.loads(proc.stdout)
-                if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
-                    reason = parsed["error"][:160]
+                code = parsed.get("errorCode") if isinstance(parsed, dict) else None
+                if isinstance(code, str) and code in SAFE_PEER_ERROR_CODES:
+                    raise RuntimeError(code)
             except (TypeError, json.JSONDecodeError):
                 pass
-            suffix = f": {reason}" if reason else ""
-            raise RuntimeError(f"local peer command exited {proc.returncode}{suffix}")
+            raise RuntimeError("peer command failed")
         try:
             value = json.loads(proc.stdout)
         except (TypeError, json.JSONDecodeError) as exc:

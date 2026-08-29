@@ -33,6 +33,7 @@ class Store:
         self.events = [event('e0')]
         self.runs = [run_payload('r0', 'kikuchi', 'k-1', 'e0')]
         self.calls = []
+        self.failure_notes = []
         self.n = 1
     def sweep_conversation_runs(self, identity, **kw):
         self.calls.append('sweep')
@@ -49,7 +50,8 @@ class Store:
     def create_conversation_run(self, identity, **kw):
         rid = f'r{self.n}'; self.n += 1; row = run_payload(rid, kw['targetMemberId'], kw['targetInstanceId'], kw['triggeredByEventId'], revision=1); self.runs.append(row); return {'run': row}
     def complete_conversation_run(self, identity, **kw): self.calls.append('complete'); return {'run': {}}
-    def fail_conversation_run(self, identity, **kw): self.calls.append('fail')
+    def fail_conversation_run(self, identity, **kw):
+        self.calls.append('fail'); self.failure_notes.append(kw['sanitizedStatusNote'])
 
 class Identity:
     def __init__(self, member, instance): self.member_id, self.instance_id = member, instance
@@ -116,3 +118,27 @@ def test_executor_and_validator_flow_with_wrong_instance_rejection():
     validator = PeerCollaborationRunner(store, Identity('taro', 'taro-1'), target_member_id='taro', target_instance_id='taro-1', executor=lambda r,e: {}, validator=lambda r,e: 'accepted', mode='validator')
     assert validator.run_once()['status'] == 'accepted'
     assert store.calls == ['sweep', 'sweep', 'claim', 'complete', 'sweep', 'claim', 'complete']
+
+
+def test_executor_safe_error_code_is_persisted_without_raw_exception():
+    store = Store()
+
+    def fail(*_):
+        raise RuntimeError('workspace_source_access_denied')
+
+    runner = PeerCollaborationRunner(store, Identity('kikuchi', 'k-1'), target_member_id='kikuchi',
+                                     target_instance_id='k-1', executor=fail, validator=lambda *_: 'accepted')
+    result = runner.run_once()
+    assert result is not None
+    assert result['status'] == 'failed'
+    assert store.failure_notes == ['workspace_source_access_denied']
+
+    store = Store()
+
+    def unsafe(*_):
+        raise RuntimeError('credential at /tmp/private/token.json')
+
+    runner = PeerCollaborationRunner(store, Identity('kikuchi', 'k-1'), target_member_id='kikuchi',
+                                     target_instance_id='k-1', executor=unsafe, validator=lambda *_: 'accepted')
+    runner.run_once()
+    assert store.failure_notes == ['peer execution failed']

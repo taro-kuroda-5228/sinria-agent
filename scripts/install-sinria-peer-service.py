@@ -135,7 +135,8 @@ def main() -> None:
         subprocess.run(["launchctl", "bootout", domain, str(path)], capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
         subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{plist['Label']}"], check=True)
-    print(json.dumps({"installed": True, "label": plist["Label"], "plist": str(path), "root": str(root), "loaded": not a.no_load}))
+    print(json.dumps({"installed": True, "label": plist["Label"], "plist": str(path), "root": str(root),
+                      "loaded": not a.no_load, "workspacePreflight": workspace_preflight}))
 
 
 if __name__ == "__main__":
