@@ -8,7 +8,11 @@ import os
 import plistlib
 import shlex
 import subprocess
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sinria_constants import get_sinria_home
 
 
 def git_common_dir(root: Path) -> Path:
@@ -46,7 +50,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
     if not worker.exists() or not command_script.exists():
         raise SystemExit("peer worker scripts not found in primary checkout")
     command_env = "PEER_EXECUTOR_COMMAND" if mode == "executor" else "PEER_VALIDATOR_COMMAND"
-    logs = Path.home() / ".sinria/logs"
+    logs = get_sinria_home() / "logs"
     return {
         "Label": f"ai.sinria.peer-worker.{mode}",
         "ProgramArguments": [str(python), str(worker), "--mode", mode, "--poll-interval", str(poll_interval)],
@@ -56,6 +60,7 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
             "COMPANY_OS_MEMBER_ID": member_id,
             "COMPANY_OS_INSTANCE_ID": instance_id,
             "COMPANY_OS_TRANSPORT_SUBJECT": subject,
+            "SINRIA_HOME": str(get_sinria_home()),
             command_env: f"{python} {command_script}",
 
             "PYTHONUNBUFFERED": "1",
