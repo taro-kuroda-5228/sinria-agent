@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib.util
+import pytest
 import sys
 
 
@@ -50,3 +51,19 @@ def test_worker_executor_adapter_accepts_the_real_callback_envelope(monkeypatch)
     assert result["rawContextStored"] is False
     assert result["externalActionPerformed"] is False
     assert result["refs"] == ["run://event/evt_1"]
+
+
+def test_worker_command_adapter_propagates_only_allowlisted_error_code(monkeypatch, tmp_path):
+    module = _worker_module()
+    command = tmp_path / "fails.py"
+    command.write_text(
+        "import json; print(json.dumps({'errorCode':'workspace_source_access_denied'})); raise SystemExit(2)"
+    )
+    monkeypatch.setenv("PEER_EXECUTOR_COMMAND", f"{sys.executable} {command}")
+    invoke = module.command_adapter("PEER_EXECUTOR_COMMAND", mode="executor")
+    with pytest.raises(RuntimeError, match="^workspace_source_access_denied$"):
+        invoke({}, {})
+
+    command.write_text("print('unsafe local path /tmp/private'); raise SystemExit(2)")
+    with pytest.raises(RuntimeError, match="^peer command failed$"):
+        invoke({}, {})

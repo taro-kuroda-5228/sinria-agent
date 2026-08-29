@@ -94,3 +94,6 @@ def test_executor_workspace_preflight_uses_installed_command_and_safe_json(monke
         "result": {"ok": False, "errorCode": "workspace_token_missing"},
         "error": None,
     }
+    source = SERVICE.read_text()
+    final_receipt = source[source.rfind('print(json.dumps({"installed": True'):]
+    assert '"workspacePreflight": workspace_preflight' in final_receipt
