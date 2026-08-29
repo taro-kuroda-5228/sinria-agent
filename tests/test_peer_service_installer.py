@@ -47,6 +47,7 @@ def test_plist_pins_primary_checkout_and_contains_no_token(tmp_path, monkeypatch
     assert str(primary / "scripts" / "sinria-peer-worker.py") in raw
     assert "SINRIA_COMPANY_OS_TRANSPORT_TOKEN" not in raw
     assert "SINRIA_PROFILE" not in raw
+    assert plist["EnvironmentVariables"]["SINRIA_HOME"] == str(module.get_sinria_home())
     assert plist["KeepAlive"] is True
     assert plist["RunAtLoad"] is True
     assert plist["Label"] == "ai.sinria.peer-worker.executor"
