@@ -1,6 +1,7 @@
 import importlib.util
 import plistlib
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "scripts" / "install-sinria-peer-service.py"
@@ -69,3 +70,27 @@ def test_python_path_keeps_venv_symlink_instead_of_resolving_base_interpreter(tm
     venv.mkdir(parents=True)
     (venv / "python").symlink_to(base)
     assert module.python_path(root) == venv / "python"
+
+
+def test_executor_workspace_preflight_uses_installed_command_and_safe_json(monkeypatch, tmp_path):
+    module = load_service()
+    plist = {
+        "EnvironmentVariables": {
+            "PEER_EXECUTOR_COMMAND": "/safe/venv/python /safe/peer-consultation-executor.py",
+        }
+    }
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=2, stdout='{"ok": false, "errorCode": "workspace_token_missing"}\n', stderr='')
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    result = module.run_workspace_preflight(plist, tmp_path)
+    assert captured["command"] == ["/safe/venv/python", "/safe/peer-consultation-executor.py", "--preflight"]
+    assert result == {
+        "exit": 2,
+        "result": {"ok": False, "errorCode": "workspace_token_missing"},
+        "error": None,
+    }
