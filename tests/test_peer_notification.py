@@ -26,7 +26,7 @@ def test_notify_target_is_validator_only(tmp_path, monkeypatch):
     module = load_script('install-sinria-peer-service.py')
     root = tmp_path / 'sinria-agent'
     (root / 'scripts').mkdir(parents=True)
-    for name in ('sinria-peer-worker.py', 'synthetic-peer-executor.py', 'synthetic-peer-validator.py'):
+    for name in ('sinria-peer-worker.py', 'peer-consultation-executor.py', 'synthetic-peer-validator.py'):
         (root / 'scripts' / name).write_text('')
     python = root / '.venv/bin/python'
     python.parent.mkdir(parents=True)

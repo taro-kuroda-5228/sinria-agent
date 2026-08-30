@@ -5,7 +5,7 @@ Only bounded consultation metadata crosses Company OS. Google Workspace source
 bodies are fetched and reduced locally; cell contents are never printed.
 """
 from __future__ import annotations
-import argparse, json, os, sys
+import argparse, json, os, re, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sinria_consultation import validate_consultation
@@ -76,9 +76,31 @@ def execute(envelope: dict) -> dict:
     if not meta or meta["type"] != "consultation_request":
         # Preserve existing synthetic canary behavior.
         preview = event.get("sanitizedPreview")
-        if not isinstance(preview, str) or not preview.startswith("Synthetic metadata-only") or event.get("bodyRef") is not None:
-            raise ValueError("unsupported peer event")
-        return {"summary": "Synthetic peer task executed; sanitized completion receipt returned.", "refs": [f"run://event/{event.get('eventId', 'unknown')}"], "rawContextStored": False, "externalActionPerformed": False}
+        if isinstance(preview, str) and preview.startswith("Synthetic metadata-only") and event.get("bodyRef") is None:
+            return {"summary": "Synthetic peer task executed; sanitized completion receipt returned.", "refs": [f"run://event/{event.get('eventId', 'unknown')}"], "rawContextStored": False, "externalActionPerformed": False}
+        event_id = event.get("eventId")
+        if (
+            event.get("kind") == "user_message"
+            and isinstance(preview, str)
+            and bool(preview.strip())
+            and event.get("bodyRef") is None
+            and isinstance(event_id, str)
+            and re.fullmatch(r"[A-Za-z0-9._:-]{1,120}", event_id)
+        ):
+            # Plain peer messages have no typed source/operation contract. Complete
+            # them with an explicit decision-required receipt instead of retrying
+            # forever or silently granting broad execution authority.
+            return {
+                "summary": (
+                    "Peer request received; automatic execution was not performed because "
+                    "consultation.v1 metadata is absent. Resend as a structured consultation "
+                    "or request human review."
+                ),
+                "refs": [f"run://event/{event_id}"],
+                "rawContextStored": False,
+                "externalActionPerformed": False,
+            }
+        raise ValueError("unsupported peer event")
     aggregate: list[list[object]] = []
     for ref in meta["sourceRefs"]:
         if ref["provider"] != "google_workspace" or not ref.get("range"):

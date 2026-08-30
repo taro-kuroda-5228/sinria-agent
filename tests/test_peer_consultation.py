@@ -37,6 +37,52 @@ def test_executor_resolves_workspace_locally_and_returns_no_body(monkeypatch):
     assert result['consultationMetadata']['confidence'] == .9
     assert 'body' not in result and result['rawContextStored'] is False
 
+
+def test_executor_completes_plain_user_message_with_safe_decision_required_receipt():
+    path = ROOT / 'scripts/peer-consultation-executor.py'
+    spec = importlib.util.spec_from_file_location('consult_exec_plain', path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    result = mod.execute({
+        'event': {
+            'eventId': 'evt_plain_1',
+            'kind': 'user_message',
+            'sanitizedPreview': 'Check whether a contact was already approached.',
+            'bodyRef': None,
+        }
+    })
+
+    assert result == {
+        'summary': (
+            'Peer request received; automatic execution was not performed because '
+            'consultation.v1 metadata is absent. Resend as a structured consultation '
+            'or request human review.'
+        ),
+        'refs': ['run://event/evt_plain_1'],
+        'rawContextStored': False,
+        'externalActionPerformed': False,
+    }
+
+
+def test_executor_rejects_plain_user_message_with_body_reference():
+    path = ROOT / 'scripts/peer-consultation-executor.py'
+    spec = importlib.util.spec_from_file_location('consult_exec_plain_body', path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    with pytest.raises(ValueError, match='unsupported peer event'):
+        mod.execute({
+            'event': {
+                'eventId': 'evt_plain_2',
+                'kind': 'user_message',
+                'sanitizedPreview': 'Process this body.',
+                'bodyRef': {'mode': 'local_only', 'ref': 'local://private'},
+            }
+        })
+
 def test_queue_prefers_subject_scoped_transport_token(monkeypatch):
     path = ROOT/'scripts/queue-peer-consultation.py'
     spec = importlib.util.spec_from_file_location('consult_queue', path)
