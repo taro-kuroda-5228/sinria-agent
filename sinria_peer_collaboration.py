@@ -193,6 +193,11 @@ class PeerCollaborationRunner:
             claimed = self.transport.claim_conversation_run(self.identity, runId=run.run_id, idempotencyKey=self._key(run.run_id, "claim", attempt))
             run = ConversationRun.from_payload(claimed.get("run", claimed))
             event = self._load_event(run)
+            notification_context = {
+                "authorMemberId": event.author_member_id,
+                "authorInstanceId": event.author_instance_id,
+                "sanitizedPreview": event.sanitized_preview,
+            }
             if self.heartbeat: self.heartbeat(run)
             if self.mode == "executor":
                 result = self.executor(run, event.callback_payload())
@@ -207,16 +212,28 @@ class PeerCollaborationRunner:
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=payload["summary"], idempotencyKey=self._key(run.run_id, "complete", attempt))
                 created = validation.get("run", validation)
                 return {"runId": run.run_id, "status": "completed", "validationRunId": created.get("runId"), **payload}
-            if event.kind != "assistant_message": raise ValueError("validator run must target assistant_message")
+            if event.kind != "assistant_message":
+                self.transport.complete_conversation_run(
+                    self.identity,
+                    runId=run.run_id,
+                    sanitizedStatusNote="unsupported_validator_event",
+                    idempotencyKey=self._key(run.run_id, "complete", attempt),
+                )
+                return {
+                    "runId": run.run_id,
+                    "status": "decision_required",
+                    "reason": "unsupported_validator_event",
+                    **notification_context,
+                }
             verdict = self.validator(run, event.callback_payload())
             if isinstance(verdict, Mapping): verdict = verdict.get("verdict")
             if verdict not in {"accepted", "revision_requested", "decision_required"}: raise ValueError("invalid validator verdict")
             if verdict == "accepted":
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
-                return {"runId": run.run_id, "status": "accepted"}
+                return {"runId": run.run_id, "status": "accepted", **notification_context}
             if verdict == "decision_required":
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
-                return {"runId": run.run_id, "status": verdict}
+                return {"runId": run.run_id, "status": verdict, **notification_context}
             events = self.transport.list_conversation_events(self.identity, conversationId=run.conversation_id).get("events", [])
             revision_count = sum(1 for item in events if isinstance(item, Mapping) and item.get("kind") == "user_message"
                                  and "revision requested" in str(item.get("sanitizedPreview", "")).lower())
@@ -227,9 +244,9 @@ class PeerCollaborationRunner:
                     triggeredByEventId=revision.event_id, targetMemberId=event.author_member_id, targetInstanceId=event.author_instance_id,
                     idempotencyKey=self._key(run.run_id, "revision-run", attempt))
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=verdict, idempotencyKey=self._key(run.run_id, "complete", attempt))
-                return {"runId": run.run_id, "status": verdict, "nextRunId": created.get("run", created).get("runId")}
+                return {"runId": run.run_id, "status": verdict, "nextRunId": created.get("run", created).get("runId"), **notification_context}
             self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote="decision_required", idempotencyKey=self._key(run.run_id, "complete", attempt))
-            return {"runId": run.run_id, "status": "decision_required"}
+            return {"runId": run.run_id, "status": "decision_required", **notification_context}
         except Exception as exc:
             try: self.transport.fail_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=safe_failure_note(exc), idempotencyKey=self._key(run.run_id, "fail", attempt))
             except Exception: pass

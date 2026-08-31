@@ -50,6 +50,23 @@ def command_adapter(name, *, mode):
     return invoke
 
 
+def notification_receipt(completed):
+    failure = {'status': 'notify_error', 'error': 'peer notification delivery failed'}
+    if completed.returncode != 0:
+        return failure
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return failure
+    if not isinstance(payload, dict) or payload.get('success') is not True:
+        return failure
+    target = payload.get('target')
+    message_id = payload.get('messageId')
+    if not isinstance(target, str) or not target or not isinstance(message_id, str) or not message_id:
+        return failure
+    return {'status': 'notified', 'target': target, 'messageId': message_id}
+
+
 def main():
     load_dotenv(Path.home() / '.sinria' / '.env', override=False)
     if os.environ.get('SINRIA_COMPANY_OS_TRANSPORT_SUBJECT'):
@@ -108,8 +125,8 @@ def main():
                         timeout=30,
                         check=False,
                     )
-                    if completed.returncode != 0:
-                        print(json.dumps({'status': 'notify_error', 'error': 'peer notification delivery failed'}, ensure_ascii=False), flush=True)
+                    receipt = notification_receipt(completed)
+                    print(json.dumps(receipt, ensure_ascii=False), flush=True)
         except Exception as exc:
             print(json.dumps({"status": "poll_error", "error": sanitize_summary(exc)}, ensure_ascii=False), flush=True)
         time.sleep(a.poll_interval)

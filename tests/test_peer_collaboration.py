@@ -79,6 +79,39 @@ def test_decision_required_stops_without_creating_revision_run():
     assert store.calls == ['sweep', 'claim', 'complete']
 
 
+def test_validator_closes_non_assistant_run_without_retrying():
+    store = Store()
+    validator_called = False
+
+    def validate(*_):
+        nonlocal validator_called
+        validator_called = True
+        return 'accepted'
+
+    validator = PeerCollaborationRunner(
+        store,
+        Identity('kikuchi', 'k-1'),
+        target_member_id='kikuchi',
+        target_instance_id='k-1',
+        executor=lambda *_: {},
+        validator=validate,
+        mode='validator',
+    )
+
+    result = validator.run_once()
+
+    assert result == {
+        'runId': 'r0',
+        'status': 'decision_required',
+        'reason': 'unsupported_validator_event',
+        'authorMemberId': 'taro',
+        'authorInstanceId': 'taro-1',
+        'sanitizedPreview': 'hello',
+    }
+    assert validator_called is False
+    assert store.calls == ['sweep', 'claim', 'complete']
+
+
 def test_runner_fail_closed_filters_cross_member_runs_returned_by_backend():
     store = Store()
     store.list_conversation_runs = lambda identity, **kw: {'runs': list(store.runs)}
