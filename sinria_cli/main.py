@@ -17,6 +17,12 @@ def _pin_sinria_runtime_env() -> None:
 
 def main() -> None:
     _pin_sinria_runtime_env()
+    import sys
+
+    from sinria_cli.credential_commands import dispatch as dispatch_credentials
+
+    if dispatch_credentials(sys.argv[1:]):
+        return
     from hermes_cli.main import main as _compat_main
 
     _compat_main()
