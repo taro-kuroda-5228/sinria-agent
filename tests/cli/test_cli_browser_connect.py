@@ -30,6 +30,7 @@ class TestChromeDebugLaunch:
 
         with patch("hermes_cli.browser_connect.shutil.which", side_effect=lambda name: r"C:\Chrome\chrome.exe" if name == "chrome.exe" else None), \
              patch("hermes_cli.browser_connect.os.path.isfile", side_effect=lambda path: path == r"C:\Chrome\chrome.exe"), \
+             patch("hermes_cli.browser_connect._wait_for_browser_debug_ready_or_exit", return_value="ready"), \
              patch("subprocess.Popen", side_effect=fake_popen):
             assert HermesCLI._try_launch_chrome_debug(9333, "Windows") is True
 
@@ -59,6 +60,7 @@ class TestChromeDebugLaunch:
 
         with patch("hermes_cli.browser_connect.shutil.which", return_value=None), \
              patch("hermes_cli.browser_connect.os.path.isfile", side_effect=lambda path: path == installed), \
+             patch("hermes_cli.browser_connect._wait_for_browser_debug_ready_or_exit", return_value="ready"), \
              patch("subprocess.Popen", side_effect=fake_popen):
             assert HermesCLI._try_launch_chrome_debug(9222, "Windows") is True
 
