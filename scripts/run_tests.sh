@@ -47,7 +47,8 @@ if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; the
 fi
 
 VENV=""
-VENV_CANDIDATES=("$REPO_ROOT/.venv" "$REPO_ROOT/venv")
+# Allow linked worktrees to reuse an already provisioned test environment.
+VENV_CANDIDATES=("${SINRIA_TEST_VENV:-}" "$REPO_ROOT/.venv" "$REPO_ROOT/venv")
 if [ -n "$MAIN_CHECKOUT_ROOT" ] && [ "$MAIN_CHECKOUT_ROOT" != "$REPO_ROOT" ]; then
   VENV_CANDIDATES+=("$MAIN_CHECKOUT_ROOT/.venv" "$MAIN_CHECKOUT_ROOT/venv")
 fi
