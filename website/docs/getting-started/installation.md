@@ -132,6 +132,37 @@ sinria setup          # Or run the full setup wizard
 
 ---
 
+## Consent-based real-profile browser setup (macOS)
+
+Sinria's real-profile browser mode is opt-in. Run the normal setup first, then
+set the consent switch in the user configuration:
+
+```bash
+sinria setup
+sinria config set browser.use_real_profile true
+```
+
+The switch is stored at `~/.sinria/config.yaml`. When enabled, Sinria detects
+the stable default Chromium channel (Chrome, Edge, Brave, or Chromium), reads
+the active profile from the browser's real user-data directory, and copies the
+needed authentication state into the Sinria-owned path
+`~/.sinria/browser-profile/<browser>`. Browser commands for a task then reuse
+one persistent CDP-backed session for navigation and subsequent commands.
+
+The source profile is not modified and Sinria does not attach to the browser
+that you use interactively. To revoke consent and remove copied profile data:
+
+```bash
+sinria config set browser.use_real_profile false
+```
+
+The next local-browser session removes the copied snapshot. If the default
+browser is not a supported stable Chromium channel, or the profile cannot be
+snapshotted/launched, Sinria fails closed; it does not silently switch to a
+cloud browser. Real-profile mode is incompatible with the Lightpanda engine.
+
+---
+
 ## Prerequisites
 
 **pip install:** Python 3.11+.
