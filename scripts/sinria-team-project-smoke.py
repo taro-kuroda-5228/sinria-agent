@@ -44,6 +44,7 @@ def main() -> int:
                 "operations",
                 depends_on=["draft"],
                 operation="write",
+                scope="external",
                 acceptance_criteria=["brief-recorded"],
             ),
         ]
