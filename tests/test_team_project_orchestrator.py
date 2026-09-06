@@ -100,6 +100,153 @@ def test_missing_capable_worker_waits_instead_of_faking_completion(tmp_path):
     assert state["tasks"]["build"]["assignedMemberId"] is None
 
 
+def test_internal_company_knowledge_write_runs_without_human_approval(tmp_path):
+    calls = []
+
+    def execute(_worker, task, _attempt, _key):
+        calls.append((task.operation, task.scope, task.input_refs))
+        return TaskResult(
+            "stored internally",
+            ["company-knowledge://operating-knowledge/brief-1"],
+            {"knowledge-stored": "company-knowledge://operating-knowledge/brief-1"},
+        )
+
+    orchestrator = TeamProjectOrchestrator(
+        JsonProjectStore(tmp_path / "projects.json"),
+        workers=[Worker("member-a", "inst-a", {"operations"})],
+        planner=lambda _: [
+            TaskSpec(
+                "store",
+                "Store confidential context internally",
+                "operations",
+                operation="write",
+                scope="company_knowledge",
+                input_refs=[
+                    "local://approved-context/brief-1",
+                    "vault://service-credential/company-knowledge",
+                ],
+                acceptance_criteria=["knowledge-stored"],
+            )
+        ],
+        executors={"operations": execute},
+    )
+    orchestrator.create_project(
+        ProjectSpec("project-internal-write", "Store internal context", ["knowledge-stored"])
+    )
+
+    completed = orchestrator.run_until_blocked("project-internal-write")
+
+    assert completed["status"] == "completed"
+    assert completed["tasks"]["store"]["approval"] is None
+    assert calls == [
+        (
+            "write",
+            "company_knowledge",
+            [
+                "local://approved-context/brief-1",
+                "vault://service-credential/company-knowledge",
+            ],
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation", "scope", "reversible"),
+    [
+        ("send", "external", True),
+        ("delete", "local", False),
+        ("billing", "external", True),
+        ("auth", "local", True),
+        ("permission", "company_knowledge", True),
+        ("production", "production", True),
+    ],
+)
+def test_only_egress_irreversible_and_privileged_operations_wait_for_approval(
+    tmp_path, operation, scope, reversible
+):
+    orchestrator = TeamProjectOrchestrator(
+        JsonProjectStore(tmp_path / "projects.json"),
+        workers=[Worker("member-a", "inst-a", {"operations"})],
+        planner=lambda _: [
+            TaskSpec(
+                "action",
+                "Perform bounded action",
+                "operations",
+                operation=operation,
+                scope=scope,
+                reversible=reversible,
+            )
+        ],
+        executors={},
+    )
+    orchestrator.create_project(ProjectSpec("project-gated", "Act", ["acted"]))
+
+    blocked = orchestrator.run_until_blocked("project-gated")
+
+    assert blocked["status"] == "waiting_approval"
+    assert blocked["tasks"]["action"]["status"] == "waiting_approval"
+
+
+def test_reversible_local_delete_is_autonomous(tmp_path):
+    orchestrator = TeamProjectOrchestrator(
+        JsonProjectStore(tmp_path / "projects.json"),
+        workers=[Worker("member-a", "inst-a", {"operations"})],
+        planner=lambda _: [
+            TaskSpec(
+                "archive",
+                "Move scratch artifact to recoverable trash",
+                "operations",
+                operation="delete",
+                scope="local",
+                reversible=True,
+                acceptance_criteria=["archived"],
+            )
+        ],
+        executors={
+            "operations": lambda *_: TaskResult(
+                "archived",
+                ["local://trash/artifact-1"],
+                {"archived": "local://trash/artifact-1"},
+            )
+        },
+    )
+    orchestrator.create_project(ProjectSpec("project-archive", "Archive", ["archived"]))
+
+    completed = orchestrator.run_until_blocked("project-archive")
+
+    assert completed["status"] == "completed"
+    assert completed["tasks"]["archive"]["approval"] is None
+
+
+def test_external_public_read_is_autonomous_when_no_private_payload_is_sent(tmp_path):
+    orchestrator = TeamProjectOrchestrator(
+        JsonProjectStore(tmp_path / "projects.json"),
+        workers=[Worker("member-a", "inst-a", {"research"})],
+        planner=lambda _: [
+            TaskSpec(
+                "research",
+                "Read a public source",
+                "research",
+                operation="read",
+                scope="external",
+                acceptance_criteria=["grounded"],
+            )
+        ],
+        executors={
+            "research": lambda *_: TaskResult(
+                "grounded",
+                ["artifact://public-source/1"],
+                {"grounded": "artifact://public-source/1"},
+            )
+        },
+    )
+    orchestrator.create_project(ProjectSpec("project-public-read", "Research", ["grounded"]))
+
+    completed = orchestrator.run_until_blocked("project-public-read")
+
+    assert completed["status"] == "completed"
+
+
 def test_project_runs_across_workers_revises_gates_and_recovers_after_restart(tmp_path):
     path = tmp_path / "projects.json"
     calls = []
@@ -126,6 +273,7 @@ def test_project_runs_across_workers_revises_gates_and_recovers_after_restart(tm
                 "operations",
                 depends_on=["draft"],
                 operation="write",
+                scope="external",
                 acceptance_criteria=["brief-recorded"],
             ),
         ]

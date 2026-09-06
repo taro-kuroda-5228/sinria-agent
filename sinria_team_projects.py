@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 
-AUTO_OPERATIONS = {"read", "draft"}
-GATED_OPERATIONS = {
+SUPPORTED_OPERATIONS = {
+    "read",
+    "draft",
     "write",
     "send",
     "delete",
@@ -23,8 +24,12 @@ GATED_OPERATIONS = {
     "production",
     "clinical_patient_data",
 }
+PRIVILEGED_OPERATIONS = {"billing", "auth", "permission", "production"}
+INTERNAL_SCOPES = {"local", "company_knowledge"}
+SUPPORTED_SCOPES = INTERNAL_SCOPES | {"external", "production"}
 VERDICTS = {"accepted", "revision_requested", "decision_required"}
-EVIDENCE_SCHEMES = ("run://", "local://", "artifact://")
+EVIDENCE_SCHEMES = ("run://", "local://", "artifact://", "company-knowledge://")
+INPUT_REFERENCE_SCHEMES = EVIDENCE_SCHEMES + ("vault://",)
 FORBIDDEN_KEYS = {
     "body",
     "rawbody",
@@ -107,18 +112,47 @@ class TaskSpec:
     capability: str
     depends_on: list[str] = field(default_factory=list)
     operation: str = "read"
+    scope: str = "local"
+    reversible: bool = False
+    input_refs: list[str] = field(default_factory=list)
     acceptance_criteria: list[str] = field(default_factory=list)
 
     def validate(self) -> "TaskSpec":
         _validate_identifier(self.task_id, "task_id")
         if not self.summary.strip() or not self.capability.strip():
             raise ValueError("task summary and capability are required")
-        if self.operation not in AUTO_OPERATIONS | GATED_OPERATIONS:
+        if self.operation not in SUPPORTED_OPERATIONS:
             raise ValueError("unsupported task operation")
+        if self.scope not in SUPPORTED_SCOPES:
+            raise ValueError("unsupported task scope")
+        for ref in self.input_refs:
+            if not isinstance(ref, str) or not ref.startswith(INPUT_REFERENCE_SCHEMES):
+                raise UnsafeProjectMetadata(
+                    "task inputs must use local, Company Knowledge, artifact, run, or vault references"
+                )
         if len(set(self.depends_on)) != len(self.depends_on):
             raise ValueError("duplicate dependency")
         validate_safe_metadata(asdict(self))
         return self
+
+
+def requires_approval(task: TaskSpec) -> bool:
+    """Gate only egress, production, privileged, or irreversible operations."""
+
+    if task.operation in PRIVILEGED_OPERATIONS:
+        return True
+    if task.scope == "production":
+        return True
+    if task.scope == "external" and task.operation in {
+        "write",
+        "send",
+        "delete",
+        "clinical_patient_data",
+    }:
+        return True
+    if task.operation == "delete" and not task.reversible:
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -322,7 +356,7 @@ class TeamProjectOrchestrator:
         if task is None:
             raise KeyError(f"unknown task: {task_id}")
         spec = TaskSpec(**task["spec"])
-        if spec.operation not in GATED_OPERATIONS:
+        if not requires_approval(spec):
             raise ValueError("task does not require approval")
         if task["status"] != "waiting_approval":
             raise ValueError("task is not waiting for approval")
@@ -382,7 +416,7 @@ class TeamProjectOrchestrator:
                     if entry["status"] not in {"waiting_approval", "waiting_worker"}:
                         entry["status"] = "pending"
                     continue
-                if spec.operation in GATED_OPERATIONS and entry["approval"] is None:
+                if requires_approval(spec) and entry["approval"] is None:
                     if entry["status"] != "waiting_approval":
                         entry["status"] = "waiting_approval"
                         progressed = True
