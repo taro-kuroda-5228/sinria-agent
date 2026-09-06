@@ -3,6 +3,8 @@ import plistlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "scripts" / "install-sinria-peer-service.py"
 WORKER = ROOT / "scripts" / "sinria-peer-worker.py"
@@ -51,6 +53,55 @@ def test_plist_pins_primary_checkout_and_contains_no_token(tmp_path, monkeypatch
     assert plist["KeepAlive"] is True
     assert plist["RunAtLoad"] is True
     assert plist["Label"] == "ai.sinria.peer-worker.executor"
+
+
+def test_plist_can_enable_team_capabilities_without_embedding_context_or_secrets(tmp_path):
+    module = load_service()
+    primary = tmp_path / "sinria-agent"
+    (primary / "scripts").mkdir(parents=True)
+    (primary / ".venv" / "bin").mkdir(parents=True)
+    (primary / ".venv" / "bin" / "python").write_text("")
+    (primary / "scripts" / "sinria-peer-worker.py").write_text("")
+    (primary / "scripts" / "peer-consultation-executor.py").write_text("")
+
+    plist = module.build_plist(
+        root=primary,
+        mode="executor",
+        member_id="member_kikuchi",
+        instance_id="inst_kikuchi_local",
+        subject="profile-kikuchi",
+        base_url="https://company.example",
+        poll_interval=15,
+        team_capabilities=("research", "writing"),
+        team_space_id="space-team",
+        team_conversation_id="conversation-team",
+        team_executor_command="/safe/local-team-executor",
+    )
+
+    environment = plist["EnvironmentVariables"]
+    assert environment["SINRIA_TEAM_CAPABILITIES"] == "research,writing"
+    assert environment["SINRIA_TEAM_SPACE_ID"] == "space-team"
+    assert environment["SINRIA_TEAM_CONVERSATION_ID"] == "conversation-team"
+    assert environment["SINRIA_TEAM_PROJECT_EXECUTOR_COMMAND"] == "/safe/local-team-executor"
+    raw = plistlib.dumps(plist).decode().lower()
+    assert "rawcontext" not in raw
+    assert "password=" not in raw
+    assert "token=" not in raw
+
+    with pytest.raises(ValueError, match="must not contain credentials"):
+        module.build_plist(
+            root=primary,
+            mode="executor",
+            member_id="member_kikuchi",
+            instance_id="inst_kikuchi_local",
+            subject="profile-kikuchi",
+            base_url="https://company.example",
+            poll_interval=15,
+            team_capabilities=("research",),
+            team_space_id="space-team",
+            team_conversation_id="conversation-team",
+            team_executor_command="/safe/executor --token=secret-value",
+        )
 
 
 def test_primary_checkout_resolution_uses_git_common_dir(tmp_path, monkeypatch):

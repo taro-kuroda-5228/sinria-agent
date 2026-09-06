@@ -38,6 +38,53 @@ def test_executor_resolves_workspace_locally_and_returns_no_body(monkeypatch):
     assert 'body' not in result and result['rawContextStored'] is False
 
 
+def test_executor_routes_team_project_request_to_a_local_capability_handler():
+    path = ROOT / 'scripts/peer-consultation-executor.py'
+    spec = importlib.util.spec_from_file_location('team_project_exec', path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    request_meta = {
+        'schemaVersion': 'team-project.v1',
+        'type': 'task_request',
+        'dispatchId': 'dispatch-1',
+        'projectId': 'project-1',
+        'taskId': 'research',
+        'capability': 'research',
+        'summary': 'Collect approved internal facts',
+        'operation': 'read',
+        'scope': 'company_knowledge',
+        'reversible': False,
+        'inputRefs': ['company-knowledge://briefs/source-1'],
+        'acceptanceCriteria': ['facts-grounded'],
+        'attempt': 1,
+        'approvalRef': None,
+        'rawContextStored': False,
+        'externalActionPerformed': False,
+    }
+
+    result = mod.execute(
+        {'event': {'eventId': 'event-1', 'consultationMetadata': request_meta}},
+        team_executor=lambda meta: {
+            'summary': f"{meta['taskId']} completed",
+            'evidence': ['company-knowledge://projects/project-1/research'],
+            'criteriaEvidence': {
+                'facts-grounded': 'company-knowledge://projects/project-1/research'
+            },
+            'verdict': 'accepted',
+            'externalActionPerformed': False,
+        },
+    )
+
+    response = result['consultationMetadata']
+    assert response['type'] == 'task_response'
+    assert response['dispatchId'] == 'dispatch-1'
+    assert response['criteriaEvidence'] == {
+        'facts-grounded': 'company-knowledge://projects/project-1/research'
+    }
+    assert result['rawContextStored'] is False
+
+
 def test_executor_completes_plain_user_message_with_safe_decision_required_receipt():
     path = ROOT / 'scripts/peer-consultation-executor.py'
     spec = importlib.util.spec_from_file_location('consult_exec_plain', path)

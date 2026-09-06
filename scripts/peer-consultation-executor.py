@@ -5,10 +5,11 @@ Only bounded consultation metadata crosses Company OS. Google Workspace source
 bodies are fetched and reduced locally; cell contents are never printed.
 """
 from __future__ import annotations
-import argparse, json, os, re, sys
+import argparse, json, os, re, shlex, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sinria_consultation import validate_consultation
+from sinria_team_project_transport import validate_team_project_metadata
 
 DASHBOARD_ID = "1D6SACTdRdCtAaXcQcLYqohJg8ncKwAKFekr9DfDSHbc"
 PREFLIGHT_RANGE = "📱 今日の進捗!A1:E8"
@@ -69,10 +70,70 @@ def workspace_preflight() -> dict:
     return {"ok": True, "workspaceAccess": True, "resourceId": DASHBOARD_ID,
             "range": PREFLIGHT_RANGE, "rawContextStored": False}
 
-def execute(envelope: dict) -> dict:
+def _team_project_command(meta: dict) -> dict:
+    command = os.environ.get("SINRIA_TEAM_PROJECT_EXECUTOR_COMMAND", "").strip()
+    if not command:
+        raise WorkspaceResolverError("team_capability_not_configured")
+    try:
+        completed = subprocess.run(
+            shlex.split(command),
+            input=json.dumps(meta, ensure_ascii=False),
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkspaceResolverError("team_capability_execution_failed") from exc
+    if completed.returncode != 0:
+        raise WorkspaceResolverError("team_capability_execution_failed")
+    try:
+        result = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise WorkspaceResolverError("team_capability_invalid_result") from exc
+    if not isinstance(result, dict):
+        raise WorkspaceResolverError("team_capability_invalid_result")
+    return result
+
+
+def _execute_team_project(meta: dict, handler) -> dict:
+    if meta["type"] != "task_request":
+        raise ValueError("unsupported team project event")
+    result = handler(meta)
+    if not isinstance(result, dict):
+        raise ValueError("team project executor must return an object")
+    response = validate_team_project_metadata({
+        "schemaVersion": "team-project.v1",
+        "type": "task_response",
+        "dispatchId": meta["dispatchId"],
+        "projectId": meta["projectId"],
+        "taskId": meta["taskId"],
+        "status": "completed",
+        "summary": result.get("summary"),
+        "evidence": result.get("evidence"),
+        "criteriaEvidence": result.get("criteriaEvidence"),
+        "verdict": result.get("verdict", "accepted"),
+        "rawContextStored": False,
+        "externalActionPerformed": bool(result.get("externalActionPerformed", False)),
+    })
+    assert response is not None
+    if response["verdict"] == "accepted" and set(response["criteriaEvidence"]) != set(meta["acceptanceCriteria"]):
+        raise ValueError("accepted team result must cover every criterion")
+    return {
+        "summary": response["summary"],
+        "consultationMetadata": response,
+        "refs": response["evidence"],
+        "rawContextStored": False,
+        "externalActionPerformed": response["externalActionPerformed"],
+    }
+
+
+def execute(envelope: dict, *, team_executor=None) -> dict:
     event = envelope.get("event", envelope)
     if not isinstance(event, dict): raise ValueError("invalid event envelope")
     meta = validate_consultation(event.get("consultationMetadata"))
+    if meta and meta.get("schemaVersion") == "team-project.v1":
+        return _execute_team_project(meta, team_executor or _team_project_command)
     if not meta or meta["type"] != "consultation_request":
         # Preserve existing synthetic canary behavior.
         preview = event.get("sanitizedPreview")

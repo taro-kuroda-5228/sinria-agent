@@ -21,6 +21,7 @@ def test_team_project_runtime_is_included_in_the_installed_package():
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text())
     assert "sinria_team_projects" in pyproject["tool"]["setuptools"]["py-modules"]
+    assert "sinria_team_project_transport" in pyproject["tool"]["setuptools"]["py-modules"]
 
 
 def test_project_store_rejects_a_stale_revision(tmp_path):

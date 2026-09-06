@@ -67,3 +67,31 @@ def test_worker_command_adapter_propagates_only_allowlisted_error_code(monkeypat
     command.write_text("print('unsafe local path /tmp/private'); raise SystemExit(2)")
     with pytest.raises(RuntimeError, match="^peer command failed$"):
         invoke({}, {})
+
+
+def test_worker_parses_capabilities_and_publishes_metadata_only_presence():
+    module = _worker_module()
+
+    assert module.parse_team_capabilities("research, writing,research") == {
+        "research",
+        "writing",
+    }
+
+    class Adapter:
+        def __init__(self):
+            self.workers = []
+
+        def publish_heartbeat(self, worker):
+            self.workers.append(worker)
+            return {"eventId": "heartbeat-1"}
+
+    adapter = Adapter()
+    event = module.publish_team_presence(
+        adapter,
+        member_id="member-kikuchi",
+        instance_id="inst-kikuchi",
+        capabilities={"research", "writing"},
+    )
+
+    assert event == {"eventId": "heartbeat-1"}
+    assert adapter.workers[0].capabilities == {"research", "writing"}

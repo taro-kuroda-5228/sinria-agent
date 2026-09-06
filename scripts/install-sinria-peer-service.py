@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import shlex
 import subprocess
 import sys
@@ -40,7 +41,9 @@ def python_path(root: Path) -> Path:
 
 
 def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
-                subject: str, base_url: str, poll_interval: int, notify_target: str = "") -> dict:
+                subject: str, base_url: str, poll_interval: int, notify_target: str = "",
+                team_capabilities=(), team_space_id: str = "",
+                team_conversation_id: str = "", team_executor_command: str = "") -> dict:
     root = root.resolve()
     python = python_path(root)
     worker = root / "scripts/sinria-peer-worker.py"
@@ -50,6 +53,19 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
     if not worker.exists() or not command_script.exists():
         raise SystemExit("peer worker scripts not found in primary checkout")
     command_env = "PEER_EXECUTOR_COMMAND" if mode == "executor" else "PEER_VALIDATOR_COMMAND"
+    capabilities = sorted({str(item).strip() for item in team_capabilities if str(item).strip()})
+    if team_executor_command and (
+        "\n" in team_executor_command
+        or re.search(r"(?i)(?:token|secret|password|credential|authorization|api[_-]?key)\s*=", team_executor_command)
+    ):
+        raise ValueError("team executor command must not contain credentials")
+    if capabilities and (
+        mode != "executor"
+        or not team_space_id.strip()
+        or not team_conversation_id.strip()
+        or not team_executor_command.strip()
+    ):
+        raise ValueError("team executor requires capabilities, space, conversation, and local command")
     logs = get_sinria_home() / "logs"
     return {
         "Label": f"ai.sinria.peer-worker.{mode}",
@@ -62,6 +78,12 @@ def build_plist(*, root: Path, mode: str, member_id: str, instance_id: str,
             "COMPANY_OS_TRANSPORT_SUBJECT": subject,
             "SINRIA_HOME": str(get_sinria_home()),
             command_env: f"{python} {command_script}",
+            **({
+                "SINRIA_TEAM_CAPABILITIES": ",".join(capabilities),
+                "SINRIA_TEAM_SPACE_ID": team_space_id.strip(),
+                "SINRIA_TEAM_CONVERSATION_ID": team_conversation_id.strip(),
+                "SINRIA_TEAM_PROJECT_EXECUTOR_COMMAND": team_executor_command.strip(),
+            } if capabilities else {}),
 
             "PYTHONUNBUFFERED": "1",
             **({"PEER_NOTIFY_TARGET": notify_target} if mode == "validator" and notify_target else {}),
@@ -103,6 +125,10 @@ def main() -> None:
     p.add_argument("--base-url", default="https://medical-horizon-company-os.vercel.app")
     p.add_argument("--poll-interval", type=int, default=15)
     p.add_argument("--notify-target", default="", help="validator-only Sinria message target")
+    p.add_argument("--team-capability", action="append", default=[])
+    p.add_argument("--team-space-id", default="")
+    p.add_argument("--team-conversation-id", default="")
+    p.add_argument("--team-executor-command", default="")
     p.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     p.add_argument("--no-load", action="store_true")
     p.add_argument("--preflight", action="store_true")
@@ -110,7 +136,10 @@ def main() -> None:
     root = resolve_primary_checkout(a.root)
     plist = build_plist(root=root, mode=a.mode, member_id=a.member_id, instance_id=a.instance_id,
                         subject=a.subject, base_url=a.base_url, poll_interval=a.poll_interval,
-                        notify_target=a.notify_target)
+                        notify_target=a.notify_target, team_capabilities=a.team_capability,
+                        team_space_id=a.team_space_id,
+                        team_conversation_id=a.team_conversation_id,
+                        team_executor_command=a.team_executor_command)
     workspace_preflight = run_workspace_preflight(plist, root) if a.mode == "executor" else None
     if a.preflight:
         env = os.environ.copy(); env.update(plist["EnvironmentVariables"])

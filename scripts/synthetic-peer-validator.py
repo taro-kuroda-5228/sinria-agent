@@ -24,7 +24,12 @@ def main() -> int:
     elif event.get("consultationMetadata") is not None:
         try:
             meta = validate_consultation(event["consultationMetadata"])
-            verdict = "accepted" if meta and meta["type"] == "consultation_response" else "decision_required"
+            if meta and meta["type"] == "consultation_response":
+                verdict = "accepted"
+            elif meta and meta["type"] == "task_response":
+                verdict = meta["verdict"]
+            else:
+                verdict = "decision_required"
         except ValueError:
             verdict = "decision_required"
     elif preview == "Synthetic peer task executed; sanitized completion receipt returned.":

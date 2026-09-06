@@ -17,6 +17,9 @@ SAFE_PEER_ERROR_CODES = frozenset({
     "workspace_source_access_denied",
     "workspace_source_unavailable",
     "consultation_execution_rejected",
+    "team_capability_not_configured",
+    "team_capability_execution_failed",
+    "team_capability_invalid_result",
 })
 
 
@@ -190,7 +193,12 @@ class PeerCollaborationRunner:
         self._attempts[run.run_id] = attempt
 
         try:
-            claimed = self.transport.claim_conversation_run(self.identity, runId=run.run_id, idempotencyKey=self._key(run.run_id, "claim", attempt))
+            claimed = self.transport.claim_conversation_run(
+                self.identity,
+                runId=run.run_id,
+                leaseSeconds=180,
+                idempotencyKey=self._key(run.run_id, "claim", attempt),
+            )
             run = ConversationRun.from_payload(claimed.get("run", claimed))
             event = self._load_event(run)
             notification_context = {
