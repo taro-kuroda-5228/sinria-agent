@@ -34,6 +34,7 @@ class Store:
         self.runs = [run_payload('r0', 'kikuchi', 'k-1', 'e0')]
         self.calls = []
         self.failure_notes = []
+        self.claim_fields = []
         self.n = 1
     def sweep_conversation_runs(self, identity, **kw):
         self.calls.append('sweep')
@@ -43,7 +44,7 @@ class Store:
         return {'runs': [r for r in self.runs if r['targetMemberId'] == kw.get('targetMemberId') and r['targetInstanceId'] == kw.get('targetInstanceId')]}
     def list_conversation_events(self, identity, **kw): return {'events': list(self.events)}
     def claim_conversation_run(self, identity, **kw):
-        self.calls.append('claim'); row = next(r for r in self.runs if r['runId'] == kw['runId']); row['status'] = 'claimed'; return {'run': dict(row)}
+        self.calls.append('claim'); self.claim_fields.append(kw); row = next(r for r in self.runs if r['runId'] == kw['runId']); row['status'] = 'claimed'; return {'run': dict(row)}
     def append_conversation_event(self, identity, **kw):
         eid = f'e{self.n}'; self.n += 1
         e = event(eid, kw['kind'], identity.member_id, identity.instance_id, kw['sanitizedPreview']); self.events.append(e); return {'event': e}
@@ -61,6 +62,22 @@ def test_retry_attempts_get_distinct_idempotency_keys():
     runner = PeerCollaborationRunner(None, None, target_member_id='taro', target_instance_id='taro-1', executor=lambda *_: {}, validator=lambda *_: 'accepted')
     assert runner._key('run-1', 'complete', 1) == runner._key('run-1', 'complete', 1)
     assert runner._key('run-1', 'complete', 1) != runner._key('run-1', 'complete', 2)
+
+
+def test_runner_claims_a_lease_longer_than_the_local_command_timeout():
+    store = Store()
+    runner = PeerCollaborationRunner(
+        store,
+        Identity('kikuchi', 'k-1'),
+        target_member_id='kikuchi',
+        target_instance_id='k-1',
+        executor=lambda *_: {'summary': 'answer'},
+        validator=lambda *_: 'accepted',
+    )
+
+    runner.run_once()
+
+    assert store.claim_fields[0]['leaseSeconds'] >= 180
 
 
 def test_decision_required_stops_without_creating_revision_run():

@@ -95,3 +95,22 @@
 3. Run peer-collaboration regressions.
 4. Run diff checks and a staged secret/PHI/residue scan.
 5. Commit and push the isolated feature branch; do not deploy or restart production services.
+
+## Task 6: Connect the core to Company OS distributed workers
+
+**Files:**
+- Create: `sinria_team_project_transport.py`
+- Create: `tests/test_team_project_transport.py`
+- Create: `scripts/sinria-distributed-team-project-smoke.py`
+- Create: `tests/test_distributed_team_project_smoke.py`
+- Modify: peer worker/executor/validator and installer scripts
+
+**Steps:**
+1. Define strict `team-project.v1` heartbeat, task request, and task response metadata carried by the existing append-only Company OS conversation transport. Keep raw bodies in local or Company Knowledge storage and transmit typed references only.
+2. Discover workers from fresh capability heartbeats and dispatch each task with a stable idempotency key to an explicit member/instance.
+3. Reuse Company OS conversation-run claims with a lease longer than the bounded local executor timeout, so expired work remains recoverable through the existing sweep/reclaim lifecycle.
+4. Route task requests to an explicitly configured local capability command. Refuse dummy completion when no handler exists, validate evidence/criteria coverage, and require a typed `company-os://review/...` approval reference before remote gated operations.
+5. Extend the existing peer installer with optional team capability, space, conversation, and local command settings without embedding credentials or raw context in the plist.
+6. Verify a full offline Company OS-shaped flow: heartbeat → capability assignment → durable run → lease claim → local execution → typed response → evidence-backed project completion.
+
+**Production boundary:** Merging this implementation does not activate it. Enabling team capabilities on Taro's and Kikuchi's persistent workers, restarting those LaunchAgents, and running a live multi-host project remain an explicit production activation step requiring human approval and readback.

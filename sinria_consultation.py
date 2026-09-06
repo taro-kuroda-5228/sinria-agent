@@ -12,6 +12,12 @@ def validate_consultation(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, Mapping):
         raise ValueError("consultation metadata must be an object")
+    if value.get("schemaVersion") == "team-project.v1":
+        # The existing Company OS event column is the generic collaboration
+        # metadata envelope despite its historical consultation-only name.
+        from sinria_team_project_transport import validate_team_project_metadata
+
+        return validate_team_project_metadata(value)
     kind = value.get("type")
     allowed = REQUEST_KEYS if kind == "consultation_request" else RESPONSE_KEYS if kind == "consultation_response" else set()
     if not allowed or set(value) - allowed:

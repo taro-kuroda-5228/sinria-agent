@@ -7,6 +7,23 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
 from sinria_peer_collaboration import PeerCollaborationRunner, SAFE_PEER_ERROR_CODES, sanitize_summary
+from sinria_team_project_transport import CompanyOsTeamProjectAdapter
+from sinria_team_projects import Worker
+
+
+def parse_team_capabilities(value):
+    capabilities = {item.strip() for item in str(value or '').split(',') if item.strip()}
+    if any(len(item) > 80 or not all(char.isalnum() or char in '._:-' for char in item) for item in capabilities):
+        raise ValueError('invalid team capability')
+    return capabilities
+
+
+def publish_team_presence(adapter, *, member_id, instance_id, capabilities):
+    if not capabilities:
+        return None
+    return adapter.publish_heartbeat(
+        Worker(member_id, instance_id, set(capabilities), fresh=True)
+    )
 
 
 def command_adapter(name, *, mode):
@@ -85,6 +102,19 @@ def main():
         token_env='SINRIA_COMPANY_OS_TRANSPORT_TOKEN',
     )
     ident = CompanyOsTransportIdentity(os.environ['COMPANY_OS_TRANSPORT_SUBJECT'], os.environ['COMPANY_OS_MEMBER_ID'], os.environ['COMPANY_OS_INSTANCE_ID'])
+    capabilities = parse_team_capabilities(os.environ.get('SINRIA_TEAM_CAPABILITIES', ''))
+    team_adapter = None
+    if capabilities:
+        space_id = os.environ.get('SINRIA_TEAM_SPACE_ID', '').strip()
+        conversation_id = os.environ.get('SINRIA_TEAM_CONVERSATION_ID', '').strip()
+        if not space_id or not conversation_id:
+            p.error('team capabilities require explicit space and conversation configuration')
+        team_adapter = CompanyOsTeamProjectAdapter(
+            client,
+            ident,
+            space_id=space_id,
+            conversation_id=conversation_id,
+        )
     if a.preflight:
         canary = client.canary(ident)
         listed = client.list_conversation_runs(
@@ -106,10 +136,27 @@ def main():
     runner = PeerCollaborationRunner(client, ident, target_member_id=ident.member_id, target_instance_id=ident.instance_id,
                                      executor=command, validator=command, mode=a.mode)
     if a.once:
+        if team_adapter is not None:
+            publish_team_presence(
+                team_adapter,
+                member_id=ident.member_id,
+                instance_id=ident.instance_id,
+                capabilities=capabilities,
+            )
         print(json.dumps(runner.run_once(), ensure_ascii=False), flush=True)
         return
+    last_team_heartbeat = 0.0
     while True:
         try:
+            now = time.time()
+            if team_adapter is not None and now - last_team_heartbeat >= 60:
+                publish_team_presence(
+                    team_adapter,
+                    member_id=ident.member_id,
+                    instance_id=ident.instance_id,
+                    capabilities=capabilities,
+                )
+                last_team_heartbeat = now
             result = runner.run_once()
             if result is not None:
                 print(json.dumps(result, ensure_ascii=False), flush=True)
