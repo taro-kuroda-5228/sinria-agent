@@ -119,7 +119,13 @@ def write_activation_request(release_root: Path, metadata: dict, runtime_root: P
     temporary.replace(path)
 
 
-def launch_activation(local_ref: str, runtime_root: Path, environment: dict[str, str]) -> None:
+def launch_activation(
+    local_ref: str,
+    runtime_root: Path,
+    environment: dict[str, str],
+    *,
+    popen: Callable = subprocess.Popen,
+) -> None:
     match = re.fullmatch(
         r"local://peer-runtime-activation/([A-Za-z0-9._:-]{1,120})\.json",
         local_ref,
@@ -128,6 +134,9 @@ def launch_activation(local_ref: str, runtime_root: Path, environment: dict[str,
         raise RuntimeMaintenanceError("runtime_activation_ref_invalid")
     runtime_root = runtime_root.resolve()
     request_path = runtime_root / "activation-requests" / f"{match.group(1)}.json"
+    claimed_path = request_path.with_suffix(".claimed")
+    if not request_path.exists() and claimed_path.exists():
+        return
     try:
         request = json.loads(request_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -146,9 +155,15 @@ def launch_activation(local_ref: str, runtime_root: Path, environment: dict[str,
     helper = release_root / "scripts/sinria-peer-runtime-activate.py"
     if python is None or not helper.exists():
         raise RuntimeMaintenanceError("runtime_activation_unavailable")
+    try:
+        request_path.replace(claimed_path)
+    except FileNotFoundError:
+        if claimed_path.exists():
+            return
+        raise RuntimeMaintenanceError("runtime_activation_request_invalid")
     env = {**environment, "SINRIA_RUNTIME_RELEASE_ROOT": str(release_root)}
     try:
-        subprocess.Popen(
+        popen(
             [str(python), str(helper)],
             cwd=release_root,
             env=env,
@@ -158,6 +173,7 @@ def launch_activation(local_ref: str, runtime_root: Path, environment: dict[str,
             start_new_session=True,
         )
     except OSError as exc:
+        claimed_path.replace(request_path)
         raise RuntimeMaintenanceError("runtime_activation_unavailable") from exc
 
 

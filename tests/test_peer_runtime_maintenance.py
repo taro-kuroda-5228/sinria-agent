@@ -10,8 +10,10 @@ from sinria_peer_runtime import (
     RuntimeMaintenanceError,
     activation_arguments,
     execute_maintenance,
+    launch_activation,
     stage_release,
     validate_maintenance_request,
+    write_activation_request,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -245,3 +247,24 @@ def test_activation_entrypoint_bootstraps_the_staged_release_root():
     bootstrap = 'sys.path.insert(0, str(Path(__file__).resolve().parents[1]))'
     assert bootstrap in source
     assert source.index(bootstrap) < source.index("from sinria_constants import")
+
+
+def test_activation_request_is_claimed_once_before_process_launch(tmp_path):
+    runtime = tmp_path / "runtime"
+    release = runtime / "releases" / "abc123"
+    (release / ".venv/bin").mkdir(parents=True)
+    (release / ".venv/bin/python").write_text("")
+    (release / "scripts").mkdir()
+    (release / "scripts/sinria-peer-runtime-activate.py").write_text("")
+    write_activation_request(release, {"dispatchId": "dispatch-once"}, runtime)
+    launches = []
+
+    def popen(command, **kwargs):
+        launches.append((command, kwargs))
+        return object()
+
+    ref = "local://peer-runtime-activation/dispatch-once.json"
+    launch_activation(ref, runtime, {}, popen=popen)
+    launch_activation(ref, runtime, {}, popen=popen)
+
+    assert len(launches) == 1
