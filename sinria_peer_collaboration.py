@@ -188,9 +188,17 @@ class PeerCollaborationRunner:
 
     def run_once(self) -> Optional[dict[str, Any]]:
         candidates = [r for r in self.poll() if r.status in {"queued", "failed_recoverable"}]
-        if not candidates:
+        expected_kind = "user_message" if self.mode == "executor" else "assistant_message"
+        run = next(
+            (
+                candidate
+                for candidate in candidates
+                if self._load_event(candidate).kind == expected_kind
+            ),
+            None,
+        )
+        if run is None:
             return None
-        run = candidates[0]
         attempt = self._attempts.get(run.run_id, 0) + 1
         self._attempts[run.run_id] = attempt
 
