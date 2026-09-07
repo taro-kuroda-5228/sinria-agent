@@ -121,7 +121,7 @@ def test_decision_required_stops_without_creating_revision_run():
     assert store.calls == ['sweep', 'claim', 'complete']
 
 
-def test_validator_closes_non_assistant_run_without_retrying():
+def test_validator_does_not_claim_executor_request():
     store = Store()
     validator_called = False
 
@@ -140,18 +140,34 @@ def test_validator_closes_non_assistant_run_without_retrying():
         mode='validator',
     )
 
-    result = validator.run_once()
-
-    assert result == {
-        'runId': 'r0',
-        'status': 'decision_required',
-        'reason': 'unsupported_validator_event',
-        'authorMemberId': 'taro',
-        'authorInstanceId': 'taro-1',
-        'sanitizedPreview': 'hello',
-    }
+    assert validator.run_once() is None
     assert validator_called is False
-    assert store.calls == ['sweep', 'claim', 'complete']
+    assert store.calls == ['sweep']
+    assert store.runs[0]['status'] == 'queued'
+
+
+def test_executor_skips_validation_run_and_claims_next_request():
+    store = Store()
+    store.events[0] = event('e0', kind='assistant_message', author='taro', instance='taro-1')
+    store.events.append(event('e1', kind='user_message', author='taro', instance='taro-1'))
+    store.runs.append(run_payload('r1', 'kikuchi', 'k-1', 'e1'))
+    executed = []
+    runner = PeerCollaborationRunner(
+        store,
+        Identity('kikuchi', 'k-1'),
+        target_member_id='kikuchi',
+        target_instance_id='k-1',
+        executor=lambda run, _event: executed.append(run.run_id) or {'summary': 'answer'},
+        validator=lambda *_: 'accepted',
+    )
+
+    result = runner.run_once()
+
+    assert result is not None
+    assert result['runId'] == 'r1'
+    assert executed == ['r1']
+    assert store.runs[0]['status'] == 'queued'
+    assert store.claim_fields[0]['runId'] == 'r1'
 
 
 def test_runner_fail_closed_filters_cross_member_runs_returned_by_backend():
