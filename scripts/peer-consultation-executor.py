@@ -119,12 +119,19 @@ def _execute_team_project(meta: dict, handler) -> dict:
     assert response is not None
     if response["verdict"] == "accepted" and set(response["criteriaEvidence"]) != set(meta["acceptanceCriteria"]):
         raise ValueError("accepted team result must cover every criterion")
+    local_post_action = result.get("_localPostAction")
+    if local_post_action is not None and (
+        not isinstance(local_post_action, str)
+        or not re.fullmatch(r"local://peer-runtime-activation/[A-Za-z0-9._:-]{1,120}\.json", local_post_action)
+    ):
+        raise ValueError("invalid local post action")
     return {
         "summary": response["summary"],
         "consultationMetadata": response,
         "refs": response["evidence"],
         "rawContextStored": False,
         "externalActionPerformed": response["externalActionPerformed"],
+        **({"_localPostAction": local_post_action} if local_post_action else {}),
     }
 
 

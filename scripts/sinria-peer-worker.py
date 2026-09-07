@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gateway.company_os_transport import CompanyOsTransportClient, CompanyOsTransportIdentity
 from sinria_peer_collaboration import PeerCollaborationRunner, SAFE_PEER_ERROR_CODES, sanitize_summary
+from sinria_constants import get_sinria_home
+from sinria_peer_runtime import launch_activation
 from sinria_team_project_transport import CompanyOsTeamProjectAdapter
 from sinria_team_projects import Worker
 
@@ -133,8 +135,20 @@ def main():
         }, ensure_ascii=False))
         return
     command = command_adapter('PEER_EXECUTOR_COMMAND' if a.mode == 'executor' else 'PEER_VALIDATOR_COMMAND', mode=a.mode)
-    runner = PeerCollaborationRunner(client, ident, target_member_id=ident.member_id, target_instance_id=ident.instance_id,
-                                     executor=command, validator=command, mode=a.mode)
+    runner = PeerCollaborationRunner(
+        client,
+        ident,
+        target_member_id=ident.member_id,
+        target_instance_id=ident.instance_id,
+        executor=command,
+        validator=command,
+        local_post_action=lambda ref: launch_activation(
+            ref,
+            Path(get_sinria_home()) / 'runtime',
+            dict(os.environ),
+        ),
+        mode=a.mode,
+    )
     if a.once:
         if team_adapter is not None:
             publish_team_presence(
