@@ -138,12 +138,14 @@ class ConversationRun:
 class PeerCollaborationRunner:
     def __init__(self, transport: Any, identity: Any, *, target_member_id: str, target_instance_id: str,
                  executor: Callable, validator: Callable, heartbeat: Optional[Callable] = None,
+                 local_post_action: Optional[Callable[[str], None]] = None,
                  mode: str = "executor", max_rounds: int = 3):
         if mode not in {"executor", "validator"} or max_rounds < 1:
             raise ValueError("invalid peer runner configuration")
         self.transport, self.identity = transport, identity
         self.target_member_id, self.target_instance_id = target_member_id, target_instance_id
-        self.executor, self.validator, self.heartbeat, self.mode, self.max_rounds = executor, validator, heartbeat, mode, max_rounds
+        self.executor, self.validator, self.heartbeat = executor, validator, heartbeat
+        self.local_post_action, self.mode, self.max_rounds = local_post_action, mode, max_rounds
         self._attempts: dict[str, int] = {}
 
 
@@ -210,6 +212,13 @@ class PeerCollaborationRunner:
             if self.mode == "executor":
                 result = self.executor(run, event.callback_payload())
                 if not isinstance(result, Mapping): raise ValueError("executor must return an object")
+                local_post_action = result.get("_localPostAction")
+                if local_post_action is not None and (
+                    not isinstance(local_post_action, str)
+                    or not re.fullmatch(r"local://peer-runtime-activation/[A-Za-z0-9._:-]{1,120}\.json", local_post_action)
+                    or self.local_post_action is None
+                ):
+                    raise ValueError("invalid local post action")
                 payload = safe_metadata(result)
                 assistant = self._append(run, "assistant_message", payload["summary"], "assistant", attempt, body_ref=payload.get("bodyRef"), consultation=payload.get("consultationMetadata"))
                 author = event.author_member_id
@@ -218,6 +227,9 @@ class PeerCollaborationRunner:
                     triggeredByEventId=assistant.event_id, targetMemberId=author, targetInstanceId=event.author_instance_id,
                     idempotencyKey=self._key(run.run_id, "validation", attempt))
                 self.transport.complete_conversation_run(self.identity, runId=run.run_id, sanitizedStatusNote=payload["summary"], idempotencyKey=self._key(run.run_id, "complete", attempt))
+                if local_post_action is not None:
+                    assert self.local_post_action is not None
+                    self.local_post_action(local_post_action)
                 created = validation.get("run", validation)
                 return {"runId": run.run_id, "status": "completed", "validationRunId": created.get("runId"), **payload}
             if event.kind != "assistant_message":

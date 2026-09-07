@@ -73,6 +73,7 @@ def test_executor_routes_team_project_request_to_a_local_capability_handler():
             },
             'verdict': 'accepted',
             'externalActionPerformed': False,
+            '_localPostAction': 'local://peer-runtime-activation/dispatch-1.json',
         },
     )
 
@@ -83,6 +84,7 @@ def test_executor_routes_team_project_request_to_a_local_capability_handler():
         'facts-grounded': 'company-knowledge://projects/project-1/research'
     }
     assert result['rawContextStored'] is False
+    assert result['_localPostAction'] == 'local://peer-runtime-activation/dispatch-1.json'
 
 
 def test_executor_completes_plain_user_message_with_safe_decision_required_receipt():

@@ -80,6 +80,31 @@ def test_runner_claims_a_lease_longer_than_the_local_command_timeout():
     assert store.claim_fields[0]['leaseSeconds'] >= 180
 
 
+def test_local_post_action_runs_only_after_response_and_completion_are_durable():
+    store = Store()
+    actions = []
+    runner = PeerCollaborationRunner(
+        store,
+        Identity('kikuchi', 'k-1'),
+        target_member_id='kikuchi',
+        target_instance_id='k-1',
+        executor=lambda *_: {
+            'summary': 'release staged',
+            '_localPostAction': 'local://peer-runtime-activation/dispatch-1.json',
+        },
+        validator=lambda *_: 'accepted',
+        local_post_action=lambda ref: actions.append((ref, list(store.calls))),
+    )
+
+    result = runner.run_once()
+
+    assert actions == [(
+        'local://peer-runtime-activation/dispatch-1.json',
+        ['sweep', 'claim', 'complete'],
+    )]
+    assert '_localPostAction' not in result
+
+
 def test_decision_required_stops_without_creating_revision_run():
     store = Store()
     store.events.append(event('e1', kind='assistant_message', author='kikuchi', instance='k-1'))
