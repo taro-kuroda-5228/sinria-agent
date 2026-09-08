@@ -1,8 +1,5 @@
 import os
 import sys
-import time
-from pathlib import Path
-import pytest
 
 
 def test_native_compression_preserves_bytes_and_path(tmp_path):
