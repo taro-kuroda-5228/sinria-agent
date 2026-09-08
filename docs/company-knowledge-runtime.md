@@ -42,6 +42,24 @@ Peer collaboration is separate from source retrieval: the peer runtime can
 claim, heartbeat, complete, fail, and revise delegated work, while source routing
 determines which personal or shared knowledge is appropriate for the current turn.
 
+## Active accumulation (opt-in)
+
+Set `context_sources.accumulation.enabled: true` together with
+`context_sources.enabled: true`. This supplies fixed per-turn guidance even when
+no source keyword matches. It asks the agent to preserve reusable verified
+findings, deduplicate existing canonical records, retain provenance, and verify
+save/readback. Personal exploration stays personal; shared decisions require
+formal organizational adoption and authorized review. It does not grant new
+connector permissions or implement an automatic transcript uploader. This is
+agent guidance, not a guaranteed storage transaction or deterministic access gate.
+
+For explicitly quiescent local archives on macOS, `agent.local_storage.compress_inactive`
+can apply native filesystem compression, verify byte integrity and atomically
+replace the original at the same pathname. Callers must establish no writers;
+age alone is not a lock. No automatic sweep of active sessions is installed.
+Unsupported platforms and files without a measured allocated-byte saving are
+left unchanged. Native compression is lossless; no original history is pruned.
+
 ## Required identity
 
 Each installation must use its own identity. Do not share profiles or indexes between employees.

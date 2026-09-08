@@ -6,7 +6,7 @@ description: >
   LINE Messaging API gateway adapter for Sinria.
   Runs an aiohttp webhook server that receives LINE webhook events
   (with HMAC-SHA256 signature verification) and relays messages between
-  LINE chats (1:1, groups, rooms) and the Hermes agent. Outbound replies
+  LINE chats (1:1, groups, rooms) and the Sinria agent. Outbound replies
   prefer the free reply token and fall back to the metered Push API
   when the token has expired or is absent. Slow LLM responses surface a
   Template Buttons postback bubble so the user can fetch the answer with
@@ -62,4 +62,36 @@ optional_env:
   - name: LINE_SLOW_RESPONSE_THRESHOLD
     description: "Seconds before the slow-LLM postback button fires (default: 45; set 0 to disable and always Push-fallback)"
     prompt: "Slow response threshold (seconds)"
+    password: false
+  - name: LINE_TASK_INTAKE_GROUPS
+    description: "Comma-separated LINE group IDs that use passive task-intake mode"
+    prompt: "Task-intake group IDs (comma-separated)"
+    password: false
+  - name: LINE_TASK_PARTICIPANTS_JSON
+    description: "JSON map from LINE user IDs to Company OS member_id and instance_id"
+    prompt: "Task participant mapping JSON"
+    password: false
+  - name: COMPANY_OS_BASE_URL
+    description: "HTTPS base URL of the Company OS task API"
+    prompt: "Company OS base URL"
+    password: false
+  - name: COMPANY_OS_BRIDGE_TOKEN
+    description: "Legacy-compatible bearer token for the Company OS task transport"
+    prompt: "Company OS bridge token"
+    password: true
+  - name: SINRIA_COMPANY_OS_TRANSPORT_TOKEN
+    description: "Sinria-native bearer token for the Company OS task transport"
+    prompt: "Sinria Company OS transport token"
+    password: true
+  - name: SINRIA_COMPANY_CONTEXT_WORKSPACE_ID
+    description: "Company OS workspace ID for task creation"
+    prompt: "Company OS workspace ID"
+    password: false
+  - name: LINE_TASK_INTAKE_LOCAL_MODEL
+    description: "Installed Ollama model used for local-only classification"
+    prompt: "Local task classifier model"
+    password: false
+  - name: LINE_TASK_INTAKE_LOCAL_URL
+    description: "Loopback Ollama URL (default: http://127.0.0.1:11434; non-loopback is rejected)"
+    prompt: "Local task classifier URL"
     password: false

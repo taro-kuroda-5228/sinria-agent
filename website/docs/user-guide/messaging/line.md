@@ -1,12 +1,12 @@
 ---
 sidebar_position: 17
 title: "LINE"
-description: "Set up Hermes Agent as a LINE Messaging API bot"
+description: "Set up Sinria as a LINE Messaging API bot"
 ---
 
 # LINE Setup
 
-Run Hermes Agent as a [LINE](https://line.me/) bot via the official LINE Messaging API. The adapter lives as a bundled platform plugin under `plugins/platforms/line/` — no core edits, just enable it like any other platform.
+Run Sinria as a [LINE](https://line.me/) bot via the official LINE Messaging API. The adapter lives as a bundled platform plugin under `plugins/platforms/line/` — no core edits, just enable it like any other platform.
 
 LINE is the dominant messaging app in Japan, Taiwan, and Thailand. If your users live there, this is how they reach you.
 
@@ -44,18 +44,18 @@ cloudflared tunnel --url http://localhost:8646
 ngrok http 8646
 
 # devtunnel
-devtunnel create hermes-line --allow-anonymous
-devtunnel port create hermes-line -p 8646 --protocol https
-devtunnel host hermes-line
+devtunnel create sinria-line --allow-anonymous
+devtunnel port create sinria-line -p 8646 --protocol https
+devtunnel host sinria-line
 ```
 
 Copy the `https://...` URL — you'll set it as the webhook URL below. **Leave the tunnel running** while testing. For production, set up a fixed Cloudflare named tunnel so the webhook URL doesn't change on restart.
 
 ---
 
-## Step 3: Configure Hermes
+## Step 3: Configure Sinria
 
-Add to `~/.hermes/.env`:
+Add to `~/.sinria/.env`:
 
 ```env
 LINE_CHANNEL_ACCESS_TOKEN=YOUR_LONG_LIVED_TOKEN
@@ -71,7 +71,7 @@ LINE_ALLOWED_ROOMS=R1234567890abcdef...           # optional room IDs
 LINE_PUBLIC_URL=https://my-tunnel.example.com
 ```
 
-Then in `~/.hermes/config.yaml`:
+Then in `~/.sinria/config.yaml`:
 
 ```yaml
 gateway:
@@ -98,7 +98,7 @@ Back in the LINE console:
 ## Step 5: Run the gateway
 
 ```bash
-hermes gateway
+sinria gateway run
 ```
 
 The agent log shows:
@@ -134,7 +134,7 @@ LINE_SLOW_RESPONSE_THRESHOLD=0
 For the postback flow to fire reliably, suppress chatter that would consume the reply token before the threshold:
 
 ```yaml
-# ~/.hermes/config.yaml
+# ~/.sinria/config.yaml
 display:
   interim_assistant_messages: false
   platforms:
@@ -180,13 +180,76 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 
 **"invalid signature" on webhook verify.** The `Channel secret` was copied wrong, or your tunnel rewrote the request body. Verify with `curl -i https://<tunnel>/line/webhook/health` first — that should return `{"status":"ok","platform":"line"}`.
 
-**Bot receives nothing in groups.** Check `LINE_ALLOWED_GROUPS` includes the `C...` group ID. To find a group ID, send a test message and grep `~/.hermes/logs/gateway.log` for `LINE: rejecting unauthorized source` — the rejected source dict has the IDs.
+**Bot receives nothing in groups.** Check `LINE_ALLOWED_GROUPS` includes the `C...` group ID. During setup, temporarily permit only the controlled onboarding group, send a test message, and inspect the local Sinria webhook diagnostics under `~/.sinria/logs/`; never copy raw identifiers into shared logs or documents.
 
 **`send_image` fails with "LINE_PUBLIC_URL must be set".** LINE's Messaging API does not accept binary uploads — images, audio, and video must be reachable HTTPS URLs. Set `LINE_PUBLIC_URL` to the tunnel's public hostname and the adapter will serve files from `/line/media/<token>/<filename>` automatically.
 
 **Postback button never appears.** Either the LLM responded faster than `LINE_SLOW_RESPONSE_THRESHOLD`, or another bubble (tool-progress, streaming) consumed the reply token first. See the suppression block under "Slow LLM responses".
 
-**"already in use by another profile".** The same channel access token is bound to another running Hermes profile. Stop the other gateway or use a separate channel.
+**"already in use by another profile".** The same channel access token is bound to another running Sinria profile. Stop the other gateway or use a separate channel.
+
+---
+
+## Passive task intake for a two-person conversation
+
+LINE does not allow a bot to read an existing private 1:1 thread. Invite the
+Sinria Official Account as a third participant; LINE then creates a group. The
+two people keep their normal personal LINE accounts, and Sinria can process new
+messages posted after it joins.
+
+Task intake is opt-in per group. Sinria treats chat text as untrusted data and
+uses an explicitly configured **local Ollama model on loopback** for a strict
+task/no-task decision. The normal agent/session path is bypassed, so raw LINE
+text cannot fall through to a cloud model. Non-task messages are silent. Only
+a clear request creates a Company OS task and receives a short receipt.
+
+```yaml
+gateway:
+  platforms:
+    line:
+      enabled: true
+      extra:
+        task_intake_groups: ["C...target-group-id..."]
+        task_workspace_id: "<company-os-workspace-id>"
+        task_intake_local_model: "qwen3.5:9b"
+        task_intake_local_url: "http://127.0.0.1:11434"
+        task_participants:
+          "U...taro-line-user-id...":
+            member_id: "member-taro"
+            instance_id: "instance-taro"
+          "U...kikuchi-line-user-id...":
+            member_id: "member-kikuchi"
+            instance_id: "instance-kikuchi"
+```
+
+Set the Company OS endpoint and bearer credential in the local Sinria secret
+store, not in shared configuration:
+
+```env
+COMPANY_OS_BASE_URL=https://company-os.example.invalid
+SINRIA_COMPANY_OS_TRANSPORT_TOKEN=YOUR_LOCAL_SECRET
+SINRIA_COMPANY_CONTEXT_WORKSPACE_ID=YOUR_WORKSPACE_ID
+```
+
+Safety and behavior:
+
+* Raw LINE text is written only under `~/.sinria/private/line/task-intake/`
+  for messages that became tasks; directory mode is `0700` and files are `0600`.
+* Raw LINE text is classified through loopback HTTP only. Non-loopback model
+  URLs are rejected, and the task group never enters Sinria's normal chat
+  session or cloud-model path.
+* Company OS receives only a sanitized summary and a
+  `local://line/task-intake/...` evidence reference. It never receives raw LINE
+  text, LINE user IDs, credentials, or patient identifiers.
+* The immutable LINE webhook/message identity generates the Company OS
+  idempotency key, so webhook retries do not create duplicate tasks.
+* Exactly two mapped human participants are required for
+  `other_participant`; ambiguous or missing identity mappings fail closed.
+* Created tasks disallow external actions and external egress. Later execution
+  still follows the normal Sinria approval policy.
+* Typing, streaming, tool-progress, and slow-response bubbles are suppressed
+  in task-intake groups by the adapter itself; only a task receipt or a
+  recoverable configuration/connection failure is sent.
 
 ---
 
