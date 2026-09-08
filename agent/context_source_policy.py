@@ -83,6 +83,7 @@ class ContextSourcePolicy:
     priority: tuple[str, ...]
     personal: _Source | None = None
     company: _Source | None = None
+    accumulate: bool = False
 
     @classmethod
     def from_config(cls, value: Mapping[str, Any] | None) -> "ContextSourcePolicy":
@@ -100,6 +101,8 @@ class ContextSourcePolicy:
             priority=priority,
             personal=_Source.from_mapping(value.get("personal")),
             company=_Source.from_mapping(value.get("company")),
+            accumulate=(isinstance(value.get("accumulation"), Mapping)
+                        and value["accumulation"].get("enabled") is True),
         )
 
     def guidance_for(self, query: str) -> str:
@@ -107,7 +110,7 @@ class ContextSourcePolicy:
             return ""
         personal = self.personal if self.personal and self.personal.matches(query) else None
         company = self.company if self.company and self.company.matches(query) else None
-        if personal is None and company is None:
+        if personal is None and company is None and not self.accumulate:
             return ""
 
         lines = [
@@ -145,6 +148,15 @@ class ContextSourcePolicy:
                 lines.append(
                     "The configured migration target is not the current full source of truth until migration is verified by readback."
                 )
+
+        if self.accumulate:
+            lines.extend([
+                "Persist reusable verified findings, decisions, and corrections before completing substantive tasks, using configured adapters and existing canonical records.",
+                "Search before writing; update or deduplicate rather than copying full transcripts. Preserve author, source citation, scope, fact/proposal/decision status, and supersession history.",
+                "Personal opinions and exploratory work remain personal, including company-related work. Company Knowledge requires evidence of formal organizational adoption and authorized review; seniority alone is not approval.",
+                "Respect identity and audience boundaries. Never copy another member's personal knowledge or raw confidential content into shared stores. Missing configuration or authorization means report pending, not guess a destination.",
+                "After saving, read back the exact target and verify retrieval before reporting saved. Record only non-sensitive receipt metadata; do not treat successful dispatch as persistence.",
+            ])
 
         lines.extend(
             [
