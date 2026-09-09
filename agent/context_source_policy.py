@@ -97,7 +97,7 @@ class ContextSourcePolicy:
         else:
             priority = ()
         return cls(
-            enabled=bool(value.get("enabled", False)),
+            enabled=value.get("enabled") is True,
             priority=priority,
             personal=_Source.from_mapping(value.get("personal")),
             company=_Source.from_mapping(value.get("company")),
@@ -169,12 +169,26 @@ class ContextSourcePolicy:
         return "\n".join(lines)
 
 
-def guidance_for_agent(agent: Any, query: str) -> str:
+def task_text(content: Any) -> str:
+    """Extract authored task text locally, never stringify media or metadata."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            part["text"] for part in content
+            if isinstance(part, Mapping)
+            and part.get("type") in ("text", "input_text")
+            and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def guidance_for_agent(agent: Any, query: Any) -> str:
     """Return policy guidance without allowing policy failures to break a turn."""
     policy = getattr(agent, "_context_source_policy", None)
     if not isinstance(policy, ContextSourcePolicy):
         return ""
     try:
-        return policy.guidance_for(query)
+        return policy.guidance_for(task_text(query))
     except Exception:
         return ""

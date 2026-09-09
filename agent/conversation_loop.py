@@ -39,7 +39,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.company_context.runtime import ContextIdentity
-from agent.context_source_policy import guidance_for_agent
+from agent.context_source_policy import guidance_for_agent, task_text
 from agent.correction_loop.advice import format_correction_advice
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
@@ -110,6 +110,35 @@ def _current_turn_user_injections(*blocks: str) -> list:
         seen.add(block)
         result.append(block)
     return result
+
+
+def _compose_user_context(content, injections):
+    """Compose an independent API-only copy without changing authored blocks."""
+    from copy import deepcopy
+
+    blocks = [b for b in injections if isinstance(b, str) and b]
+    if not blocks:
+        return deepcopy(content)
+    if isinstance(content, str):
+        return content + "\n\n" + "\n\n".join(blocks)
+    if isinstance(content, list):
+        return deepcopy(content) + [{"type": "text", "text": "\n\n".join(blocks)}]
+    return deepcopy(content)
+
+
+def _project_user_context(message):
+    """Replay the existing list sidecar, including versioned full API copies."""
+    from copy import deepcopy
+
+    injections = message.pop("_injected_user_context", None)
+    if message.get("role") != "user" or not isinstance(injections, list):
+        return
+    if len(injections) == 1 and isinstance(injections[0], dict):
+        envelope = injections[0]
+        if envelope.get("type") == "sinria_api_content_v1" and isinstance(envelope.get("content"), (str, list)):
+            message["content"] = deepcopy(envelope["content"])
+        return
+    message["content"] = _compose_user_context(message.get("content", ""), injections)
 
 
 def _format_quota_reset_for_report(reset_at) -> str:
@@ -761,12 +790,17 @@ def run_conversation(
     # fail-open and has no execution-policy authority.
     _turn_injections = _current_turn_user_injections(
         format_correction_advice(user_message),
-        guidance_for_agent(agent, _query),
+        guidance_for_agent(agent, original_user_message),
         build_memory_context_block(_ext_prefetch_cache) if _ext_prefetch_cache else "",
         _plugin_user_context,
     )
     if _turn_injections:
         user_msg["_injected_user_context"] = _turn_injections
+        if isinstance(user_message, list):
+            user_msg["_injected_user_context"] = [{
+                "type": "sinria_api_content_v1",
+                "content": _compose_user_context(user_message, _turn_injections),
+            }]
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -774,15 +808,30 @@ def run_conversation(
     # the same fixed per-turn injection bytes as the regular provider path.
     if agent.api_mode == "codex_app_server":
         _codex_user_input = user_message
-        if _turn_injections and isinstance(user_message, str):
-            _codex_user_input = user_message + "\n\n" + "\n\n".join(_turn_injections)
-        return agent._run_codex_app_server_turn(
+        if _turn_injections:
+            _codex_user_input = _compose_user_context(user_message, _turn_injections)
+            if isinstance(_codex_user_input, list):
+                # This older Codex transport accepts text only. Preserve the
+                # authored blocks locally and persist the exact text sent.
+                _codex_user_input = "\n\n".join(
+                    "[image attached]" if isinstance(part, dict) and part.get("type") in ("image", "image_url", "input_image")
+                    else task_text([part]) for part in _codex_user_input
+                ).strip()
+            user_msg["_injected_user_context"] = [{
+                "type": "sinria_api_content_v1", "content": _codex_user_input,
+            }]
+        # The older Codex early-return path bypasses the regular finalizer.
+        # Persist the sidecar before dispatch, then flush projected results.
+        agent._persist_session(messages, conversation_history)
+        _codex_result = agent._run_codex_app_server_turn(
             user_message=_codex_user_input,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        agent._persist_session(messages, conversation_history)
+        return _codex_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         # A hard account/weekly quota is shared by every gateway lane. Once
@@ -979,17 +1028,7 @@ def run_conversation(
             # byte-identically across turns (prompt-cache prefix survives turn
             # boundaries) while stored ``content`` stays byte-pure. Histories
             # from before this field existed simply have nothing to re-attach.
-            _stored_injections = api_msg.pop("_injected_user_context", None)
-            if (
-                msg.get("role") == "user"
-                and isinstance(_stored_injections, list)
-                and isinstance(api_msg.get("content"), str)
-            ):
-                _blocks = [b for b in _stored_injections if isinstance(b, str) and b]
-                if _blocks:
-                    api_msg["content"] = (
-                        api_msg["content"] + "\n\n" + "\n\n".join(_blocks)
-                    )
+            _project_user_context(api_msg)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
