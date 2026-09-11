@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -567,6 +568,12 @@ _AUTH_REFRESH_PROFILE_FILES = (
     "Preferences",
 )
 
+# Browser SDKs such as Supabase persist refresh sessions in Local Storage
+# rather than the cookie DB. The initial full snapshot already carries this
+# directory; refresh it on every clean relaunch as well so a login performed
+# after the first snapshot is not permanently invisible to automation.
+_AUTH_REFRESH_PROFILE_DIRS = ("Local Storage",)
+
 def real_profile_copy_dir(browser: str) -> str:
     """Return the hermes-owned snapshot dir for ``browser``'s real profile."""
     return str(get_hermes_home() / "browser-profile" / browser)
@@ -698,8 +705,61 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
         return False
 
 
+def _copy_auth_directory(src_dir: str, dst_dir: str) -> bool:
+    """Refresh an auth-bearing directory without exposing a torn target.
+
+    Chrome LevelDB directories contain a live ``LOCK`` file that must never be
+    mirrored. Copy into a sibling temporary directory first, then atomically
+    swap it into the idle profile copy. If either copy or swap fails, preserve
+    the previous known-good directory and report failure to the caller.
+    """
+    parent = os.path.dirname(dst_dir)
+    os.makedirs(parent, exist_ok=True)
+    temp_dir = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(dst_dir)}.refresh-", dir=parent
+    )
+    backup_dir = f"{dst_dir}.previous-{os.getpid()}-{time.monotonic_ns()}"
+    moved_previous = False
+    try:
+        shutil.copytree(
+            src_dir,
+            temp_dir,
+            dirs_exist_ok=True,
+            symlinks=False,
+            ignore=shutil.ignore_patterns("LOCK"),
+            ignore_dangling_symlinks=True,
+        )
+        if os.path.isdir(dst_dir):
+            os.replace(dst_dir, backup_dir)
+            moved_previous = True
+        try:
+            os.replace(temp_dir, dst_dir)
+        except OSError:
+            if moved_previous and not os.path.exists(dst_dir):
+                os.replace(backup_dir, dst_dir)
+                moved_previous = False
+            raise
+        if moved_previous:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            moved_previous = False
+        return True
+    except OSError as e:
+        logger.debug("real-profile: could not copy auth directory %s: %s", src_dir, e)
+        return False
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        if moved_previous and not os.path.exists(dst_dir) and os.path.isdir(backup_dir):
+            try:
+                os.replace(backup_dir, dst_dir)
+                moved_previous = False
+            except OSError:
+                pass
+        if not moved_previous:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+
 def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
-    """Copy ``source_profile``'s auth files into the copy's ``Default`` slot.
+    """Copy ``source_profile``'s auth state into the copy's ``Default`` slot.
 
     agent-browser launches ``Default`` in the copied user-data-dir; mirroring
     the active source profile's cookies/logins/prefs there is what makes the
@@ -707,18 +767,24 @@ def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
     real session lives in a non-Default profile). Lock-aware (Windows), so a
     running Chrome doesn't block the cookie DBs.
 
-    Returns the number of DB auth files that could NOT be copied (0 = clean).
+    Returns the number of auth items that could NOT be copied (0 = clean).
     """
     dst_default = os.path.join(dst, "Default")
-    failed_dbs = 0
+    failed_items = 0
     for rel in _AUTH_REFRESH_PROFILE_FILES:
         s = os.path.join(src, source_profile, rel)
         if not os.path.isfile(s):
             continue
         ok = _copy_auth_file(s, os.path.join(dst_default, rel))
         if not ok and os.path.basename(rel) in _SQLITE_AUTH_DBS:
-            failed_dbs += 1
-    return failed_dbs
+            failed_items += 1
+    for rel in _AUTH_REFRESH_PROFILE_DIRS:
+        source_dir = os.path.join(src, source_profile, rel)
+        if not os.path.isdir(source_dir):
+            continue
+        if not _copy_auth_directory(source_dir, os.path.join(dst_default, rel)):
+            failed_items += 1
+    return failed_items
 
 
 _SNAPSHOT_DONE_MARKER = ".hermes-snapshot-complete"
@@ -925,7 +991,7 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     """Snapshot ``browser``'s real ACTIVE profile into the hermes copy dir.
 
     Copies only what the launched browser needs: the user-data-dir's
-    ``Local State`` plus the auth-bearing files of the profile the user
+    ``Local State`` plus the auth-bearing state of the profile the user
     actually browses (``Local State → profile.last_used``, e.g. ``Profile 6``),
     mirrored into the copy's ``Default`` — which is what agent-browser opens.
     We deliberately do NOT copy every profile dir: non-active profiles are
@@ -935,8 +1001,8 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     succeeds; a torn/interrupted first copy (disk full, Ctrl+C) therefore never
     looks "already populated" on the next run — it is redone from scratch.
 
-    Auth files are re-synced on every call so fresh logins from the user's own
-    browsing show up. Locked-file copy errors are tolerated best-effort.
+    Auth files and Local Storage are re-synced on every call so fresh logins
+    from the user's own browsing show up. Copy errors fail closed.
 
     Returns ``(copy_dir, None)`` on success, ``(None, error)`` on failure.
     """
@@ -1062,17 +1128,19 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                     len(multi.args[0]) if multi.args else 0, src, source_profile,
                 )
 
-        # Both paths: copy the active profile's auth DBs into Default,
-        # lock-aware (sqlite online-backup) so a running Chrome on Windows
-        # doesn't block them. This is also the per-launch fresh-login re-sync.
-        failed_dbs = _mirror_profile_auth(src, dst, source_profile)
-        if failed_dbs:
-            # We could not read the user's cookie/login DBs at all — even the
-            # online-backup fallback failed. Rather than launch a silently
-            # signed-out session, fail closed with an actionable message.
+        # Both paths: refresh the active profile's auth DBs and storage into
+        # Default. DB copying is lock-aware (sqlite online-backup), and auth
+        # directories use temp-copy + atomic swap. This is the per-launch
+        # fresh-login re-sync.
+        failed_auth_items = _mirror_profile_auth(src, dst, source_profile)
+        if failed_auth_items:
+            # We could not refresh one or more login surfaces. Rather than
+            # launch a silently signed-out or stale session, fail closed with
+            # an actionable message.
             return None, (
                 f"could not read the '{browser}' profile's login data "
-                f"({failed_dbs} database(s) locked). Close {browser} and retry, "
+                f"({failed_auth_items} authentication item(s) unavailable). "
+                f"Close {browser} and retry, "
                 "or turn browser.use_real_profile off."
             )
 
