@@ -23,6 +23,7 @@ from gateway.line_peer_routing import (
     call_line_peer_backend,
     parse_line_peer_routes,
     select_line_peer_route,
+    validate_line_peer_token,
 )
 from gateway.line_peer_relay_service import (
     _NoRedirectHandler as _RelayNoRedirectHandler,
@@ -32,6 +33,13 @@ from gateway.line_peer_relay_service import (
 
 _line = load_plugin_adapter("line")
 _PURPOSE_TOKEN = base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+
+
+def test_purpose_token_must_be_canonical_base64url():
+    noncanonical = _PURPOSE_TOKEN[:-1] + ("9" if _PURPOSE_TOKEN[-1] != "9" else "7")
+    assert base64.urlsafe_b64decode(noncanonical + "=") == bytes(range(32))
+    with pytest.raises(ValueError, match="canonical"):
+        validate_line_peer_token(noncanonical)
 
 
 @pytest.mark.parametrize("handler_class", [_NoRedirectHandler, _RelayNoRedirectHandler])
