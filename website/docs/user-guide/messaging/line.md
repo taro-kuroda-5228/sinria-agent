@@ -154,6 +154,76 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 
 ---
 
+## Route one LINE account to member-owned Sinria instances
+
+LINE permits only one LINE Official Account in a group. Keep that account as the
+front door and route mapped DMs or explicitly prefixed group messages to the
+member's own Sinria runtime.
+
+On the member Mac, keep the following only in `~/.sinria/.env`:
+
+```env
+SINRIA_LINE_PEER_RELAY_TOKEN=<purpose-scoped-random-token>
+SINRIA_MEMBER_ID=<member-id>
+SINRIA_INSTANCE_ID=<instance-id>
+SINRIA_LOCAL_API_URL=http://127.0.0.1:8642
+SINRIA_LOCAL_API_KEY=<member-local-api-server-key>
+```
+
+Generate the purpose token locally with
+`python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`; never invent a
+memorable token or copy the value into chat, docs, or Company OS.
+
+From the stable primary employee-distribution checkout:
+
+```bash
+python scripts/install-sinria-line-peer-relay.py --preflight
+python scripts/install-sinria-line-peer-relay.py
+```
+
+The relay accepts loopback binds only. Publish it only with private Tailscale
+Serve HTTPS (`*.ts.net`), never Funnel, and never expose the member's general API
+server. Configure the front door with non-secret route metadata:
+
+```yaml
+gateway:
+  platforms:
+    line:
+      enabled: true
+      extra:
+        peer_routes:
+          kikuchi:
+            display_name: "Kikuchi"
+            member_id: "member_kikuchi"
+            instance_id: "inst_kikuchi_local"
+            endpoint: "https://<private-host>.ts.net/v1/line-peer-relay"
+            token_env: "SINRIA_LINE_PEER_KIKUCHI_TOKEN"
+            dm_user_ids: ["U...verified-user-id..."]
+            group_ids: ["C...approved-group-id..."]
+            group_prefixes: ["@Kikuchi Sinria"]
+```
+
+Use a token environment name matching `SINRIA_LINE_PEER_*_TOKEN`; store the
+matching purpose token only in the front-door local secret file. The member's
+`SINRIA_LOCAL_API_KEY` never leaves that member machine.
+
+A mapped DM never falls back to the front-door owner's agent. Group routing
+requires an exact prefix. Only one-way identifier hashes cross the private relay;
+raw text is never written to Company OS. Relay turns enforce an empty toolset,
+so external actions cannot run and `externalActionPerformed=false` is grounded
+in a runtime boundary. The relay cache stores only the answer; target-local
+Sinria session retention follows the member's local policy.
+
+The configured `dm_user_ids` and `group_ids` are scoped peer authorization;
+unmatched peer-only traffic never reaches the front-door local agent. If a crash
+leaves delivery in indeterminate `sending`, newer turns remain blocked until the
+local hash-only state is reconciled; do not delete the database or assume send.
+
+Completion requires a fresh real LINE round trip with the expected member and
+instance receipt. Installation or a health check alone is not completion.
+
+---
+
 ## Environment variable reference
 
 | Variable | Required | Default | Description |
@@ -173,6 +243,7 @@ Cron jobs with `deliver: line` route to `LINE_HOME_CHANNEL`. The adapter ships a
 | `LINE_BUTTON_LABEL` | no | "Get answer" | Button label |
 | `LINE_DELIVERED_TEXT` | no | "Already replied ✅" | Reply when an already-delivered button is tapped again |
 | `LINE_INTERRUPTED_TEXT` | no | "Run was interrupted before completion." | Reply when a `/stop` orphan button is tapped |
+| `LINE_PEER_ROUTES_JSON` | no | — | JSON route map for private member-owned Sinria relays |
 
 ---
 

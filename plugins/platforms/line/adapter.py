@@ -79,6 +79,19 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote as _urlquote
 
+from gateway.line_peer_routing import (
+    LinePeerDeliveryGate,
+    LinePeerProtocolError,
+    call_line_peer_backend,
+    parse_line_peer_routes,
+    select_line_peer_route,
+)
+
+
+class LinePeerDeliveryError(RuntimeError):
+    """Retryable LINE delivery failure after a peer-routed turn."""
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -559,6 +572,10 @@ class _MessageDeduplicator:
         self._seen[event_id] = time.time()
         return False
 
+    def discard(self, event_id: str) -> None:
+        if event_id:
+            self._seen.pop(event_id, None)
+
 
 # ---------------------------------------------------------------------------
 # Source / chat-id resolution
@@ -871,6 +888,17 @@ class LineAdapter(BasePlatformAdapter):
             except json.JSONDecodeError:
                 mapping = {}
         self.task_participants = mapping if isinstance(mapping, dict) else {}
+        peer_routes = extra.get("peer_routes")
+        if peer_routes is None:
+            peer_routes = os.getenv("LINE_PEER_ROUTES_JSON", "")
+        self.peer_routes = parse_line_peer_routes(peer_routes)
+        self._peer_conversation_locks: Dict[str, asyncio.Lock] = {}
+        self._peer_delivery_gate_path = (
+            get_sinria_home() / "private" / "line-peer" / "front-door-delivery.sqlite3"
+        )
+        self._peer_delivery_gate: Optional[LinePeerDeliveryGate] = LinePeerDeliveryGate(
+            self._peer_delivery_gate_path
+        )
         self.task_workspace_id = str(
             extra.get("task_workspace_id")
             or os.getenv("SINRIA_COMPANY_CONTEXT_WORKSPACE_ID", "")
@@ -942,6 +970,8 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
+        if self._peer_delivery_gate is None:
+            self._peer_delivery_gate = LinePeerDeliveryGate(self._peer_delivery_gate_path)
         if not self.channel_access_token or not self.channel_secret:
             self._set_fatal_error(
                 "config_missing",
@@ -1056,6 +1086,10 @@ class LineAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
 
+        if self._peer_delivery_gate is not None:
+            self._peer_delivery_gate.close()
+            self._peer_delivery_gate = None
+
     # ------------------------------------------------------------------
     # Webhook handlers
     # ------------------------------------------------------------------
@@ -1087,12 +1121,19 @@ class LineAdapter(BasePlatformAdapter):
             return web.Response(status=400, text="bad json")
 
         events = payload.get("events", []) or []
+        retryable_failure = False
         for event in events:
             try:
                 await self._dispatch_event(event)
+            except LinePeerDeliveryError:
+                self._dedup.discard(str(event.get("webhookEventId") or ""))
+                retryable_failure = True
+                logger.warning("LINE peer response delivery failed; requesting webhook retry")
             except Exception:
                 logger.exception("LINE: dispatch_event failed")
 
+        if retryable_failure:
+            return web.Response(status=503, text="retry")
         return web.Response(status=200, text="ok")
 
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
@@ -1102,7 +1143,7 @@ class LineAdapter(BasePlatformAdapter):
 
         # Dedup retries (LINE webhooks may be re-delivered).
         if webhook_event_id and self._dedup.is_duplicate(webhook_event_id):
-            logger.debug("LINE: ignoring duplicate webhook event %s", webhook_event_id)
+            logger.debug("LINE: ignoring duplicate webhook event")
             return
 
         # Filter our own messages (self-echo).
@@ -1110,27 +1151,46 @@ class LineAdapter(BasePlatformAdapter):
         if self._bot_user_id and sender_user_id == self._bot_user_id:
             return
 
-        # Allowlist gate.
-        if not _allowed_for_source(
+        source_type = str(source.get("type") or "")
+        peer_source_allowed = any(
+            (source_type == "user" and str(source.get("userId") or "") in route.dm_user_ids)
+            or (source_type == "group" and str(source.get("groupId") or "") in route.group_ids)
+            for route in self.peer_routes.values()
+        )
+        legacy_source_allowed = _allowed_for_source(
             source,
             allow_all=self.allow_all,
             user_ids=self.allowed_users,
             group_ids=self.allowed_groups,
             room_ids=self.allowed_rooms,
-        ):
-            logger.info("LINE: rejecting unauthorized source %s", source)
+        )
+        if not legacy_source_allowed and not peer_source_allowed:
+            logger.info(
+                "LINE: rejecting unauthorized source type=%s",
+                str(source.get("type") or "unknown"),
+            )
             return
 
         if event_type == "message":
-            await self._handle_message_event(event)
+            await self._handle_message_event(
+                event, peer_only=peer_source_allowed and not legacy_source_allowed
+            )
         elif event_type == "postback":
+            if peer_source_allowed and not legacy_source_allowed:
+                return
             await self._handle_postback_event(event)
         elif event_type in {"follow", "unfollow", "join", "leave"}:
-            logger.info("LINE: lifecycle event %s from %s", event_type, source)
+            logger.info(
+                "LINE: lifecycle event %s source_type=%s",
+                event_type,
+                str(source.get("type") or "unknown"),
+            )
         else:
             logger.debug("LINE: ignoring event type %r", event_type)
 
-    async def _handle_message_event(self, event: Dict[str, Any]) -> None:
+    async def _handle_message_event(
+        self, event: Dict[str, Any], *, peer_only: bool = False
+    ) -> None:
         msg = event.get("message") or {}
         msg_type = msg.get("type", "")
         message_id = msg.get("id", "")
@@ -1152,6 +1212,25 @@ class LineAdapter(BasePlatformAdapter):
         media_types: List[str] = []
         text = ""
 
+        if msg_type != "text" and str(source.get("type") or "") == "user":
+            mapped_peer = select_line_peer_route(
+                self.peer_routes,
+                source_type="user",
+                sender_user_id=str(source.get("userId") or ""),
+                chat_id=chat_id,
+                text="",
+            )
+            if mapped_peer is not None:
+                route, _ = mapped_peer
+                send_result = await self._send_text_chunks(
+                    chat_id,
+                    f"{route.display_name or '本人'}のSinriaへの転送は現在テキストのみ対応しています。",
+                    force_push=False,
+                )
+                if not send_result.success:
+                    raise LinePeerDeliveryError("peer media notice delivery failed")
+                return
+
         if msg_type == "text":
             text = msg.get("text", "") or ""
         elif msg_type in {"image", "audio", "video", "file"}:
@@ -1169,6 +1248,109 @@ class LineAdapter(BasePlatformAdapter):
             text = f"[location: {title} {address}]".strip()
         else:
             text = f"[unsupported message type: {msg_type}]"
+
+        try:
+            selected_peer = select_line_peer_route(
+                self.peer_routes,
+                source_type=str(source.get("type") or ""),
+                sender_user_id=str(source.get("userId") or ""),
+                chat_id=chat_id,
+                text=text,
+            )
+        except LinePeerProtocolError as exc:
+            logger.warning("LINE peer routing rejected safely: %s", type(exc).__name__)
+            return
+        if selected_peer is not None:
+            route, routed_text = selected_peer
+
+            def _private_ref(kind: str, value: str) -> str:
+                digest = hashlib.sha256(
+                    f"line-peer:{kind}:{value}".encode("utf-8")
+                ).hexdigest()
+                return f"sha256:{digest}"
+
+            event_identity = str(event.get("webhookEventId") or message_id)
+            if not event_identity:
+                send_result = await self._send_text_chunks(
+                    chat_id, "このLINEイベントは識別できないため、安全に転送できませんでした。",
+                    force_push=False,
+                )
+                if not send_result.success:
+                    raise LinePeerDeliveryError("peer identity notice delivery failed")
+                return
+            conversation_ref = _private_ref(
+                "conversation", f"{source.get('type')}:{chat_id}"
+            )
+            message_ref = _private_ref("message", event_identity)
+            sender_ref = _private_ref("sender", str(source.get("userId") or ""))
+            fingerprint = hashlib.sha256(json.dumps({
+                "conversationRef": conversation_ref,
+                "messageRef": message_ref,
+                "senderRef": sender_ref,
+                "memberId": route.member_id,
+                "instanceId": route.instance_id,
+                "message": routed_text,
+            }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            lock = self._peer_conversation_locks.setdefault(
+                conversation_ref, asyncio.Lock()
+            )
+            async with lock:
+                delivery_gate = self._peer_delivery_gate
+                if delivery_gate is None:
+                    raise LinePeerDeliveryError("LINE peer delivery state is unavailable")
+                delivery_state = delivery_gate.claim(
+                    conversation_ref, message_ref, fingerprint
+                )
+                if delivery_state == "delivered":
+                    return
+                if delivery_state in {"blocked", "sending"}:
+                    raise LinePeerDeliveryError("an earlier peer response is not reconciled")
+                if not routed_text:
+                    delivery_gate.transition(conversation_ref, message_ref, "sending")
+                    send_result = await self._send_text_chunks(
+                        chat_id,
+                        f"{route.display_name or '本人'}のSinria宛の内容を続けて入力してください。",
+                        force_push=False,
+                    )
+                    if not send_result.success:
+                        delivery_gate.transition(conversation_ref, message_ref, "processing")
+                        raise LinePeerDeliveryError("peer empty-message notice delivery failed")
+                    delivery_gate.transition(conversation_ref, message_ref, "delivered")
+                    return
+                try:
+                    receipt = await call_line_peer_backend(
+                        route,
+                        text=routed_text,
+                        conversation_ref=conversation_ref,
+                        message_ref=message_ref,
+                        source_type=str(source.get("type") or ""),
+                        sender_ref=sender_ref,
+                    )
+                except LinePeerProtocolError as exc:
+                    logger.warning("LINE peer backend unavailable: %s", type(exc).__name__)
+                    delivery_gate.transition(conversation_ref, message_ref, "sending")
+                    send_result = await self._send_text_chunks(
+                        chat_id,
+                        f"⚠️ {route.display_name or '本人'}のSinriaに接続できませんでした。代理回答は行っていません。",
+                        force_push=False,
+                    )
+                    if not send_result.success:
+                        delivery_gate.transition(conversation_ref, message_ref, "processing")
+                        raise LinePeerDeliveryError("peer failure notice delivery failed")
+                    delivery_gate.transition(conversation_ref, message_ref, "delivered")
+                    return
+                delivery_gate.transition(conversation_ref, message_ref, "sending")
+                send_result = await self._send_text_chunks(
+                    chat_id, receipt.response, force_push=False
+                )
+                if not send_result.success:
+                    delivery_gate.transition(conversation_ref, message_ref, "processing")
+                    raise LinePeerDeliveryError("peer response delivery failed")
+                delivery_gate.transition(conversation_ref, message_ref, "delivered")
+                return
+
+        if peer_only:
+            return
 
         # Confidentiality boundary: task-intake groups never enter the normal
         # agent/session path.  Their raw text is classified only through the
@@ -1510,14 +1692,14 @@ class LineAdapter(BasePlatformAdapter):
                 await self._client.reply(token, messages)
                 return SendResult(success=True, message_id=token)
             except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+                logger.info("LINE: reply token rejected (%s); falling back to push", type(exc).__name__)
                 # fall through to push
 
         try:
             await self._client.push(chat_id, messages)
             return SendResult(success=True, message_id=None)
         except Exception as exc:
-            logger.error("LINE: push send failed: %s", exc)
+            logger.error("LINE: push send failed: %s", type(exc).__name__)
             return SendResult(success=False, error=str(exc))
 
     def _consume_reply_token(self, chat_id: str) -> Tuple[str, bool]:
@@ -1824,7 +2006,7 @@ class LineAdapter(BasePlatformAdapter):
             try:
                 await self._client.reply(token, first_batch)
             except Exception as exc:
-                logger.info("LINE: reply token rejected (%s); falling back to push", exc)
+                logger.info("LINE: reply token rejected (%s); falling back to push", type(exc).__name__)
                 try:
                     await self._client.push(chat_id, first_batch)
                 except Exception as exc2:

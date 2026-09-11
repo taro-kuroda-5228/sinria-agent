@@ -306,6 +306,41 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
 
+    def test_create_agent_empty_toolsets_clear_post_init_injections(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.tools = [{"function": {"name": "kanban_complete"}}]
+                self.valid_tool_names = {"kanban_complete"}
+                self.enabled_toolsets = ["kanban"]
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai-codex", "base_url": "https://example.test/v1", "api_mode": "codex_responses"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config", staticmethod(lambda: None)
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model", staticmethod(lambda: None)
+        )
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"kanban"})
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(session_id="line-peer-session", enabled_toolsets=[])
+
+        assert captured["enabled_toolsets"] == []
+        assert agent.tools == []
+        assert agent.valid_tool_names == set()
+        assert agent.enabled_toolsets == []
+        assert agent._sinria_no_tools_enforced is True
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -701,6 +736,26 @@ class TestChatCompletionsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/chat/completions", json={"model": "test", "messages": []})
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_no_tools_request_is_forwarded_to_agent_runtime(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "safe answer", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "sinria-agent",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "sinria_no_tools": True,
+                    },
+                )
+        assert resp.status == 200
+        assert mock_run.await_args.kwargs["enabled_toolsets"] == []
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
