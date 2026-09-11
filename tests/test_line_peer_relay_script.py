@@ -117,12 +117,44 @@ def test_check_loads_profile_env_without_printing_credentials(tmp_path, monkeypa
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(module, "get_sinria_home", lambda: home)
+    probes = []
+    monkeypatch.setattr(
+        module,
+        "probe_line_peer_local_api",
+        lambda url, key: probes.append((url, key)) or {"ok": True},
+    )
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--check"])
 
     assert module.main() == 0
     output = capsys.readouterr().out
     assert '"ok": true' in output
     assert _PURPOSE_TOKEN not in output
+    assert "local-secret" not in output
+    assert probes == [("http://127.0.0.1:8642", "local-secret")]
+
+
+def test_check_fails_closed_when_local_api_health_probe_fails(monkeypatch, capsys):
+    module = _load()
+    values = {
+        "SINRIA_LINE_PEER_RELAY_TOKEN": _PURPOSE_TOKEN,
+        "SINRIA_MEMBER_ID": "member_kikuchi",
+        "SINRIA_INSTANCE_ID": "inst_kikuchi_local",
+        "SINRIA_LOCAL_API_URL": "http://127.0.0.1:8642",
+        "SINRIA_LOCAL_API_KEY": "local-secret",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        module,
+        "probe_line_peer_local_api",
+        lambda *_: (_ for _ in ()).throw(module.LinePeerRelayError("private detail")),
+    )
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--check"])
+
+    assert module.main() == 2
+    output = capsys.readouterr().out
+    assert "local_api_unavailable" in output
+    assert "private detail" not in output
     assert "local-secret" not in output
 
 
@@ -138,6 +170,7 @@ def test_check_rejects_non_loopback_local_api(monkeypatch, capsys):
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--check"])
+
     assert module.main() == 2
     output = capsys.readouterr().out
     assert "invalid_local_api_url" in output

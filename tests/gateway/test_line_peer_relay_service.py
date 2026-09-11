@@ -12,6 +12,7 @@ import pytest
 from gateway.line_peer_relay_service import (
     LinePeerRelayError,
     LinePeerRelayStore,
+    probe_line_peer_local_api,
     process_line_peer_relay,
     validate_line_peer_payload,
 )
@@ -95,13 +96,44 @@ def test_relay_calls_only_local_api_and_returns_verified_receipt(tmp_path):
     assert "今日の予定" not in serialized
 
 
+def test_preflight_probes_authenticated_loopback_health():
+    captured = {}
+
+    def request_fn(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "platform": "api_server"}
+
+    receipt = probe_line_peer_local_api(
+        "http://127.0.0.1:8642",
+        "local-only-key",
+        request_fn=request_fn,
+    )
+
+    assert receipt == {"ok": True, "service": "sinria-local-api"}
+    assert captured == {
+        "url": "http://127.0.0.1:8642/health/detailed",
+        "token": "local-only-key",
+        "timeout": 10.0,
+    }
+
+
+def test_preflight_rejects_unhealthy_or_unreachable_local_api():
+    with pytest.raises(LinePeerRelayError, match="health check failed"):
+        probe_line_peer_local_api(
+            "http://127.0.0.1:8642",
+            "local-only-key",
+            request_fn=lambda **_: {"status": "degraded"},
+        )
+
+
 def test_relay_refuses_non_loopback_agent_api(tmp_path):
     for local_api_url in (
         "https://external.example",
         "http://user:password@127.0.0.1:8642",
+        "http://127.0.0.1:8642/v1",
     ):
         with LinePeerRelayStore(tmp_path / ("relay-" + str(len(local_api_url)) + ".sqlite3")) as store:
-            with pytest.raises(LinePeerRelayError, match="loopback|userinfo"):
+            with pytest.raises(LinePeerRelayError, match="loopback|userinfo|base path"):
                 process_line_peer_relay(
                     _payload(),
                     member_id="member_kikuchi",

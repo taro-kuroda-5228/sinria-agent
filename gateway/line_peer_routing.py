@@ -7,6 +7,8 @@ credential values.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import math
 import os
@@ -45,6 +47,15 @@ def validate_line_peer_token(value: str) -> None:
     """Require a token shaped like 32+ random bytes encoded as base64url."""
     if not _TOKEN_RE.fullmatch(value):
         raise ValueError("LINE peer purpose token must encode at least 32 random bytes")
+    try:
+        decoded = base64.b64decode(
+            value + ("=" * (-len(value) % 4)), altchars=b"-_", validate=True
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("LINE peer purpose token is not canonical base64url") from exc
+    canonical = base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
+    if canonical != value or len(decoded) < 32:
+        raise ValueError("LINE peer purpose token must canonically encode at least 32 bytes")
     counts = {char: value.count(char) for char in set(value)}
     entropy = -sum(
         (count / len(value)) * math.log2(count / len(value))
@@ -165,6 +176,31 @@ class LinePeerDeliveryGate:
                     (message_ref, str(row[0]), time.time()),
                 )
             self.connection.commit()
+
+    def reconcile(
+        self,
+        conversation_ref: str,
+        message_ref: str,
+        *,
+        decision: str,
+        human_confirmed: bool,
+    ) -> None:
+        if not human_confirmed:
+            raise ValueError("LINE peer sending reconciliation requires human review")
+        if decision not in {"retry", "delivered"}:
+            raise ValueError("LINE peer reconciliation decision is invalid")
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT state FROM peer_delivery WHERE conversation_ref = ? AND message_ref = ?",
+                (conversation_ref, message_ref),
+            ).fetchone()
+            if row is None or str(row[0]) != "sending":
+                raise LinePeerProtocolError("LINE peer sending claim is unavailable")
+            self.transition(
+                conversation_ref,
+                message_ref,
+                "processing" if decision == "retry" else "delivered",
+            )
 
     def close(self) -> None:
         with self._lock:

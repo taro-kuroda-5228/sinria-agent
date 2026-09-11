@@ -181,6 +181,10 @@ python scripts/install-sinria-line-peer-relay.py --preflight
 python scripts/install-sinria-line-peer-relay.py
 ```
 
+Preflight makes an authenticated loopback request to `/health/detailed`; it is
+not a configuration-only check and fails closed if the member runtime is
+unavailable or rejects the local API key.
+
 The relay accepts loopback binds only. Publish it only with private Tailscale
 Serve HTTPS (`*.ts.net`), never Funnel, and never expose the member's general API
 server. Configure the front door with non-secret route metadata:
@@ -218,6 +222,20 @@ The configured `dm_user_ids` and `group_ids` are scoped peer authorization;
 unmatched peer-only traffic never reaches the front-door local agent. If a crash
 leaves delivery in indeterminate `sending`, newer turns remain blocked until the
 local hash-only state is reconciled; do not delete the database or assume send.
+After a human checks whether LINE received the response, run exactly one of:
+
+```bash
+python scripts/reconcile-sinria-line-peer-delivery.py \
+  --conversation-ref sha256:<hash> --message-ref sha256:<hash> \
+  --decision retry --confirm-human-review
+python scripts/reconcile-sinria-line-peer-delivery.py \
+  --conversation-ref sha256:<hash> --message-ref sha256:<hash> \
+  --decision delivered --confirm-human-review
+```
+
+Use `retry` only after confirming non-delivery and `delivered` only after
+confirming delivery. The command accepts hash-only references and stores no raw
+LINE body.
 
 Completion requires a fresh real LINE round trip with the expected member and
 instance receipt. Installation or a health check alone is not completion.

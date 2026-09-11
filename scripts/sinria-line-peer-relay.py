@@ -19,6 +19,7 @@ from gateway.line_peer_relay_service import (  # noqa: E402
     _loopback_chat_url,
     LinePeerRelayError,
     LinePeerRelayStore,
+    probe_line_peer_local_api,
     process_line_peer_relay,
 )
 from gateway.line_peer_routing import validate_line_peer_token  # noqa: E402
@@ -165,6 +166,11 @@ def main() -> int:
         print(json.dumps({"ok": False, "error": error}))
         return 2
     if args.check:
+        try:
+            probe_line_peer_local_api(values["local_api_url"], values["local_api_key"])
+        except LinePeerRelayError:
+            print(json.dumps({"ok": False, "error": "local_api_unavailable"}))
+            return 2
         print(json.dumps({
             "ok": True,
             "service": "sinria-line-peer-relay",

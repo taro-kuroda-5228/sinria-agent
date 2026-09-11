@@ -17,6 +17,7 @@ from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 from gateway.line_peer_routing import (
     _NoRedirectHandler,
     _NoProxyHandler,
+    LinePeerDeliveryGate,
     LinePeerProtocolError,
     LinePeerRoute,
     call_line_peer_backend,
@@ -44,6 +45,22 @@ def test_relay_http_clients_disable_redirects(handler_class):
 @pytest.mark.parametrize("handler_class", [_NoProxyHandler, _RelayNoProxyHandler])
 def test_relay_http_clients_ignore_environment_proxies(handler_class):
     assert handler_class().proxies == {}
+
+
+def test_human_review_can_reconcile_indeterminate_sending_state(tmp_path):
+    gate = LinePeerDeliveryGate(tmp_path / "delivery.sqlite3")
+    conversation = "sha256:" + "a" * 64
+    message = "sha256:" + "b" * 64
+    fingerprint = "c" * 64
+    assert gate.claim(conversation, message, fingerprint) == "processing"
+    gate.transition(conversation, message, "sending")
+    with pytest.raises(ValueError, match="human review"):
+        gate.reconcile(conversation, message, decision="retry", human_confirmed=False)
+    gate.reconcile(conversation, message, decision="retry", human_confirmed=True)
+    assert gate.claim(conversation, message, fingerprint) == "processing"
+    gate.transition(conversation, message, "sending")
+    gate.reconcile(conversation, message, decision="delivered", human_confirmed=True)
+    assert gate.claim(conversation, message, fingerprint) == "delivered"
 
 
 def _route(**overrides):

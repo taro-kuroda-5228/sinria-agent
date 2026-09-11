@@ -163,6 +163,27 @@ def _local_api_request(
     return value
 
 
+def _local_api_health_request(*, url: str, token: str, timeout: float) -> dict[str, Any]:
+    request = Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with build_opener(_NoProxyHandler(), _NoRedirectHandler()).open(
+            request, timeout=timeout
+        ) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise LinePeerRelayError("local Sinria agent health check failed") from exc
+    if not isinstance(value, dict):
+        raise LinePeerRelayError("local Sinria agent health check failed")
+    return value
+
+
 def _loopback_chat_url(base_url: str) -> str:
     parsed = urlparse(str(base_url or "").strip().rstrip("/"))
     if parsed.username is not None or parsed.password is not None:
@@ -171,7 +192,32 @@ def _loopback_chat_url(base_url: str) -> str:
         raise LinePeerRelayError("local Sinria agent API must use HTTP loopback")
     if not parsed.netloc or parsed.query or parsed.fragment:
         raise LinePeerRelayError("local Sinria agent API URL is invalid")
+    if parsed.path not in {"", "/"}:
+        raise LinePeerRelayError("local Sinria agent API base path is unsupported")
     return str(base_url).strip().rstrip("/") + "/v1/chat/completions"
+
+
+def probe_line_peer_local_api(
+    base_url: str,
+    local_api_key: str,
+    *,
+    request_fn: Callable[..., dict[str, Any]] = _local_api_health_request,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Verify the authenticated local API is reachable before relay activation."""
+    if not local_api_key:
+        raise LinePeerRelayError("local Sinria agent credential is not configured")
+    chat_url = _loopback_chat_url(base_url)
+    health_url = chat_url.removesuffix("/v1/chat/completions") + "/health/detailed"
+    try:
+        value = request_fn(url=health_url, token=local_api_key, timeout=timeout)
+    except LinePeerRelayError:
+        raise
+    except Exception as exc:
+        raise LinePeerRelayError("local Sinria agent health check failed") from exc
+    if value.get("status") != "ok":
+        raise LinePeerRelayError("local Sinria agent health check failed")
+    return {"ok": True, "service": "sinria-local-api"}
 
 
 def process_line_peer_relay(
