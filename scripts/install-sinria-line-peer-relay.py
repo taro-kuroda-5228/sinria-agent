@@ -114,7 +114,9 @@ def main() -> None:
     temporary.replace(path)
 
     if not args.no_load:
-        domain = f"gui/{os.getuid()}"
+        if not hasattr(os, "getuid"):
+            raise SystemExit("LINE peer relay LaunchAgent installation requires macOS")
+        domain = f"gui/{os.getuid()}"  # windows-footgun: ok -- guarded macOS launchd path
         subprocess.run(["launchctl", "bootout", domain, str(path)], capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
         subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{LABEL}"], check=True)
