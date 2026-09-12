@@ -285,6 +285,7 @@ async def test_clear_task_posts_metadata_then_sends_short_receipt(tmp_path):
 def test_prepare_inbound_task_context_only_for_configured_text_group(tmp_path):
     cfg = type("Cfg", (), {"extra": {
         "task_intake_groups": ["Cgroup"],
+        "task_invocation_prefixes": [],
         "task_evidence_root": str(tmp_path),
     }})()
     adapter = _line.LineAdapter(cfg)
@@ -379,6 +380,7 @@ async def test_configured_group_bypasses_agent_and_uses_local_classifier(tmp_pat
     cfg = type("Cfg", (), {"extra": {
         "allowed_groups": ["Cgroup"],
         "task_intake_groups": ["Cgroup"],
+        "task_invocation_prefixes": [],
         "task_intake_local_model": "qwen3.5:9b",
         "task_evidence_root": str(tmp_path),
     }})()
