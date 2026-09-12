@@ -240,6 +240,21 @@ LINE body.
 Completion requires a fresh real LINE round trip with the expected member and
 instance receipt. Installation or a health check alone is not completion.
 
+### Human acknowledgement evidence
+
+Keep transport and human evidence separate. A LINE API 2xx is only
+`api_accepted`; it is not proof that a person displayed, read, understood, or
+accepted the message. State advances to `human_replied` only when the expected
+sender replies in the expected conversation with the exact expected phrase
+while quoting the specific outbound message.
+
+The local `human-confirmation.sqlite3` stores conversation, sender, message, and
+reply identities only as one-way hashes. Unquoted replies, another DM/group,
+another participant, and generic acknowledgements such as `了解です` cannot
+confirm. For local task classification, `quotedMessageId` is rendered only as a
+role relationship such as `[sender replying_to=other_participant]`; raw LINE
+IDs are not added to model context.
+
 ---
 
 ## Environment variable reference

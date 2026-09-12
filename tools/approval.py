@@ -578,6 +578,99 @@ _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, 
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
 
+# Deferred memory is a cache only; shared state is the authorization authority.
+_deferred_gateway_approvals: dict[str, dict] = {}
+_DEFERRED_APPROVAL_TTL_SECONDS = 2 * 60 * 60
+
+
+def _expire_deferred_gateway_approval_locked(session_key: str) -> None:
+    entry = _deferred_gateway_approvals.get(session_key)
+    if entry is not None and entry["expires_at"] <= time.time():
+        _deferred_gateway_approvals.pop(session_key, None)
+        approval_store.clear_pending(entry["approval_id"])
+    elif entry is not None and not approval_store.is_live(entry["approval_id"]):
+        _deferred_gateway_approvals.pop(session_key, None)
+
+
+def _defer_gateway_approval(session_key: str, approval: dict, *, approval_id: str | None = None) -> None:
+    """Record a deferred approval bound to one session and exact command."""
+    if not session_key:
+        return
+    data = dict(approval)
+    data["command_sha256"] = hashlib.sha256(
+        str(data.get("command", "")).encode("utf-8", "replace")
+    ).hexdigest()
+    handoff = approval_id is not None
+    approval_id = uuid.uuid4().hex[:12] if approval_id is None else approval_id
+    with _lock:
+        if not handoff:
+            approval_id = approval_store.record_pending(
+                approval_id, session_key, data, owner="deferred",
+                ttl_seconds=_DEFERRED_APPROVAL_TTL_SECONDS,
+            )
+        if not approval_id or not approval_store.is_live(approval_id):
+            return
+        _deferred_gateway_approvals[session_key] = {
+            "approval_id": approval_id,
+            "data": data,
+            "expires_at": time.time() + _DEFERRED_APPROVAL_TTL_SECONDS,
+            "choice": None,
+        }
+
+
+
+def peek_gateway_approval(session_key: str, command: str | None = None) -> Optional[dict]:
+    """Return a live deferred approval, optionally requiring exact command."""
+    digest = hashlib.sha256(str(command).encode("utf-8", "replace")).hexdigest() if command is not None else None
+    with _lock:
+        _expire_deferred_gateway_approval_locked(session_key)
+        entry = _deferred_gateway_approvals.get(session_key)
+        if entry is not None and (digest is None or entry["data"]["command_sha256"] == digest):
+            return dict(entry["data"])
+    for row in reversed(approval_store.list_pending(max_age_seconds=_DEFERRED_APPROVAL_TTL_SECONDS)):
+        if row.get("session_key") == session_key and (digest is None or row.get("command_sha256") == digest):
+            return row
+    return None
+
+
+def _consume_deferred_gateway_approval(session_key: str, command: str) -> Optional[str]:
+    """Atomically claim a resolved exact-session/exact-command response once."""
+    digest = hashlib.sha256(str(command).encode("utf-8", "replace")).hexdigest()
+    with _lock:
+        _expire_deferred_gateway_approval_locked(session_key)
+    rows = approval_store.list_pending(max_age_seconds=_DEFERRED_APPROVAL_TTL_SECONDS)
+    for row in reversed(rows):
+        if row.get("session_key") == session_key and row.get("command_sha256") == digest:
+            with _lock:
+                row_id = str(row.get("id", ""))
+                choice = approval_store.poll_response(
+                    row_id, owner="deferred", session_key=session_key, digest=digest,
+                )
+                if choice is not None:
+                    current = _deferred_gateway_approvals.get(session_key)
+                    if current is not None and current["approval_id"] == row_id:
+                        _deferred_gateway_approvals.pop(session_key, None)
+                    approval_store.clear_pending(row_id)
+                    return choice
+    return None
+
+
+def peek_gateway_approval_id(session_key: str) -> Optional[str]:
+    """Return the live approval ID without exposing command data."""
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if queue:
+            return queue[0].approval_id
+        _expire_deferred_gateway_approval_locked(session_key)
+        deferred = _deferred_gateway_approvals.get(session_key)
+        if deferred is not None:
+            return str(deferred["approval_id"])
+    candidates = [row for row in approval_store.list_pending(
+        max_age_seconds=_DEFERRED_APPROVAL_TTL_SECONDS
+    ) if row.get("session_key") == session_key]
+    return str(candidates[-1]["id"]) if candidates else None
+
+
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
@@ -640,32 +733,63 @@ def resolve_gateway_approval(
     choice: str,
     resolve_all: bool = False,
     authorize: Optional[Callable[[dict, str], bool]] = None,
+    expected_approval_id: Optional[str] = None,
 ) -> int:
-    """Resolve pending gateway approval(s), optionally under an atomic policy.
-
-    ``authorize`` is evaluated while the queue lock is held and before any
-    entry is removed.  A rejected positive approval leaves every waiter
-    pending.  Denial is always allowed because it cannot increase authority.
-    """
+    """Authorize before persisting a decision; shared authority prevents replay."""
+    targets = []
+    check_file_store = False
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
-            return 0
-        targets = list(queue) if resolve_all else [queue[0]]
-        if choice != "deny" and authorize is not None:
-            if not all(bool(authorize(entry.data, choice)) for entry in targets):
-                raise ApprovalAuthorizationError(
-                    "approver is not authorized for this pending operation"
-                )
-        if resolve_all:
-            queue.clear()
+            _expire_deferred_gateway_approval_locked(session_key)
+            deferred = _deferred_gateway_approvals.get(session_key)
+            if deferred is not None and deferred["choice"] is None:
+                if expected_approval_id is not None and deferred["approval_id"] != expected_approval_id:
+                    return 0
+                if choice not in {"once", "deny"}:
+                    raise ApprovalAuthorizationError("deferred approvals only support once or deny")
+                if choice != "deny" and authorize is not None and not authorize(deferred["data"], choice):
+                    raise ApprovalAuthorizationError("approver is not authorized for this pending operation")
+                return int(approval_store.write_response(deferred["approval_id"], choice))
+            check_file_store = True
         else:
-            queue.pop(0)
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+            targets = list(queue) if resolve_all else [queue[0]]
+            if choice not in {"once", "deny"} and any(
+                (entry.data.get("metadata") or {}).get("tool") == "execute_code"
+                for entry in targets
+            ):
+                return 0
+            if expected_approval_id is not None:
+                if resolve_all or targets[0].approval_id != expected_approval_id:
+                    return 0
+            if choice != "deny" and authorize is not None:
+                if not all(bool(authorize(entry.data, choice)) for entry in targets):
+                    raise ApprovalAuthorizationError("approver is not authorized for this pending operation")
+            targets = [entry for entry in targets
+                       if approval_store.resolve_active(entry.approval_id, choice)]
+            for entry in targets:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            for entry in targets:
+                entry.result = choice
+
+    if check_file_store:
+        if choice not in {"once", "deny"}:
+            raise ApprovalAuthorizationError("deferred approvals only support once or deny")
+        rows = approval_store.list_pending(max_age_seconds=_DEFERRED_APPROVAL_TTL_SECONDS)
+        candidates = [row for row in rows if row.get("session_key") == session_key]
+        if expected_approval_id is not None:
+            candidates = [row for row in candidates if row.get("id") == expected_approval_id]
+        if not candidates:
+            return 0
+        candidate = candidates[-1]
+        auth_data = {"metadata": candidate.get("collaboration_binding") or {}}
+        if choice != "deny" and authorize is not None and not authorize(auth_data, choice):
+            raise ApprovalAuthorizationError("approver is not authorized for this pending operation")
+        return int(approval_store.write_response(str(candidate.get("id", "")), choice))
 
     for entry in targets:
-        entry.result = choice
         approval_store.clear_pending(entry.approval_id)
         entry.event.set()
     return len(targets)
@@ -691,10 +815,13 @@ def _wait_for_gateway_entry(entry: "_ApprovalEntry", timeout: int) -> bool:
             return False
         if entry.event.wait(timeout=min(1.0, remaining)):
             return True
-        remote = approval_store.poll_response(entry.approval_id)
-        if remote is not None:
-            entry.result = remote
-            return True
+        with _lock:
+            if entry.result is not None:
+                return True
+            remote = approval_store.poll_response(entry.approval_id)
+            if remote is not None:
+                entry.result = remote
+                return True
         if touch_activity_if_due is not None:
             touch_activity_if_due(activity_state, "waiting for user approval")
 
@@ -702,7 +829,12 @@ def _wait_for_gateway_entry(entry: "_ApprovalEntry", timeout: int) -> bool:
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
-        return bool(_gateway_queues.get(session_key))
+        _expire_deferred_gateway_approval_locked(session_key)
+        if _gateway_queues.get(session_key) or session_key in _deferred_gateway_approvals:
+            return True
+    return any(row.get("session_key") == session_key for row in approval_store.list_pending(
+        max_age_seconds=_DEFERRED_APPROVAL_TTL_SECONDS
+    ))
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -736,19 +868,17 @@ def disable_session_yolo(session_key: str) -> None:
 def clear_session(session_key: str) -> None:
     """Remove all approval and yolo state for a given session.
 
-    Does NOT call approval_store.clear_pending directly: setting entry.result
-    and entry.event.set() wakes the waiter thread, which calls
-    approval_store.clear_pending itself as part of normal resolution teardown
-    (see request_gateway_approval / _wait_for_gateway_entry).  If the waiter
-    thread is already dead (process crash, premature exit), the 2-hour stale
-    sweep in approval_store.list_pending covers any leftover files.
+    Shared retirement precedes local cleanup; deferred entries have no waiter
+    to clean them up, and may belong to another process. Tombstones survive.
     """
     if not session_key:
         return
     with _lock:
+        approval_store.clear_session(session_key)
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _deferred_gateway_approvals.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -1033,7 +1163,8 @@ def request_gateway_approval(
 
     with _lock:
         notify_cb = _gateway_notify_cbs.get(session_key)
-    if notify_cb is None:
+    if notify_cb is None and (metadata or {}).get("tool") != "execute_code":
+        # Preserve distribution's callback-less behavior for unrelated gates.
         submit_pending(session_key, {
             "command": preview,
             "pattern_key": pattern_key,
@@ -1059,8 +1190,14 @@ def request_gateway_approval(
     }
     entry = _ApprovalEntry(approval_data)
     with _lock:
+        shared_id = approval_store.record_pending(entry.approval_id, session_key, approval_data)
+        if shared_id != entry.approval_id:
+            return {
+                "approved": False,
+                "status": "approval_required",
+                "message": "BLOCKED: Existing script approval is pending or approval storage is unavailable.",
+            }
         _gateway_queues.setdefault(session_key, []).append(entry)
-    approval_store.record_pending(entry.approval_id, session_key, approval_data)
 
     _fire_approval_hook(
         "pre_approval_request",
@@ -1073,7 +1210,8 @@ def request_gateway_approval(
     )
 
     try:
-        notify_cb(approval_data)
+        if notify_cb is not None:
+            notify_cb(approval_data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         with _lock:
@@ -1100,13 +1238,27 @@ def request_gateway_approval(
 
     resolved = _wait_for_gateway_entry(entry, timeout)
 
+    # Preserve the displayed ID for a one-shot script after the wait expires.
+    deferred = (metadata or {}).get("tool") == "execute_code" and not resolved and entry.result is None
+    if deferred:
+        _defer_gateway_approval(session_key, entry.data, approval_id=entry.approval_id)
+
     with _lock:
         queue = _gateway_queues.get(session_key, [])
         if entry in queue:
             queue.remove(entry)
         if not queue:
             _gateway_queues.pop(session_key, None)
-    approval_store.clear_pending(entry.approval_id)
+        if deferred and entry.result is not None:
+            current = _deferred_gateway_approvals.get(session_key)
+            if current is not None and current["approval_id"] == entry.approval_id:
+                _deferred_gateway_approvals.pop(session_key, None)
+            deferred = False
+            resolved = True
+        elif deferred:
+            approval_store.mark_deferred(entry.approval_id)
+    if not deferred:
+        approval_store.clear_pending(entry.approval_id)
 
     choice = entry.result
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
@@ -1525,7 +1677,7 @@ def check_all_command_guards(command: str, env_type: str,
             entry = _ApprovalEntry(approval_data)
             with _lock:
                 _gateway_queues.setdefault(session_key, []).append(entry)
-            approval_store.record_pending(entry.approval_id, session_key, approval_data)
+                approval_store.record_pending(entry.approval_id, session_key, approval_data)
 
             # Notify plugins that an approval is being requested. Fires before
             # the gateway notify callback so observers (e.g. macOS notifier
@@ -1696,6 +1848,66 @@ def check_all_command_guards(command: str, env_type: str,
 
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
+
+
+def check_execute_code_guard(code: str, env_type: str,
+                             has_host_access: bool = False) -> dict:
+    """Gate arbitrary Python before spawning; grants bind the exact script."""
+    pattern_key = "execute_code"
+    description = (
+        "execute_code script execution. The script can spawn subprocesses or "
+        "mutate files without passing through terminal command approval; "
+        "approval is one-shot for this run."
+    )
+    if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"} and not has_host_access:
+        return {"approved": True, "message": None}
+    approval_mode = _get_approval_mode()
+    if (is_truthy_value(os.getenv("HERMES_YOLO_MODE"))
+            or is_current_session_yolo_enabled() or approval_mode == "off"):
+        return {"approved": True, "message": None}
+    if env_var_enabled("HERMES_CRON_SESSION"):
+        if _get_cron_approval_mode() == "deny":
+            return {
+                "approved": False,
+                "message": "BLOCKED: execute_code runs arbitrary Python; this cron profile requires user approval.",
+                "pattern_key": pattern_key, "description": description,
+                "outcome": "blocked", "user_consent": False,
+            }
+        return {"approved": True, "message": None}
+    is_gateway = _is_gateway_approval_context()
+    if not is_gateway and not env_var_enabled("HERMES_EXEC_ASK"):
+        return {"approved": True, "message": None}
+    command = f"execute_code <<'PY'\n{code}\nPY"
+    if is_gateway:
+        session_key = get_current_session_key(default="")
+        choice = _consume_deferred_gateway_approval(session_key, command)
+        if choice is not None:
+            return {
+                "approved": choice == "once",
+                "message": None if choice == "once" else "BLOCKED: Script approval denied or not one-shot.",
+                "user_approved": choice == "once",
+            }
+        if peek_gateway_approval(session_key, command) is not None:
+            return {
+                "approved": False, "status": "approval_required",
+                "message": "BLOCKED: Existing script approval is pending. Resolve it before retrying the exact script.",
+            }
+    if approval_mode == "smart":
+        verdict = _smart_approve(command, description)
+        if verdict == "approve":
+            return {"approved": True, "message": None,
+                    "smart_approved": True, "description": description}
+        if verdict == "deny":
+            return {
+                "approved": False,
+                "message": "BLOCKED by smart approval: execute_code script execution was assessed as genuinely dangerous. Do NOT retry.",
+                "smart_denied": True, "pattern_key": pattern_key,
+                "description": description, "outcome": "denied", "user_consent": False,
+            }
+    return request_gateway_approval(
+        command, description, pattern_key=pattern_key,
+        allow_session=False, allow_permanent=False, metadata={"tool": "execute_code"},
+    )
 
 
 # Load permanent allowlist from config on module import

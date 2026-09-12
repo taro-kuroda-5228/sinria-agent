@@ -1065,7 +1065,29 @@ def execute_code(
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
-    env_type = _get_env_config()["env_type"]
+    env_config = _get_env_config()
+    env_type = env_config["env_type"]
+
+    # Gate the whole script before either execution path can spawn. This
+    # distribution has no terminal host-access helper: conservatively treat
+    # custom Docker arguments as host access as well as explicit bind mounts.
+    from tools.approval import check_execute_code_guard
+    guard = check_execute_code_guard(
+        code, env_type,
+        has_host_access=env_type == "docker" and bool(
+            env_config.get("docker_volumes")
+            or env_config.get("docker_mount_cwd_to_workspace")
+            or env_config.get("docker_extra_args")
+        ),
+    )
+    if not guard.get("approved", False):
+        return json.dumps({
+            "status": guard.get("status", "error"),
+            "error": guard.get("message") or "execute_code blocked by approval guard.",
+            "tool_calls_made": 0,
+            "duration_seconds": 0,
+        }, ensure_ascii=False)
+
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
 
