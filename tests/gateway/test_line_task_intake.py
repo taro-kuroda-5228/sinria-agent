@@ -20,6 +20,56 @@ def test_task_intake_disabled_by_default(monkeypatch):
     assert adapter.task_intake_groups == set()
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("@Sinria 提案資料を更新して", "提案資料を更新して"),
+        ("@Sinria\u3000提案資料を更新して", "提案資料を更新して"),
+        ("@Sinria", ""),
+        ("@SinriaBot 提案資料を更新して", None),
+        ("前置き @Sinria 提案資料を更新して", None),
+        ("<@&1506049462001467605> 提案資料を更新して", None),
+    ],
+)
+def test_explicit_task_prefix_must_match_at_start_and_on_a_boundary(text, expected):
+    assert _line.extract_line_task_invocation(
+        {"type": "text", "text": text},
+        prefixes=("@Sinria",),
+        bot_user_id="Ubot",
+    ) == expected
+
+
+def test_native_line_self_mention_at_start_invokes_task():
+    message = {
+        "type": "text", "text": "任意表示 提案資料を更新して",
+        "mention": {"mentionees": [
+            {"index": 0, "length": 4, "type": "user", "isSelf": True},
+        ]},
+    }
+    assert _line.extract_line_task_invocation(
+        message, prefixes=("@Sinria",), bot_user_id="Ubot"
+    ) == "提案資料を更新して"
+
+
+def test_unverified_or_quoted_marker_does_not_invoke():
+    unverified = {
+        "type": "text", "text": "@Other 提案資料を更新して",
+        "mention": {"mentionees": [
+            {"index": 0, "length": 6, "type": "user", "isSelf": False},
+        ]},
+    }
+    quoted = {
+        "type": "text", "text": "了解です",
+        "quotedMessageId": "message-containing-old-marker",
+    }
+    assert _line.extract_line_task_invocation(
+        unverified, prefixes=("@Sinria",), bot_user_id="Ubot"
+    ) is None
+    assert _line.extract_line_task_invocation(
+        quoted, prefixes=("@Sinria",), bot_user_id="Ubot"
+    ) is None
+
+
 def test_parse_no_task_decision_is_silent():
     decision = _line.parse_task_intake_decision(
         '{"kind":"none","reason":"雑談"}'
@@ -248,6 +298,46 @@ def test_prepare_inbound_task_context_only_for_configured_text_group(tmp_path):
 
     assert prompt and "strict JSON" not in prompt
     assert adapter._task_contexts["Cgroup"]["message_id"] == "m1"
+
+
+def test_configured_invocation_prefix_requires_mapped_sender_and_strips_marker(tmp_path):
+    cfg = type("Cfg", (), {"extra": {
+        "task_intake_groups": ["Cgroup"],
+        "task_invocation_prefixes": ["@Sinria"],
+        "task_participants": {
+            "Utaro": {"member_id": "member-taro", "instance_id": "instance-taro"},
+        },
+        "task_evidence_root": str(tmp_path),
+    }})()
+    adapter = _line.LineAdapter(cfg)
+    base = {"timestamp": 123, "source": {"type": "group", "groupId": "Cgroup"}}
+
+    assert adapter._prepare_task_intake({
+        **base,
+        "webhookEventId": "evt-unmapped",
+        "source": {**base["source"], "userId": "Uunknown"},
+        "message": {"type": "text", "id": "m-unmapped", "text": "@Sinria 更新して"},
+    }) is None
+    assert adapter._prepare_task_intake({
+        **base,
+        "webhookEventId": "evt-plain",
+        "source": {**base["source"], "userId": "Utaro"},
+        "message": {"type": "text", "id": "m-plain", "text": "通常会話"},
+    }) is None
+    prompt = adapter._prepare_task_intake({
+        **base,
+        "webhookEventId": "evt-task",
+        "source": {**base["source"], "userId": "Utaro"},
+        "message": {"type": "text", "id": "m-task", "text": "@Sinria 更新して"},
+    })
+
+    assert prompt is not None
+    assert "verified explicit Sinria invocation" in prompt
+    assert adapter._task_contexts["Cgroup"]["text"] == "更新して"
+    assert all(
+        item["sender_user_id"] == "Utaro"
+        for item in adapter._task_conversation_history["Cgroup"]
+    )
 
 
 @pytest.mark.asyncio

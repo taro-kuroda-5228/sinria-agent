@@ -294,14 +294,21 @@ IDs are not added to model context.
 
 ---
 
-## Passive task intake for a two-person conversation
+## Explicit Sinria task intake for a group conversation
 
 LINE does not allow a bot to read an existing private 1:1 thread. Invite the
 Sinria Official Account as a third participant; LINE then creates a group. The
 two people keep their normal personal LINE accounts, and Sinria can process new
 messages posted after it joins.
 
-Task intake is opt-in per group. Sinria treats chat text as untrusted data and
+Task intake is opt-in per group. Set `task_invocation_prefixes` to require an
+explicit marker such as `@Sinria` at the start of the current message. A
+verified native LINE mention of the Official Account at index zero is also
+accepted. Display text alone is not identity: Discord-shaped strings such as
+`<@&...>`, partial matches, markers later in the message, and markers that
+appear only in quoted history do not invoke Sinria.
+
+Sinria treats chat text as untrusted data and
 uses an explicitly configured **local Ollama model on loopback** for a strict
 task/no-task decision. The normal agent/session path is bypassed, so raw LINE
 text cannot fall through to a cloud model. Non-task messages are silent. Only
@@ -314,6 +321,7 @@ gateway:
       enabled: true
       extra:
         task_intake_groups: ["C...target-group-id..."]
+        task_invocation_prefixes: ["@Sinria", "@シンリア"]
         task_workspace_id: "<company-os-workspace-id>"
         task_intake_local_model: "qwen3.5:9b"
         task_intake_local_url: "http://127.0.0.1:11434"
@@ -349,6 +357,9 @@ Safety and behavior:
   idempotency key, so webhook retries do not create duplicate tasks.
 * Exactly two mapped human participants are required for
   `other_participant`; ambiguous or missing identity mappings fail closed.
+* With invocation prefixes configured, only a mapped sender in an allowlisted
+  group can invoke intake. The marker is stripped before local classification;
+  ordinary messages remain bounded ephemeral context and are never taskified.
 * Created tasks disallow external actions and external egress. Later execution
   still follows the normal Sinria approval policy.
 * Typing, streaming, tool-progress, and slow-response bubbles are suppressed
