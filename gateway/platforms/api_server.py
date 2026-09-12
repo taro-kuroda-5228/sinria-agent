@@ -1265,6 +1265,11 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if enabled_toolsets == []:
+            setattr(agent, "tools", [])
+            setattr(agent, "valid_tool_names", set())
+            setattr(agent, "enabled_toolsets", [])
+            setattr(agent, "_sinria_no_tools_enforced", True)
         return agent
 
     def _stamp_workspace_channel(
@@ -1524,6 +1529,7 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        restricted_toolsets = [] if body.get("sinria_no_tools") is True else None
 
         if stream:
             _stream_q = _ThreadsafeAsyncQueue(asyncio.get_running_loop())
@@ -1607,6 +1613,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 workspace_boundary=workspace_boundary,
+                enabled_toolsets=restricted_toolsets,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1627,11 +1634,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 workspace_boundary=workspace_boundary,
+                enabled_toolsets=restricted_toolsets,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=["model", "messages", "tools", "tool_choice", "stream", "sinria_no_tools"],
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -3134,6 +3145,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         workspace_boundary: Optional[str] = None,
+        enabled_toolsets: Optional[List[str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3157,6 +3169,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                enabled_toolsets=enabled_toolsets,
             )
             self._stamp_workspace_channel(agent, gateway_session_key, workspace_boundary)
             if agent_ref is not None:
