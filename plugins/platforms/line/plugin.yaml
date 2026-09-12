@@ -95,3 +95,7 @@ optional_env:
     description: "Loopback Ollama URL (default: http://127.0.0.1:11434; non-loopback is rejected)"
     prompt: "Local task classifier URL"
     password: false
+  - name: LINE_PEER_ROUTES_JSON
+    description: "JSON route map for purpose-scoped private member-owned Sinria relays"
+    prompt: "LINE peer route map JSON"
+    password: false
