@@ -373,6 +373,11 @@ def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
     return None
 
 
+def _capture_autonomy_ingress_text(event: "MessageEvent") -> Optional[str]:
+    """Freeze plain external user text before any gateway rewrite."""
+    return event.autonomy_ingress_text if event.autonomy_ingress_captured else None
+
+
 def _auto_continue_freshness_window() -> float:
     """Return the configured auto-continue freshness window in seconds.
 
@@ -2333,6 +2338,7 @@ class GatewayRunner:
                             text=resolution.adopted_content,
                             source=proposal_source,
                             message_type=MessageType.TEXT,
+                            synthetic=True,
                         ),
                     )
                 return True, "提案を採用し、Sinriaの実行コンテキストへ反映しました。"
@@ -4092,6 +4098,34 @@ class GatewayRunner:
                     "Skipping auto-resume for %s: %s", entry.session_key, skip_reason
                 )
 
+        goal_prompts: Dict[str, str] = {}
+        try:
+            from hermes_cli.goals import GoalManager
+
+            existing_keys = {entry.session_key for entry in fresh_candidates}
+            for entry in entries_snapshot:
+                if (
+                    entry.session_key in existing_keys
+                    or getattr(entry, "suspended", False)
+                    or entry.origin is None
+                    or not entry.session_id
+                    or (platform is not None and entry.origin.platform != platform)
+                ):
+                    continue
+                manager = GoalManager(entry.session_id)
+                if (
+                    not manager.is_active()
+                    or not manager.is_autonomous()
+                    or manager.is_waiting()
+                ):
+                    continue
+                prompt = manager.next_continuation_prompt()
+                if prompt:
+                    goal_prompts[entry.session_key] = prompt
+                    fresh_candidates.append(entry)
+        except Exception as exc:
+            logger.warning("Failed to enumerate persisted active goals: %s", exc)
+
         resume_tasks = getattr(self, "_resume_pending_tasks", None)
         if not isinstance(resume_tasks, dict):
             resume_tasks = {}
@@ -4132,6 +4166,9 @@ class GatewayRunner:
             adapter: Any,
             event: MessageEvent,
             session_key: str,
+            *,
+            goal_resume: bool = False,
+            goal_session_id: Optional[str] = None,
         ) -> None:
             """Hold the global slot while THIS lane's resume obligation runs.
 
@@ -4156,18 +4193,49 @@ class GatewayRunner:
                         session_key,
                     )
                     return
-                skip_reason = _auto_resume_skip_reason(
-                    _read_lane_entry(session_key),
-                    window=_auto_continue_freshness_window(),
-                    resolve_session_key=self._session_key_for_source,
-                )
-                if skip_reason is not None:
-                    logger.info(
-                        "Skipping auto-resume dispatch for %s: %s",
-                        session_key,
-                        skip_reason,
+                if not goal_resume:
+                    skip_reason = _auto_resume_skip_reason(
+                        _read_lane_entry(session_key),
+                        window=_auto_continue_freshness_window(),
+                        resolve_session_key=self._session_key_for_source,
                     )
-                    return
+                    if skip_reason is not None:
+                        logger.info(
+                            "Skipping auto-resume dispatch for %s: %s",
+                            session_key,
+                            skip_reason,
+                        )
+                        return
+                else:
+                    try:
+                        from hermes_cli.goals import GoalManager
+
+                        manager = GoalManager(goal_session_id or session_key)
+                        if (
+                            not manager.is_active()
+                            or not manager.is_autonomous()
+                            or manager.is_waiting()
+                        ):
+                            logger.info(
+                                "Skipping autonomous resume for %s: goal is no longer active",
+                                session_key,
+                            )
+                            return
+                        current_prompt = manager.next_continuation_prompt()
+                    except Exception as exc:
+                        logger.warning(
+                            "Skipping autonomous resume for %s: goal revalidation failed: %s",
+                            session_key,
+                            exc,
+                        )
+                        return
+                    if not current_prompt:
+                        logger.info(
+                            "Skipping autonomous resume for %s: no continuation remains",
+                            session_key,
+                        )
+                        return
+                    event = dataclasses.replace(event, text=current_prompt)
 
                 await adapter.handle_message(event)
                 processing = getattr(adapter, "_session_tasks", {}).get(session_key)
@@ -4235,13 +4303,19 @@ class GatewayRunner:
                 # _handle_message_with_agent prepends the proper reason-aware
                 # system note before the turn runs.
                 event = MessageEvent(
-                    text="",
+                    text=goal_prompts.get(entry.session_key, ""),
                     message_type=MessageType.TEXT,
                     source=source,
                     internal=True,
                     internal_kind=_INTERNAL_KIND_AUTO_RESUME,
                 )
-                resume_coro = _dispatch_resume(adapter, event, entry.session_key)
+                resume_coro = _dispatch_resume(
+                    adapter,
+                    event,
+                    entry.session_key,
+                    goal_resume=entry.session_key in goal_prompts,
+                    goal_session_id=entry.session_id,
+                )
                 try:
                     task = asyncio.create_task(resume_coro)
                 except Exception:
@@ -4287,7 +4361,7 @@ class GatewayRunner:
 
         if scheduled:
             logger.info(
-                "Scheduled auto-resume for %d restart-interrupted session(s)",
+                "Scheduled auto-resume for %d interrupted or autonomous session(s)",
                 scheduled,
             )
         return scheduled
@@ -6848,6 +6922,7 @@ class GatewayRunner:
         # completion notifications) are system-generated and must skip user
         # authorization and the connector replay journal.
         is_internal = bool(getattr(event, "internal", False))
+        _capture_autonomy_ingress_text(event)
 
         # Discord/Slack are transports into first-party Workspace, never the
         # source of truth. A durable binding rewrites session ownership before
@@ -6929,7 +7004,8 @@ class GatewayRunner:
                 if _action == "rewrite":
                     _new_text = _result.get("text")
                     if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
+                        rewritten_event = dataclasses.replace(event, text=_new_text)
+                        event = rewritten_event
                         source = event.source
                     break
                 if _action == "allow":
@@ -7289,6 +7365,7 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        synthetic=True,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
@@ -7316,6 +7393,7 @@ class GatewayRunner:
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            synthetic=True,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -7338,6 +7416,7 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        synthetic=True,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -8433,7 +8512,7 @@ class GatewayRunner:
         # Keep the user-authored request separate from any synthetic skill
         # payload. Correction Loop, memory, and correction capture must never
         # interpret the skill's instructions as a new user correction.
-        _source_user_message = event.text
+        _source_user_message = _capture_autonomy_ingress_text(event)
 
         # Auto-load skill(s) for topic/channel bindings (Telegram DM Topics,
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
@@ -10807,6 +10886,7 @@ class GatewayRunner:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            synthetic=True,
         )
         
         # Let the normal message handler process it
@@ -10928,6 +11008,7 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    synthetic=True,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -11112,6 +11193,7 @@ class GatewayRunner:
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    synthetic=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -15962,6 +16044,26 @@ class GatewayRunner:
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Admit only the immutable platform-authored message. The model prompt
+        # may include skill, reply, attachment, or recovery context that cannot
+        # authorize an autonomous loop.
+        try:
+            from hermes_cli.goals import GoalManager, activate_autonomous_goal
+
+            if session_id and source_user_message:
+                activate_autonomous_goal(
+                    GoalManager(
+                        session_id=session_id,
+                        default_max_turns=self._goal_max_turns_from_config(),
+                    ),
+                    source_user_message,
+                )
+        except Exception as auto_goal_exc:
+            logger.debug(
+                "natural-language autonomous goal admission failed: %s",
+                auto_goal_exc,
+            )
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -17951,7 +18053,9 @@ class GatewayRunner:
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                next_source_user_message = None
                 if pending_event is not None:
+                    next_source_user_message = _capture_autonomy_ingress_text(pending_event)
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
@@ -17988,6 +18092,7 @@ class GatewayRunner:
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,
+                    source_user_message=next_source_user_message,
                     session_key=session_key,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,

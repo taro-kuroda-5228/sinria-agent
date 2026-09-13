@@ -1013,6 +1013,101 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_schedules_persisted_active_goal():
+    """A clean restart must not strand an admitted autonomous goal."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="goal-chat")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:goal-chat",
+        session_id="goal-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    manager = MagicMock()
+    manager.is_active.return_value = True
+    manager.is_autonomous.return_value = True
+    manager.is_waiting.return_value = False
+    manager.next_continuation_prompt.return_value = (
+        "[Continuing toward your standing goal]\nFinish the persisted goal."
+    )
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert event.source == source
+    assert event.text.startswith("[Continuing toward your standing goal]")
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_revalidates_goal_before_dispatch():
+    """A goal paused after scheduling must not receive a stale continuation."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="goal-paused-after-schedule")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:goal-paused-after-schedule",
+        session_id="goal-paused-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    manager = MagicMock()
+    manager.is_active.side_effect = [True, False]
+    manager.is_autonomous.return_value = True
+    manager.is_waiting.return_value = False
+    manager.next_continuation_prompt.return_value = (
+        "[Continuing toward your standing goal]\nFinish the persisted goal."
+    )
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        assert runner._schedule_resume_pending_sessions() == 1
+        await asyncio.sleep(0)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_keeps_waiting_goal_parked():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="waiting-goal")
+    entry = SessionEntry(
+        session_key="agent:main:telegram:dm:waiting-goal",
+        session_id="waiting-goal-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store._entries = {entry.session_key: entry}
+    adapter.handle_message = AsyncMock()
+
+    manager = MagicMock()
+    manager.is_active.return_value = True
+    manager.is_autonomous.return_value = True
+    manager.is_waiting.return_value = True
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_accepts_timezone_aware_marker():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="resume-aware")

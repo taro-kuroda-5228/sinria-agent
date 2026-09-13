@@ -914,6 +914,7 @@ class InboundContext:
 
     # Populated by ContentExtractMiddleware
     raw_text: str = ""
+    autonomy_ingress_text: str = ""
     media_refs: list = dc_field(default_factory=list)
 
     # Owner command detection
@@ -1852,6 +1853,7 @@ class ExtractContentMiddleware(InboundMiddleware):
 
     async def handle(self, ctx: InboundContext, next_fn) -> None:
         ctx.raw_text = self._rewrite_slash_command(self._extract_text(ctx.msg_body))
+        ctx.autonomy_ingress_text = ctx.raw_text
         ctx.media_refs = self._extract_inbound_media_refs(ctx.msg_body)
         ctx.link_urls = self._extract_link_urls(ctx.msg_body)
         await next_fn()
@@ -2631,6 +2633,8 @@ class DispatchMiddleware(InboundMiddleware):
                 reply_to_message_id=ctx.reply_to_message_id,
                 reply_to_text=ctx.reply_to_text,
                 channel_prompt=ctx.channel_prompt,
+                autonomy_ingress_text=ctx.autonomy_ingress_text,
+                autonomy_ingress_captured=True,
             )
             if _sk and ctx.msg_id:
                 adapter._processing_msg_ids[_sk] = ctx.msg_id

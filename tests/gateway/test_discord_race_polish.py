@@ -6,6 +6,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gateway.platforms.base import MessageEvent
+from gateway.platforms.discord import _merge_autonomy_ingress
+
 from gateway.config import Platform, PlatformConfig
 
 
@@ -77,3 +80,19 @@ async def test_concurrent_joins_do_not_double_connect():
     )
     assert r1 is True and r2 is True
     assert 42 in adapter._voice_clients
+
+
+def test_split_text_batch_merges_direct_ingress_authority():
+    first = MessageEvent(text="Continue autonomously until all remaining")
+    second = MessageEvent(text="tasks are complete.")
+
+    assert _merge_autonomy_ingress(first, second) == (
+        "Continue autonomously until all remaining\ntasks are complete."
+    )
+
+
+def test_split_text_batch_rejects_mixed_synthetic_authority():
+    direct = MessageEvent(text="Continue autonomously until all remaining")
+    synthetic = MessageEvent(text="tasks are complete.", synthetic=True)
+
+    assert _merge_autonomy_ingress(direct, synthetic) is None

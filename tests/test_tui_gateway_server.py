@@ -2013,6 +2013,80 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_uses_immutable_direct_autonomy_ingress(monkeypatch):
+    import hermes_cli.goals as goals
+
+    captured = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    def _capture_activation(manager, text):
+        captured.append(text)
+        return None
+
+    server._sessions["sid-autonomy-ingress"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(goals, "activate_autonomous_goal", _capture_activation)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "direct",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid-autonomy-ingress",
+                    "text": "expanded file content",
+                    "autonomy_ingress_text": (
+                        "Continue autonomously until all remaining tasks are complete."
+                    ),
+                },
+            }
+        )
+        assert response["result"]["status"] == "streaming"
+        assert captured == [
+            "Continue autonomously until all remaining tasks are complete."
+        ]
+
+        response = server.handle_request(
+            {
+                "id": "synthetic",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid-autonomy-ingress",
+                    "text": "Continue autonomously until all remaining tasks are complete.",
+                    "display_kind": "command_dispatch",
+                    "autonomy_ingress_text": (
+                        "Continue autonomously until all remaining tasks are complete."
+                    ),
+                },
+            }
+        )
+        assert response["result"]["status"] == "streaming"
+        assert captured == [
+            "Continue autonomously until all remaining tasks are complete."
+        ]
+    finally:
+        server._sessions.pop("sid-autonomy-ingress", None)
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 
@@ -4814,3 +4888,92 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_persisted_active_goal_prompt_restores_desktop_continuation():
+    manager = types.SimpleNamespace(
+        is_active=lambda: True,
+        is_autonomous=lambda: True,
+        is_waiting=lambda: False,
+        next_continuation_prompt=lambda: (
+            "[Continuing toward your standing goal]\nFinish the persisted goal."
+        ),
+    )
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        prompt = server._persisted_active_goal_prompt({"session_key": "goal-session"})
+
+    assert prompt is not None
+    assert prompt.startswith("[Continuing toward your standing goal]")
+
+
+def test_persisted_waiting_goal_stays_parked_on_desktop_resume():
+    manager = types.SimpleNamespace(
+        is_active=lambda: True,
+        is_autonomous=lambda: True,
+        is_waiting=lambda: True,
+        next_continuation_prompt=lambda: "must not run",
+    )
+    with patch("hermes_cli.goals.GoalManager", return_value=manager):
+        prompt = server._persisted_active_goal_prompt({"session_key": "goal-session"})
+
+    assert prompt is None
+
+
+def test_goal_resume_pending_dispatches_only_after_client_ack(monkeypatch):
+    sid = "sid_goal_ack"
+    session = {
+        "session_key": "session_goal_ack",
+        "history_lock": threading.Lock(),
+        "running": False,
+        "autonomous_resume_pending": True,
+    }
+    calls = []
+    server._sessions[sid] = session
+    monkeypatch.setattr(
+        server,
+        "_persisted_active_goal_prompt",
+        lambda current: "[Continuing toward your standing goal] finish",
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    try:
+        assert calls == []
+        response = server.dispatch(
+            {
+                "id": "goal-ack",
+                "method": "goal.resume_pending",
+                "params": {"session_id": sid},
+            }
+        )
+
+        assert response is not None
+        assert response["result"] == {"scheduled": True}
+        assert session["running"] is True
+        assert len(calls) == 1
+        assert calls[0][0][1:4] == (
+            sid,
+            session,
+            "[Continuing toward your standing goal] finish",
+        )
+        assert calls[0][1] == {"display_kind": "goal_continuation"}
+
+        session["running"] = False
+        duplicate = server.dispatch(
+            {
+                "id": "goal-duplicate-ack",
+                "method": "goal.resume_pending",
+                "params": {"session_id": sid},
+            }
+        )
+        assert duplicate is not None
+        assert duplicate["result"] == {
+            "scheduled": False,
+            "reason": "not_pending",
+        }
+        assert len(calls) == 1
+    finally:
+        server._sessions.pop(sid, None)

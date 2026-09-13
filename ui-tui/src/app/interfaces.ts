@@ -136,7 +136,10 @@ export type MaybePromise<T> = Promise<T> | T
 export interface ComposerActions {
   clearIn: () => void
   dequeue: () => string | undefined
-  enqueue: (text: string) => void
+  dequeueWithMetadata: () =>
+    | { autonomyIngressText?: string; displayKind?: string; text: string }
+    | undefined
+  enqueue: (text: string, displayKind?: string, autonomyIngressText?: string) => void
   handleTextPaste: (event: PasteEvent) => MaybePromise<ComposerPasteResult | null>
   openEditor: () => Promise<void>
   pushHistory: (text: string) => void
@@ -155,6 +158,8 @@ export interface ComposerRefs {
   historyDraftRef: MutableRefObject<string>
   historyRef: MutableRefObject<string[]>
   queueEditRef: MutableRefObject<null | number>
+  queueAutonomyIngressRef: MutableRefObject<Array<string | undefined>>
+  queueDisplayKindRef: MutableRefObject<Array<string | undefined>>
   queueRef: MutableRefObject<string[]>
   submitRef: MutableRefObject<(value: string) => void>
 }
@@ -287,7 +292,12 @@ export interface SlashHandlerContext {
   transcript: {
     page: (text: string, title?: string) => void
     panel: (title: string, sections: PanelSection[]) => void
-    send: (text: string) => void
+    send: (
+      text: string,
+      showUserMessage?: boolean,
+      displayKind?: string,
+      autonomyIngressText?: string
+    ) => void
     setHistoryItems: StateSetter<Msg[]>
     sys: (text: string) => void
     trimLastExchange: (items: Msg[]) => Msg[]

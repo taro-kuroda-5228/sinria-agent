@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
 import { evictInkCaches } from '@hermes/ink'
-import { useCallback, type RefObject } from 'react'
+import { type RefObject, useCallback } from 'react'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
@@ -236,7 +236,15 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 status: 'ready',
                 usage: usageFrom(r.info ?? null)
               })
-              setTimeout(() => scrollRef.current?.scrollToBottom(), 0)
+              setTimeout(() => {
+                scrollRef.current?.scrollToBottom()
+
+                if (r.autonomous_resume_pending) {
+                  void gw
+                    .request('goal.resume_pending', { session_id: r.session_id })
+                    .catch((e: Error) => sys(`goal resume failed: ${e.message}`))
+                }
+              }, 0)
             })
             .catch((e: Error) => {
               sys(`error: ${e.message}`)

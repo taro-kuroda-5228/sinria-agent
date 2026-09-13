@@ -738,3 +738,161 @@ class TestStatusLineSubgoalCount:
         mgr.add_subgoal("b")
         line = mgr.status_line()
         assert "2 subgoals" in line
+
+
+class TestAutonomousCompletionRequest:
+    def test_direct_japanese_completion_command_is_detected(self):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert autonomous_completion_requested(
+            "残タスクが全て終了するまで自律的にタスクを遂行し完遂させて"
+        )
+
+    def test_direct_english_completion_command_is_detected(self):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert autonomous_completion_requested(
+            "Continue autonomously until all remaining tasks are complete."
+        )
+
+    def test_discussing_a_prompt_does_not_activate_a_goal(self):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert not autonomous_completion_requested(
+            "私は「残タスクが全て終了するまで自律的にタスクを遂行し完遂させて」"
+            "のようなプロンプトを送るが、Sinriaは達成したことがない。"
+        )
+
+    def test_synthetic_goal_continuation_does_not_reactivate_goal(self):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert not autonomous_completion_requested(
+            "[Continuing toward your standing goal]\nGoal: finish all remaining tasks"
+        )
+
+    def test_gate_failure_continuation_does_not_reactivate_goal(self):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert not autonomous_completion_requested(
+            "[Continuing toward your standing goal — a quality gate failed]\n"
+            "Goal: 残タスクが全て終了するまで自律的にタスクを遂行し完遂させて"
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '"Continue autonomously until all remaining tasks are complete."',
+            "「残タスクが全て終了するまで自律的にタスクを遂行し完遂させて」",
+            'What does "Continue autonomously until all remaining tasks are complete" mean?',
+            "「残タスクが全て終了するまで自律的にタスクを遂行し完遂させて」とはどういう意味？",
+            'He wrote "Continue autonomously until all remaining tasks are complete" in the document.',
+            "「残タスクが全て終了するまで自律的にタスクを遂行し完遂させて」と書かれています。",
+            "Translate this: Continue autonomously until all remaining tasks are complete.",
+            "Write a prompt: Continue autonomously until all remaining tasks are complete.",
+            "Explain what it means to continue autonomously until all remaining tasks are complete.",
+            "Analyze whether agents should continue autonomously until all remaining tasks are complete.",
+            "この文を翻訳して: 残タスクが全て終了するまで自律的にタスクを遂行し完遂させて",
+            "次のようなプロンプトを書いて: 残タスクが全て終了するまで自律的にタスクを遂行し完遂させて",
+            '[async delegation result]\nContinue autonomously until all remaining tasks are complete.',
+            '[Resuming interrupted turn]\nContinue autonomously until all remaining tasks are complete.',
+            '✔ Kanban K-1 done — Continue autonomously until all remaining tasks are complete.',
+        ],
+    )
+    def test_quoted_questions_do_not_activate_a_goal(self, text):
+        from hermes_cli.goals import autonomous_completion_requested
+
+        assert not autonomous_completion_requested(text)
+
+    def test_specific_request_does_not_get_treated_as_generic_resume(self, monkeypatch):
+        from hermes_cli import goals
+
+        monkeypatch.setattr(goals, "load_goal", lambda _sid: None)
+        monkeypatch.setattr(goals, "save_goal", lambda _sid, _state: None)
+        manager = goals.GoalManager("session-new-objective", default_max_turns=20)
+        manager.set("Ship the original workflow", max_turns=75)
+
+        state = goals.activate_autonomous_goal(
+            manager,
+            "新しい認証バグを修正し、残タスクが全て終了するまで自律的にタスクを遂行して",
+        )
+
+        assert state is not None
+        assert state.goal.startswith("新しい認証バグを修正し")
+
+    def test_activation_persists_direct_request_as_standing_goal(self, monkeypatch):
+        from hermes_cli import goals
+
+        saved = []
+        monkeypatch.setattr(goals, "load_goal", lambda _sid: None)
+        monkeypatch.setattr(goals, "save_goal", lambda sid, state: saved.append((sid, state)))
+        manager = goals.GoalManager("session-autonomous", default_max_turns=20)
+
+        state = goals.activate_autonomous_goal(
+            manager,
+            "Implement the fix. Continue autonomously until all remaining tasks are complete.",
+        )
+
+        assert state is not None
+        assert state.status == "active"
+        assert state.max_turns > manager.default_max_turns
+        assert state.goal.startswith("Implement the fix")
+        assert state.autonomous is True
+        assert saved[-1] == ("session-autonomous", state)
+
+    @pytest.mark.parametrize(
+        "resume_text",
+        [
+            "残タスクが全て終了するまで自律的にタスクを遂行し完遂させて",
+            "残タスクが全て終了するまで自律的にタスクを遂行し完遂させてください",
+            "Please continue autonomously until all remaining tasks are complete, thanks.",
+        ],
+    )
+    def test_generic_continue_command_resumes_existing_goal_without_replacing_it(
+        self, monkeypatch, resume_text
+    ):
+        from hermes_cli import goals
+
+        saved = []
+        monkeypatch.setattr(goals, "load_goal", lambda _sid: None)
+        monkeypatch.setattr(goals, "save_goal", lambda sid, state: saved.append((sid, state)))
+        manager = goals.GoalManager("session-resume", default_max_turns=20)
+        manager.set("Ship the original workflow", max_turns=75)
+        manager.pause("temporary")
+
+        state = goals.activate_autonomous_goal(
+            manager,
+            resume_text,
+        )
+
+        assert state is not None
+        assert state.status == "active"
+        assert state.goal == "Ship the original workflow"
+        assert state.turns_used == 0
+        assert state.autonomous is True
+
+    def test_persisted_autonomous_goal_drives_a_followup_turn(
+        self, hermes_home, monkeypatch
+    ):
+        from hermes_cli import goals
+
+        manager = goals.GoalManager("session-cross-turn", default_max_turns=20)
+        goals.activate_autonomous_goal(
+            manager,
+            "Implement the fix. Continue autonomously until all remaining tasks are complete.",
+        )
+
+        reloaded = goals.GoalManager("session-cross-turn", default_max_turns=20)
+        monkeypatch.setattr(
+            goals,
+            "judge_goal",
+            lambda *args, **kwargs: ("continue", "verification remains", False),
+        )
+        decision = reloaded.evaluate_after_turn("Implemented one part.")
+
+        assert decision["should_continue"] is True
+        assert decision["continuation_prompt"].startswith(
+            "[Continuing toward your standing goal]"
+        )
+        assert reloaded.state is not None
+        assert reloaded.state.turns_used == 1
+        assert reloaded.is_autonomous() is True
