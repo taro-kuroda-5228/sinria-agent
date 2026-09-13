@@ -12,8 +12,28 @@ export function removeAtInPlace<T>(arr: T[], i: number): T[] {
   return arr
 }
 
+export interface QueuedSubmission {
+  autonomyIngressText?: string
+  displayKind?: string
+  text: string
+}
+
+export function shiftQueuedSubmission(
+  queue: string[],
+  displayKinds: Array<string | undefined>,
+  autonomyIngresses: Array<string | undefined>
+): QueuedSubmission | undefined {
+  const text = queue.shift()
+  const displayKind = displayKinds.shift()
+  const autonomyIngressText = autonomyIngresses.shift()
+
+  return text === undefined ? undefined : { autonomyIngressText, displayKind, text }
+}
+
 export function useQueue() {
   const queueRef = useRef<string[]>([])
+  const queueDisplayKindRef = useRef<Array<string | undefined>>([])
+  const queueAutonomyIngressRef = useRef<Array<string | undefined>>([])
   const [queuedDisplay, setQueuedDisplay] = useState<string[]>([])
   const queueEditRef = useRef<number | null>(null)
   const [queueEditIdx, setQueueEditIdx] = useState<number | null>(null)
@@ -26,15 +46,34 @@ export function useQueue() {
   }, [])
 
   const enqueue = useCallback(
-    (text: string) => {
+    (text: string, displayKind?: string, autonomyIngressText?: string) => {
       queueRef.current.push(text)
+      queueDisplayKindRef.current.push(displayKind)
+      queueAutonomyIngressRef.current.push(autonomyIngressText)
       syncQueue()
     },
     [syncQueue]
   )
 
   const dequeue = useCallback(() => {
-    const head = queueRef.current.shift()
+    const head = shiftQueuedSubmission(
+      queueRef.current,
+      queueDisplayKindRef.current,
+      queueAutonomyIngressRef.current
+    )
+
+    syncQueue()
+
+    return head?.text
+  }, [syncQueue])
+
+  const dequeueWithMetadata = useCallback(() => {
+    const head = shiftQueuedSubmission(
+      queueRef.current,
+      queueDisplayKindRef.current,
+      queueAutonomyIngressRef.current
+    )
+
     syncQueue()
 
     return head
@@ -43,6 +82,8 @@ export function useQueue() {
   const replaceQ = useCallback(
     (i: number, text: string) => {
       queueRef.current[i] = text
+      queueDisplayKindRef.current[i] = undefined
+      queueAutonomyIngressRef.current[i] = undefined
       syncQueue()
     },
     [syncQueue]
@@ -53,6 +94,8 @@ export function useQueue() {
       const before = queueRef.current.length
 
       removeAtInPlace(queueRef.current, i)
+      removeAtInPlace(queueDisplayKindRef.current, i)
+      removeAtInPlace(queueAutonomyIngressRef.current, i)
 
       if (queueRef.current.length !== before) {
         syncQueue()
@@ -63,9 +106,12 @@ export function useQueue() {
 
   return {
     dequeue,
+    dequeueWithMetadata,
     enqueue,
     queueEditIdx,
     queueEditRef,
+    queueAutonomyIngressRef,
+    queueDisplayKindRef,
     queueRef,
     queuedDisplay,
     removeQ,

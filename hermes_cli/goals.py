@@ -67,6 +67,89 @@ _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # `judge reply was not JSON`.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 
+# A direct request to keep working until every remaining task is complete is
+# persisted across turns and restarts. Keep the contract bounded so existing
+# judge and runaway protections still apply.
+DEFAULT_AUTONOMOUS_MAX_TURNS = 100
+
+_AUTONOMOUS_JA_COMPLETION_RE = re.compile(
+    r"(?:残(?:り)?タスク|残作業|未完了(?:タスク|作業)|タスク|作業|全部|全て|すべて)"
+    r".{0,48}(?:全部|全て|すべて).{0,24}(?:終了|完了|終わ(?:る|った)|片付(?:く|ける))"
+    r".{0,12}まで",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_JA_ACTION_RE = re.compile(
+    r"(?:自律的|自動で|中断せず|止まらず|止めず|やめず|返事を待たず|返信を待たず)"
+    r".{0,32}(?:遂行|完遂|実行|進め|続け|対応)",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_EN_COMPLETION_RE = re.compile(
+    r"(?:continue|work|proceed|keep going).{0,40}(?:autonomously|without (?:waiting|stopping))"
+    r".{0,60}until (?:all|every).{0,30}(?:remaining )?(?:tasks?|work).{0,20}"
+    r"(?:complete|completed|done|finished)",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_META_RE = re.compile(
+    r"(?:のような|という|といった).{0,24}(?:プロンプト|命令)"
+    r"|(?:プロンプト|命令).{0,24}(?:送る|言う|例|達成したこと)"
+    r"|「[^」]+」(?:とは|という意味|をどう)"
+    r"|(?:when I say|a prompt (?:like|such as)|example prompt|discussing)"
+    r"|what does [\"'“‘].+[\"'”’] mean"
+    r"|^(?:please\s+)?explain\s+what\s+it\s+means?\s+to\b"
+    r"|^(?:please\s+)?analy[sz]e\s+whether\s+(?:an?\s+)?(?:agents?|sinria|you)\s+should\b"
+    r"|^(?:translate|rewrite|summari[sz]e|explain|analy[sz]e)\b.{0,40}[:：]"
+    r"|^(?:write|draft|create)\s+(?:a\s+)?(?:prompt|sentence|message|text)\b.{0,40}[:：]"
+    r"|^(?:この|次の|以下の).{0,20}(?:文|文章|テキスト|プロンプト)"
+    r".{0,16}(?:翻訳|要約|説明|分析|言い換え|書いて|作成)",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_GENERIC_JA_RESUME_RE = re.compile(
+    r"^(?:残(?:り)?タスク|残作業|未完了(?:タスク|作業)?)(?:が|を)?"
+    r"(?:全部|全て|すべて)(?:終了|完了|終わる)(?:する)?まで"
+    r"(?:自律的に|自動で|中断せず|止まらず|止めず|やめず|返事を待たず|返信を待たず)"
+    r"(?:タスク|作業)?を?(?:(?:遂行|実行|対応)し)?"
+    r"(?:完遂させて|遂行して|実行して|進めて|続けて|対応して)"
+    r"(?:くださいませ|ください|下さい|ね)?$",
+    re.IGNORECASE,
+)
+
+
+def autonomous_completion_requested(text: Any) -> bool:
+    """Detect a direct request for durable, cross-turn completion."""
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    if (
+        not clean
+        or clean.startswith("[")
+        or re.match(r"^(?:✔\s*Kanban\b|↻\s*/loop\b)", clean, re.IGNORECASE)
+    ):
+        return False
+    if re.search(r"[\"'「『“‘].+[\"'」』”’]", clean, re.DOTALL):
+        return False
+    if _AUTONOMOUS_META_RE.search(clean):
+        return False
+    return bool(
+        (_AUTONOMOUS_JA_COMPLETION_RE.search(clean) and _AUTONOMOUS_JA_ACTION_RE.search(clean))
+        or _AUTONOMOUS_EN_COMPLETION_RE.search(clean)
+    )
+
+
+def _is_generic_autonomous_resume(text: str) -> bool:
+    compact = re.sub(r"[\s。.!！?？,，]+", "", text)
+    if len(compact) > 90:
+        return False
+    return bool(
+        _AUTONOMOUS_GENERIC_JA_RESUME_RE.fullmatch(compact)
+        or re.fullmatch(
+            r"(?:please)?(?:continue|work|proceed|keepgoing)autonomouslyuntilall"
+            r"(?:remaining)?(?:tasks?|work)(?:are)?(?:complete|completed|done|finished)"
+            r"(?:please|thanks|thankyou)?",
+            compact,
+            re.IGNORECASE,
+        )
+    )
+
 
 CONTINUATION_PROMPT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
@@ -149,6 +232,7 @@ class GoalState:
     max_turns: int = DEFAULT_MAX_TURNS
     created_at: float = 0.0
     last_turn_at: float = 0.0
+    autonomous: bool = False
     last_verdict: Optional[str] = None        # "done" | "continue" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
@@ -177,6 +261,7 @@ class GoalState:
             max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
+            autonomous=bool(data.get("autonomous", False)),
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
@@ -464,6 +549,37 @@ def judge_goal(
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Natural-language admission into the durable goal loop
+# ──────────────────────────────────────────────────────────────────────
+
+
+def activate_autonomous_goal(
+    manager: "GoalManager",
+    user_message: Any,
+    *,
+    max_turns: int = DEFAULT_AUTONOMOUS_MAX_TURNS,
+) -> Optional[GoalState]:
+    """Persist a direct completion command or resume its existing goal."""
+    if not autonomous_completion_requested(user_message):
+        return None
+
+    text = str(user_message).strip()
+    state = manager.state
+    if state is not None and _is_generic_autonomous_resume(text):
+        if state.status == "active":
+            return manager.enable_autonomous()
+        if state.status == "paused":
+            manager.resume(reset_budget=True)
+            return manager.enable_autonomous()
+
+    durable_turns = max(
+        int(max_turns or DEFAULT_AUTONOMOUS_MAX_TURNS),
+        manager.default_max_turns + 1,
+    )
+    manager.set(text, max_turns=durable_turns)
+    return manager.enable_autonomous()
+
+
 # GoalManager — the orchestration surface CLI + gateway talk to
 # ──────────────────────────────────────────────────────────────────────
 
@@ -498,6 +614,25 @@ class GoalManager:
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
+
+    def is_autonomous(self) -> bool:
+        return bool(self._state is not None and self._state.autonomous)
+
+    def is_waiting(self) -> bool:
+        """Return whether a goal is parked rather than eligible to run."""
+        return bool(
+            self._state is not None
+            and self._state.status == "paused"
+            and str(self._state.paused_reason or "").startswith("waiting")
+        )
+
+    def enable_autonomous(self) -> GoalState:
+        if self._state is None:
+            raise RuntimeError("no goal to make autonomous")
+        if not self._state.autonomous:
+            self._state.autonomous = True
+            save_goal(self.session_id, self._state)
+        return self._state
 
     def has_goal(self) -> bool:
         return self._state is not None and self._state.status in {"active", "paused"}
@@ -755,6 +890,9 @@ __all__ = [
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_AUTONOMOUS_MAX_TURNS",
+    "autonomous_completion_requested",
+    "activate_autonomous_goal",
     "load_goal",
     "save_goal",
     "clear_goal",

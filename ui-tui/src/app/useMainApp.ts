@@ -1,4 +1,4 @@
-import { useApp, useHasSelection, useSelection, useStdout, useTerminalTitle, type ScrollBoxHandle } from '@hermes/ink'
+import { type ScrollBoxHandle, useApp, useHasSelection, useSelection, useStdout, useTerminalTitle } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
@@ -523,7 +523,7 @@ export function useMainApp(gw: GatewayClient) {
       return
     }
 
-    const next = composerActions.dequeue()
+    const next = composerActions.dequeueWithMetadata()
 
     if (next) {
       patchUiState({ busy: true, status: 'running…' })

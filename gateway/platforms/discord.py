@@ -97,6 +97,25 @@ from gateway.platforms.base import (
 from tools.url_safety import is_safe_url
 
 
+def _merge_autonomy_ingress(
+    first: MessageEvent,
+    second: MessageEvent,
+) -> Optional[str]:
+    """Combine split direct ingress without inheriting synthetic chunks."""
+    if (
+        not first.autonomy_ingress_captured
+        or not second.autonomy_ingress_captured
+        or first.autonomy_ingress_text is None
+        or second.autonomy_ingress_text is None
+    ):
+        return None
+    return (
+        f"{first.autonomy_ingress_text}\n{second.autonomy_ingress_text}"
+        if first.autonomy_ingress_text
+        else second.autonomy_ingress_text
+    )
+
+
 def _clean_discord_id(entry: str) -> str:
     """Strip common prefixes from a Discord user ID or username entry.
 
@@ -5135,6 +5154,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # a plain Discord reply has the same contract as clicking a button.
         cron_notification = getattr(self, "_cron_action_notifications", {}).get(reply_to_id)
         cron_action = _CRON_ACTION_REPLY_ALIASES.get(str(event_text).strip().lower())
+        cron_action_derived = bool(cron_notification and cron_action)
         if cron_notification and cron_action:
             event_text = _build_cron_action_user_message(cron_action, cron_notification)
             reply_to_text = cron_notification
@@ -5153,6 +5173,9 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            synthetic=cron_action_derived,
+            autonomy_ingress_text=normalized_content,
+            autonomy_ingress_captured=True,
         )
 
         # Track thread participation so the bot won't require @mention for
@@ -5194,8 +5217,11 @@ class DiscordAdapter(BasePlatformAdapter):
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
+            merged_autonomy_ingress = _merge_autonomy_ingress(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            existing.autonomy_ingress_text = merged_autonomy_ingress
+            existing.autonomy_ingress_captured = True
             existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -5438,6 +5464,9 @@ if DISCORD_AVAILABLE:
             user_message = _build_cron_action_user_message(action, notification)
             event = self.adapter._build_slash_event(interaction, user_message)
             event.text = user_message
+            event.synthetic = True
+            event.autonomy_ingress_text = None
+            event.autonomy_ingress_captured = True
             event.reply_to_text = notification
             event.reply_to_message_id = message_id or None
             try:

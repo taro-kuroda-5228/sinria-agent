@@ -85,10 +85,20 @@ export function useSubmission(opts: UseSubmissionOptions) {
   }, [composerState.input, composerState.inputBuf])
 
   const send = useCallback(
-    (text: string, showUserMessage = true) => {
+    (
+      text: string,
+      showUserMessage = true,
+      displayKind?: string,
+      autonomyIngressText?: string
+    ) => {
       const expand = expandSnips(composerState.pasteSnips)
 
-      const startSubmit = (displayText: string, submitText: string, showUserMessage = true) => {
+      const startSubmit = (
+        displayText: string,
+        submitText: string,
+        showUserMessage = true,
+        promptAutonomyIngressText: string | null = autonomyIngressText ?? null
+      ) => {
         const sid = getUiState().sid
 
         if (!sid) {
@@ -107,9 +117,18 @@ export function useSubmission(opts: UseSubmissionOptions) {
         turnController.bufRef = ''
         turnController.interrupted = false
 
-        gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText }).catch((e: Error) => {
+        gw.request<PromptSubmitResponse>('prompt.submit', {
+          autonomy_ingress_text: promptAutonomyIngressText ?? undefined,
+          display_kind: displayKind,
+          session_id: sid,
+          text: submitText
+        }).catch((e: Error) => {
           if (isSessionBusyError(e)) {
-            composerActions.enqueue(submitText)
+            composerActions.enqueue(
+              submitText,
+              displayKind,
+              promptAutonomyIngressText ?? undefined
+            )
             patchUiState({ busy: true, status: 'queued for next turn' })
 
             return sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
@@ -141,7 +160,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
             turnController.pushActivity(`detected file: ${r.name}`)
           }
 
-          startSubmit(r.text || text, expand(r.text || text), showUserMessage)
+          startSubmit(r.text || text, expand(r.text || text), showUserMessage, null)
         })
         .catch(() => startSubmit(text, expand(text), showUserMessage))
     },
@@ -199,7 +218,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
   )
 
   const sendQueued = useCallback(
-    (text: string) => {
+    ({
+      autonomyIngressText,
+      displayKind,
+      text
+    }: {
+      autonomyIngressText?: string
+      displayKind?: string
+      text: string
+    }) => {
       if (text.startsWith('!')) {
         return shellExec(text.slice(1).trim())
       }
@@ -207,10 +234,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
       if (hasInterpolation(text)) {
         patchUiState({ busy: true })
 
-        return interpolate(text, send)
+        return interpolate(text, expanded => send(expanded, true, displayKind))
       }
 
-      send(text)
+      send(text, true, displayKind, autonomyIngressText)
     },
     [interpolate, send, shellExec]
   )
@@ -234,16 +261,18 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const fallback = (note: string) => {
         if (opts.fallbackToFront) {
           composerRefs.queueRef.current.unshift(full)
+          composerRefs.queueDisplayKindRef.current.unshift(undefined)
+          composerRefs.queueAutonomyIngressRef.current.unshift(full)
           composerActions.syncQueue()
         } else {
-          composerActions.enqueue(full)
+          composerActions.enqueue(full, undefined, full)
         }
 
         sys(note)
       }
 
       if (mode === 'queue') {
-        return composerActions.enqueue(full)
+        return composerActions.enqueue(full, undefined, full)
       }
 
       if (mode === 'steer' && live.sid) {
@@ -276,7 +305,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return interpolate(full, send)
       }
 
-      send(full)
+      send(full, true, undefined, full)
     },
     [appendMessage, composerActions, composerRefs, gw, interpolate, send, sys]
   )
@@ -306,7 +335,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       if (!live.sid) {
         composerActions.pushHistory(full)
-        composerActions.enqueue(full)
+        composerActions.enqueue(full, undefined, full)
         composerActions.clearIn()
 
         return
@@ -318,6 +347,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
       if (editIdx !== null) {
         composerActions.replaceQueue(editIdx, full)
         const picked = composerRefs.queueRef.current.splice(editIdx, 1)[0]
+        composerRefs.queueDisplayKindRef.current.splice(editIdx, 1)
+        composerRefs.queueAutonomyIngressRef.current.splice(editIdx, 1)
         composerActions.syncQueue()
         composerActions.setQueueEdit(null)
 
@@ -331,6 +362,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
           // mode-specific behavior (interrupt-and-send, steer, or queue).
           if (getUiState().busyInputMode === 'queue') {
             composerRefs.queueRef.current.unshift(picked)
+            composerRefs.queueDisplayKindRef.current.unshift(undefined)
+            composerRefs.queueAutonomyIngressRef.current.unshift(picked)
 
             return composerActions.syncQueue()
           }
@@ -338,7 +371,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
           return handleBusyInput(picked, { fallbackToFront: true })
         }
 
-        return sendQueued(picked)
+        return sendQueued({ autonomyIngressText: picked, text: picked })
       }
 
       composerActions.pushHistory(full)
@@ -353,7 +386,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return interpolate(full, send)
       }
 
-      send(full)
+      send(full, true, undefined, full)
     },
     [appendMessage, composerActions, composerRefs, handleBusyInput, interpolate, send, sendQueued, shellExec, slashRef]
   )

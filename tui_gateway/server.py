@@ -2240,6 +2240,32 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"session_id": None})
 
 
+def _persisted_active_goal_prompt(session: dict) -> str | None:
+    """Return the persisted autonomous continuation for a desktop session."""
+    session_id = str(
+        session.get("session_key")
+        or session.get("db_id")
+        or session.get("session_id")
+        or ""
+    ).strip()
+    if not session_id:
+        return None
+    try:
+        from hermes_cli.goals import GoalManager
+
+        manager = GoalManager(session_id)
+        if (
+            not manager.is_active()
+            or not manager.is_autonomous()
+            or manager.is_waiting()
+        ):
+            return None
+        return manager.next_continuation_prompt()
+    except Exception:
+        logger.debug("persisted goal lookup failed for %s", session_id, exc_info=True)
+        return None
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -2270,6 +2296,11 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(tokens)
         _init_session(sid, target, agent, history, cols=int(params.get("cols", 80)))
+        session = _sessions.get(sid)
+        goal_prompt = _persisted_active_goal_prompt(session) if session else None
+        if session is not None:
+            with session["history_lock"]:
+                session["autonomous_resume_pending"] = bool(goal_prompt)
     except Exception as e:
         return _err(rid, 5000, f"resume failed: {e}")
     return _ok(
@@ -2280,8 +2311,40 @@ def _(rid, params: dict) -> dict:
             "message_count": len(messages),
             "messages": messages,
             "info": _session_info(agent),
+            # The client acknowledges the resumed session before asking the
+            # backend to dispatch this continuation.  This prevents goal
+            # events from racing ahead of transcript/session installation.
+            "autonomous_resume_pending": bool(goal_prompt),
         },
     )
+
+
+@method("goal.resume_pending")
+def _(rid, params: dict) -> dict:
+    """Dispatch an autonomous continuation after the client adopts a session."""
+    sid = str(params.get("session_id") or "").strip()
+    session = _sessions.get(sid)
+    if session is None:
+        return _err(rid, 4007, "session not found")
+    with session["history_lock"]:
+        if not session.get("autonomous_resume_pending"):
+            return _ok(rid, {"scheduled": False, "reason": "not_pending"})
+        if session.get("running"):
+            return _ok(rid, {"scheduled": False, "reason": "busy"})
+        goal_prompt = _persisted_active_goal_prompt(session)
+        if not goal_prompt:
+            session["autonomous_resume_pending"] = False
+            return _ok(rid, {"scheduled": False, "reason": "inactive"})
+        session["autonomous_resume_pending"] = False
+        session["running"] = True
+    _run_prompt_submit(
+        f"__goal_resume__{int(time.time() * 1000)}",
+        sid,
+        session,
+        goal_prompt,
+        display_kind="goal_continuation",
+    )
+    return _ok(rid, {"scheduled": True})
 
 
 @method("session.delete")
@@ -3001,9 +3064,18 @@ def _(rid, params: dict) -> dict:
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
+    display_kind = (
+        "command_dispatch"
+        if params.get("display_kind") == "command_dispatch"
+        else None
+    )
+    autonomy_ingress_text = params.get("autonomy_ingress_text")
+    if display_kind or not isinstance(autonomy_ingress_text, str):
+        autonomy_ingress_text = None
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    assert session is not None
     with session["history_lock"]:
         if session.get("running"):
             return _err(rid, 4009, "session busy")
@@ -3026,7 +3098,14 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
             return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            autonomy_ingress_text=autonomy_ingress_text,
+        )
 
     threading.Thread(target=run_after_agent_ready, daemon=True).start()
     return _ok(rid, {"status": "streaming"})
@@ -3073,7 +3152,9 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(
+                rid, sid, session, text, display_kind="process_notification"
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -3108,7 +3189,9 @@ def _notification_poller_loop(
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text)
+            _run_prompt_submit(
+                rid, sid, session, text, display_kind="process_notification"
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
@@ -3131,7 +3214,15 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    display_kind: str | None = None,
+    autonomy_ingress_text: str | None = None,
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -3155,6 +3246,29 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
+
+            try:
+                from hermes_cli.goals import GoalManager, activate_autonomous_goal
+
+                goal_session_id = session.get("session_key") or ""
+                if goal_session_id and autonomy_ingress_text is not None:
+                    try:
+                        goals_cfg = _load_cfg().get("goals") or {}
+                        goal_max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+                    except Exception:
+                        goal_max_turns = 20
+                    activate_autonomous_goal(
+                        GoalManager(
+                            session_id=goal_session_id,
+                            default_max_turns=goal_max_turns,
+                        ),
+                        autonomy_ingress_text,
+                    )
+            except Exception as auto_goal_exc:
+                logger.debug(
+                    "natural-language autonomous goal admission failed: %s",
+                    auto_goal_exc,
+                )
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
@@ -3479,7 +3593,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    display_kind="goal_continuation",
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -3503,7 +3623,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     session["running"] = True
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        display_kind="process_notification",
+                    )
                 except Exception as _n_exc:
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "

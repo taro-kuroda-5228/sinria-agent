@@ -573,7 +573,44 @@ describe('createSlashHandler', () => {
     await vi.waitFor(() => {
       expect(ctx.transcript.sys).toHaveBeenCalledWith('⚡ loading skill: hermes-agent-dev')
     })
-    expect(ctx.transcript.send).toHaveBeenCalledWith(skillMessage)
+    expect(ctx.transcript.send).toHaveBeenCalledWith(
+      skillMessage,
+      true,
+      'command_dispatch'
+    )
+  })
+
+  it('marks command.dispatch send payloads as synthetic', async () => {
+    const dispatchedMessage = 'Continue autonomously until all tasks are complete.'
+
+    const ctx = buildCtx({
+      gateway: {
+        gw: {
+          getLogTail: vi.fn(() => ''),
+          request: vi.fn((method: string) => {
+            if (method === 'slash.exec') {
+              return Promise.reject(new Error('use command.dispatch'))
+            }
+
+            if (method === 'command.dispatch') {
+              return Promise.resolve({ type: 'send', message: dispatchedMessage })
+            }
+
+            return Promise.resolve({})
+          })
+        },
+        rpc: vi.fn(() => Promise.resolve({}))
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/custom-send continue')).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.transcript.send).toHaveBeenCalledWith(
+        dispatchedMessage,
+        true,
+        'command_dispatch'
+      )
+    })
   })
 
   it('/history pages the current TUI transcript (user + assistant)', () => {

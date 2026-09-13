@@ -115,6 +115,7 @@ export interface SessionCreateResponse {
 }
 
 export interface SessionResumeResponse {
+  autonomous_resume_pending?: boolean
   info?: SessionInfo
   message_count?: number
   messages: GatewayTranscriptMessage[]

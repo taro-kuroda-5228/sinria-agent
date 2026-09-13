@@ -970,6 +970,17 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Derived message text that must keep normal authorization semantics but
+    # cannot grant direct-user autonomous-goal authority.
+    synthetic: bool = False
+
+    # Gateway-owned immutable snapshot used only for natural-language
+    # autonomous-goal admission.  Keeping it as an init field lets
+    # ``dataclasses.replace`` preserve the original snapshot across gateway
+    # rewrites; trusted adapters may provide an earlier raw transport snapshot.
+    autonomy_ingress_text: Optional[str] = field(default=None, repr=False)
+    autonomy_ingress_captured: bool = field(default=False, repr=False)
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -979,6 +990,28 @@ class MessageEvent:
     # necessarily a startup auto-resume probe — a rendered webhook template
     # can legitimately come out empty too).
     internal_kind: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.autonomy_ingress_captured:
+            if (
+                self.message_type != MessageType.TEXT
+                or self.internal
+                or self.synthetic
+                or str(self.autonomy_ingress_text or "").lstrip().startswith("/")
+            ):
+                self.autonomy_ingress_text = None
+            return
+        self.autonomy_ingress_text = (
+            str(self.text or "")
+            if (
+                self.message_type == MessageType.TEXT
+                and not self.internal
+                and not self.synthetic
+                and not str(self.text or "").lstrip().startswith("/")
+            )
+            else None
+        )
+        self.autonomy_ingress_captured = True
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

@@ -113,10 +113,13 @@ export function useComposerState({
   const {
     queueRef,
     queueEditRef,
+    queueAutonomyIngressRef,
+    queueDisplayKindRef,
     queuedDisplay,
     queueEditIdx,
     enqueue,
     dequeue,
+    dequeueWithMetadata,
     removeQ,
     replaceQ,
     setQueueEdit,
@@ -300,6 +303,7 @@ export function useComposerState({
     () => ({
       clearIn,
       dequeue,
+      dequeueWithMetadata,
       enqueue,
       handleTextPaste,
       openEditor,
@@ -317,6 +321,7 @@ export function useComposerState({
     [
       clearIn,
       dequeue,
+      dequeueWithMetadata,
       enqueue,
       handleTextPaste,
       openEditor,
@@ -335,10 +340,20 @@ export function useComposerState({
       historyDraftRef,
       historyRef,
       queueEditRef,
+      queueAutonomyIngressRef,
+      queueDisplayKindRef,
       queueRef,
       submitRef
     }),
-    [historyDraftRef, historyRef, queueEditRef, queueRef, submitRef]
+    [
+      historyDraftRef,
+      historyRef,
+      queueAutonomyIngressRef,
+      queueDisplayKindRef,
+      queueEditRef,
+      queueRef,
+      submitRef
+    ]
   )
 
   const state = useMemo(

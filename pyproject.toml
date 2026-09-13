@@ -229,7 +229,7 @@ sinria_cli = ["chrome_extension/**/*"]
 skills = ["**/*"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "agent.*", "tools", "tools.*", "sinria_cli", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "skills"]
+include = ["agent", "agent.*", "tools", "tools.*", "sinria_cli", "sinria_cli.*", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*", "providers", "providers.*", "skills"]
 exclude = ["tests", "tests.*", "*.tests", "*.tests.*"]
 
 [tool.setuptools.exclude-package-data]

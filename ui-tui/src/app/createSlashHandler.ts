@@ -110,14 +110,19 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
             if (d.type === 'skill') {
               sys(`⚡ loading skill: ${d.name}`)
 
-              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: skill payload missing message`)
+              return d.message?.trim()
+                ? send(d.message, true, 'command_dispatch')
+                : sys(`/${parsed.name}: skill payload missing message`)
             }
 
             if (d.type === 'send') {
               if (d.notice?.trim()) {
                 sys(d.notice)
               }
-              return d.message?.trim() ? send(d.message) : sys(`/${parsed.name}: empty message`)
+
+              return d.message?.trim()
+                ? send(d.message, true, 'command_dispatch')
+                : sys(`/${parsed.name}: empty message`)
             }
           })
           .catch(guardedErr)

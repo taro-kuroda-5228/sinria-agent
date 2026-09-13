@@ -2712,6 +2712,15 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+
+class _SyntheticInputMessage(str):
+    """Queue envelope for turns not authored as direct user prompts."""
+
+    @property
+    def text(self) -> str:
+        return str(self)
+
+
 class HermesCLI:
     """
     Interactive CLI for Sinria.
@@ -8109,7 +8118,7 @@ class HermesCLI:
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
-                self._pending_input.put(retry_msg)
+                self._pending_input.put(_SyntheticInputMessage(retry_msg))
         elif canonical == "undo":
             if self._confirm_destructive_slash(
                 "undo",
@@ -8215,7 +8224,7 @@ class HermesCLI:
             if not payload:
                 _cprint("  Usage: /queue <prompt>")
             else:
-                self._pending_input.put(payload)
+                self._pending_input.put(_SyntheticInputMessage(payload))
                 if self._agent_running:
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
@@ -8242,7 +8251,7 @@ class HermesCLI:
                         _cprint("  Steer rejected (empty payload).")
             else:
                 # No active run — treat as a normal next-turn message.
-                self._pending_input.put(payload)
+                self._pending_input.put(_SyntheticInputMessage(payload))
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
@@ -8320,7 +8329,7 @@ class HermesCLI:
                     skill_name = _skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(_SyntheticInputMessage(msg))
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -8653,7 +8662,7 @@ class HermesCLI:
 
             # Inject context message so the model knows
             if hasattr(self, '_pending_input'):
-                self._pending_input.put(
+                self._pending_input.put(_SyntheticInputMessage(
                     "[System note: The user has connected your browser tools to their live Chrome browser "
                     "via Chrome DevTools Protocol. Your browser_navigate, browser_snapshot, browser_click, "
                     "and other browser tools now control their real browser — including any pages they have "
@@ -8661,7 +8670,7 @@ class HermesCLI:
                     "services before connecting. Please await their instruction before attempting to operate "
                     "the browser. When you do act, be mindful that your actions affect their real browser — "
                     "don't close tabs or navigate away from pages without asking.]"
-                )
+                ))
 
         elif sub == "disconnect":
             if current:
@@ -8678,10 +8687,10 @@ class HermesCLI:
                 print()
 
                 if hasattr(self, '_pending_input'):
-                    self._pending_input.put(
+                    self._pending_input.put(_SyntheticInputMessage(
                         "[System note: The user has disconnected the browser tools from their live Chrome. "
                         "Browser tools are back to default mode (headless local browser or cloud provider).]"
-                    )
+                    ))
             else:
                 print()
                 print("Browser is not connected to live Chrome (already using default mode)")
@@ -8843,7 +8852,7 @@ class HermesCLI:
         # Kick the loop off immediately so the user doesn't have to send a
         # separate message after setting the goal.
         try:
-            self._pending_input.put(state.goal)
+            self._pending_input.put(_SyntheticInputMessage(state.goal))
         except Exception:
             pass
 
@@ -9034,7 +9043,7 @@ class HermesCLI:
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._pending_input.put(_SyntheticInputMessage(prompt))
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -10254,7 +10263,9 @@ class HermesCLI:
                 self._attached_images.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
-                self._pending_input.put(transcript)
+                # Voice transcription is transformed input, not immutable
+                # plain-text ingress authority for creating a durable goal.
+                self._pending_input.put(_SyntheticInputMessage(transcript))
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}No speech detected.{_RST}")
@@ -10960,7 +10971,12 @@ class HermesCLI:
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: Optional[list] = None,
+        allow_autonomous_goal: bool = True,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -10979,6 +10995,10 @@ class HermesCLI:
         Returns:
             The agent's response, or None on error
         """
+        autonomous_goal_text = (
+            message if allow_autonomous_goal and isinstance(message, str) else None
+        )
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -11208,6 +11228,17 @@ class HermesCLI:
                     agent_message = _srn + "\n\n" + agent_message
                     self._pending_skills_reload_note = None
                 try:
+                    try:
+                        from hermes_cli.goals import activate_autonomous_goal
+
+                        goal_manager = self._get_goal_manager()
+                        if goal_manager is not None:
+                            activate_autonomous_goal(goal_manager, autonomous_goal_text)
+                    except Exception as auto_goal_exc:
+                        logging.debug(
+                            "natural-language autonomous goal admission failed: %s",
+                            auto_goal_exc,
+                        )
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
@@ -11539,7 +11570,7 @@ class HermesCLI:
             if _leftover_steer and hasattr(self, '_pending_input'):
                 preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
-                self._pending_input.put(_leftover_steer)
+                self._pending_input.put(_SyntheticInputMessage(_leftover_steer))
 
             return response
             
@@ -13776,13 +13807,17 @@ class HermesCLI:
                             try:
                                 from tools.process_registry import process_registry
                                 for _evt, _synth in process_registry.drain_notifications():
-                                    self._pending_input.put(_synth)
+                                    self._pending_input.put(_SyntheticInputMessage(_synth))
                             except Exception:
                                 pass
                         continue
                     
                     if not user_input:
                         continue
+
+                    is_synthetic_input = isinstance(user_input, _SyntheticInputMessage)
+                    if is_synthetic_input:
+                        user_input = user_input.text
 
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
@@ -13843,7 +13878,11 @@ class HermesCLI:
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            allow_autonomous_goal=not is_synthetic_input,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -13885,7 +13924,7 @@ class HermesCLI:
                         try:
                             from tools.process_registry import process_registry
                             for _evt, _synth in process_registry.drain_notifications():
-                                self._pending_input.put(_synth)
+                                self._pending_input.put(_SyntheticInputMessage(_synth))
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 
