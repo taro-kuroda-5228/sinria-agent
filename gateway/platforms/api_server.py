@@ -1190,6 +1190,7 @@ class APIServerAdapter(BasePlatformAdapter):
         max_iterations: Optional[int] = None,
         enabled_toolsets: Optional[List[str]] = None,
         skip_memory: bool = False,
+        execution_platform: str = "api_server",
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1229,10 +1230,13 @@ class APIServerAdapter(BasePlatformAdapter):
             model = runtime_model
 
         user_config = _load_gateway_config()
+        agent_platform = str(execution_platform or "api_server").strip().lower()
+        if agent_platform not in {"api_server", "line"}:
+            raise ValueError("unsupported execution platform")
         effective_toolsets = (
             enabled_toolsets
             if enabled_toolsets is not None
-            else sorted(_get_platform_tools(user_config, "api_server"))
+            else sorted(_get_platform_tools(user_config, agent_platform))
         )
 
         effective_max_iterations = (
@@ -1255,7 +1259,7 @@ class APIServerAdapter(BasePlatformAdapter):
             enabled_toolsets=effective_toolsets,
             skip_memory=skip_memory,
             session_id=session_id,
-            platform="api_server",
+            platform=agent_platform,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
@@ -3395,6 +3399,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
+        execution_platform = str(body.get("execution_platform") or "api_server").strip().lower()
+        if execution_platform not in {"api_server", "line"}:
+            return web.json_response(
+                _openai_error("'execution_platform' must be 'api_server' or 'line'"),
+                status=400,
+            )
+
         from agent.browser_receipts import sanitize_browser_receipts
 
         browser_receipts = sanitize_browser_receipts(body.get("browser_receipts"))
@@ -3579,6 +3590,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     max_iterations=run_max_iterations,
                     enabled_toolsets=run_enabled_toolsets,
                     skip_memory=is_voice_profile,
+                    execution_platform=execution_platform,
                 )
                 agent._external_browser_receipts = browser_receipts
                 self._stamp_workspace_channel(agent, gateway_session_key, workspace_boundary)
@@ -3621,7 +3633,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = set_session_vars(
-                            platform="api_server",
+                            platform=execution_platform,
                             session_key=approval_session_key,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
@@ -3632,7 +3644,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 pattern_key="sinria:g2:voice-action",
                                 allow_session=False,
                                 allow_permanent=False,
-                                metadata={"run_id": run_id, "source": "api_server"},
+                                metadata={"run_id": run_id, "source": execution_platform},
                             )
                             if not decision.get("approved", False):
                                 r = {

@@ -319,12 +319,14 @@ def test_configured_invocation_prefix_requires_mapped_sender_and_strips_marker(t
         "source": {**base["source"], "userId": "Uunknown"},
         "message": {"type": "text", "id": "m-unmapped", "text": "@Sinria 更新して"},
     }) is None
-    assert adapter._prepare_task_intake({
+    plain_prompt = adapter._prepare_task_intake({
         **base,
         "webhookEventId": "evt-plain",
         "source": {**base["source"], "userId": "Utaro"},
         "message": {"type": "text", "id": "m-plain", "text": "通常会話"},
-    }) is None
+    })
+    assert plain_prompt is not None
+    assert adapter._task_contexts["Cgroup"]["allow_task"] is False
     prompt = adapter._prepare_task_intake({
         **base,
         "webhookEventId": "evt-task",
@@ -433,3 +435,73 @@ def test_local_classifier_request_contract_disables_thinking():
     ]
     assert '"think": False' in classifier
     assert "timeout=120.0" in classifier
+
+
+def test_parse_searchable_conversation_memory_candidate():
+    candidate = _line.parse_line_conversation_memory_candidate(json.dumps({
+        "kind": "none",
+        "memory": {
+            "kind": "discussion",
+            "topic": "実装方針",
+            "summary": "LINEも共通実行レイヤーを利用する方針を相談した",
+        },
+    }, ensure_ascii=False))
+    assert candidate is not None
+    assert candidate.memory_kind == "discussion"
+
+
+@pytest.mark.asyncio
+async def test_explicit_invocation_is_queued_when_classifier_returns_none(tmp_path):
+    captured = []
+    cfg = type("Cfg", (), {"extra": {
+        "task_participants": {"Utaro": {"member_id": "m1", "instance_id": "i1"}},
+        "task_evidence_root": str(tmp_path),
+        "task_workspace_id": "medical-horizon",
+        "conversation_memory_db": str(tmp_path / "conversation-memory.sqlite3"),
+        "task_writer": lambda payload: captured.append(payload) or {"ok": True, "taskId": "t1"},
+    }})()
+    adapter = _line.LineAdapter(cfg)
+    result = await adapter._handle_task_intake_response(
+        "Cgroup",
+        '{"kind":"none","reason":"conservative","memory":null}',
+        {
+            "sender_user_id": "Utaro", "message_id": "m1", "webhook_event_id": "e1",
+            "text": "動作確認を実行して", "timestamp_ms": 1,
+            "allow_task": True, "explicit_invocation": True,
+        },
+    )
+    assert result.success is True
+    assert len(captured) == 1
+    assert captured[0]["payload"]["sourcePlatform"] == "line"
+
+
+@pytest.mark.asyncio
+async def test_non_mentioned_conversation_is_memory_only(tmp_path):
+    from agent.line_conversation_memory import LineConversationMemoryStore
+
+    captured = []
+    db_path = tmp_path / "conversation-memory.sqlite3"
+    cfg = type("Cfg", (), {"extra": {
+        "task_participants": {"Utaro": {"member_id": "m1", "instance_id": "i1"}},
+        "task_evidence_root": str(tmp_path),
+        "conversation_memory_db": str(db_path),
+        "task_writer": lambda payload: captured.append(payload) or {"ok": True, "taskId": "t1"},
+    }})()
+    adapter = _line.LineAdapter(cfg)
+    result = await adapter._handle_task_intake_response(
+        "Cgroup",
+        json.dumps({
+            "kind": "none", "reason": "discussion",
+            "memory": {"kind": "discussion", "topic": "方針", "summary": "共通実行レイヤーを利用する"},
+        }, ensure_ascii=False),
+        {
+            "sender_user_id": "Utaro", "message_id": "m1", "webhook_event_id": "e1",
+            "text": "共通実行レイヤーを使おう", "timestamp_ms": 9_999_999_999_999,
+            "allow_task": False, "explicit_invocation": False,
+        },
+    )
+    assert result.success is True
+    assert captured == []
+    with LineConversationMemoryStore(db_path=db_path) as store:
+        rows = store.search("共通実行", group_id="Cgroup")
+    assert len(rows) == 1

@@ -146,6 +146,31 @@ class TestStartRun:
                 assert status["object"] == "sinria.run"
 
     @pytest.mark.asyncio
+    async def test_line_origin_run_uses_line_execution_platform(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "LINE task", "execution_platform": "line"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(100):
+                    status = await cli.get(f"/v1/runs/{run_id}")
+                    if (await status.json())["status"] in {"completed", "failed"}:
+                        break
+                    await asyncio.sleep(0.01)
+                assert mock_create.call_args.kwargs["execution_platform"] == "line"
+
+    @pytest.mark.asyncio
     async def test_start_attaches_sanitized_browser_receipts_to_agent(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
