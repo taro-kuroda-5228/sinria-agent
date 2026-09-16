@@ -80,6 +80,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set,
 from urllib.parse import quote as _urlquote
 
 from agent.line_human_confirmation import LineHumanConfirmationStore
+from agent.line_task_completion import LineTaskCompletion, LineTaskCompletionStore
+from agent.line_task_intake_queue import LineIntakeQueue, QueuedLineIntake
 from gateway.line_peer_routing import (
     LinePeerDeliveryGate,
     LinePeerProtocolError,
@@ -1025,6 +1027,34 @@ class LineAdapter(BasePlatformAdapter):
         self._human_confirmation_store = LineHumanConfirmationStore(
             self.human_confirmation_db
         )
+        self.task_completion_db = Path(
+            extra.get("task_completion_db")
+            or os.getenv(
+                "SINRIA_LINE_TASK_COMPLETION_DB",
+                str(get_sinria_home() / "private" / "line" / "task-completions.sqlite3"),
+            )
+        )
+        self._task_completion_store: Optional[LineTaskCompletionStore] = LineTaskCompletionStore(
+            self.task_completion_db
+        )
+        try:
+            self.task_completion_poll_seconds = max(
+                1.0, min(float(extra.get("task_completion_poll_seconds", 5.0)), 60.0)
+            )
+        except (TypeError, ValueError):
+            self.task_completion_poll_seconds = 5.0
+        self._task_completion_delivery_task: Optional[asyncio.Task] = None
+        self.task_intake_queue_db = Path(
+            extra.get("task_intake_queue_db")
+            or os.getenv(
+                "SINRIA_LINE_TASK_INTAKE_QUEUE_DB",
+                str(get_sinria_home() / "private" / "line" / "intake-queue.sqlite3"),
+            )
+        )
+        self._task_intake_queue: Optional[LineIntakeQueue] = LineIntakeQueue(
+            self.task_intake_queue_db
+        )
+        self._task_intake_worker_task: Optional[asyncio.Task] = None
         self._task_writer = extra.get("task_writer")
         self.task_intake_local_model = str(
             extra.get("task_intake_local_model")
@@ -1095,6 +1125,10 @@ class LineAdapter(BasePlatformAdapter):
             self._human_confirmation_store = LineHumanConfirmationStore(
                 self.human_confirmation_db
             )
+        if self._task_completion_store is None:
+            self._task_completion_store = LineTaskCompletionStore(self.task_completion_db)
+        if self._task_intake_queue is None:
+            self._task_intake_queue = LineIntakeQueue(self.task_intake_queue_db)
         if not self.channel_access_token or not self.channel_secret:
             self._set_fatal_error(
                 "config_missing",
@@ -1166,6 +1200,16 @@ class LineAdapter(BasePlatformAdapter):
             return False
 
         self._mark_connected()
+        self._task_completion_store.recover_stale_sends()
+        self._task_completion_delivery_task = asyncio.create_task(
+            self._run_task_completion_delivery_loop(),
+            name="line-task-completion-delivery",
+        )
+        self._task_intake_queue.recover_stale()
+        self._task_intake_worker_task = asyncio.create_task(
+            self._run_task_intake_queue_loop(),
+            name="line-task-intake-worker",
+        )
         logger.info(
             "LINE: webhook listening on %s:%s%s%s",
             self.webhook_host,
@@ -1177,6 +1221,16 @@ class LineAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+
+        for task in (self._task_completion_delivery_task, self._task_intake_worker_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task_completion_delivery_task = None
+        self._task_intake_worker_task = None
 
         if self._site is not None:
             try:
@@ -1215,6 +1269,92 @@ class LineAdapter(BasePlatformAdapter):
         if self._human_confirmation_store is not None:
             self._human_confirmation_store.close()
             self._human_confirmation_store = None
+        if self._task_completion_store is not None:
+            self._task_completion_store.close()
+            self._task_completion_store = None
+        if self._task_intake_queue is not None:
+            self._task_intake_queue.close()
+            self._task_intake_queue = None
+
+    @staticmethod
+    def _task_completion_text(item: LineTaskCompletion) -> str:
+        if item.status == "waiting_review":
+            return f"承認待ち: {item.summary}"
+        if item.status == "failed_recoverable":
+            return f"未完了: {item.summary}"
+        return item.summary
+
+    async def _drain_task_completion_outbox(self) -> int:
+        store = self._task_completion_store
+        if store is None or self._client is None:
+            return 0
+        delivered = 0
+        for item in store.pending(limit=10):
+            if item.conversation_id not in self.task_intake_groups:
+                continue
+            if not store.claim(item.delivery_id):
+                continue
+            try:
+                result = await self._send_text_chunks(
+                    item.conversation_id,
+                    self._task_completion_text(item),
+                    force_push=True,
+                )
+                if not result.success:
+                    store.mark_indeterminate(item.delivery_id)
+                    continue
+                store.mark_delivered(item.delivery_id)
+                delivered += 1
+            except Exception:
+                store.mark_indeterminate(item.delivery_id)
+                logger.exception("LINE task completion delivery failed")
+        return delivered
+
+    async def _run_task_completion_delivery_loop(self) -> None:
+        while True:
+            try:
+                await self._drain_task_completion_outbox()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("LINE task completion outbox loop failed")
+            await asyncio.sleep(self.task_completion_poll_seconds)
+
+    async def _process_queued_task_intake(self, item: QueuedLineIntake) -> bool:
+        queue = self._task_intake_queue
+        if queue is None or not queue.claim(item.event_id):
+            return False
+        try:
+            classifier_text = str(item.context.get("classifier_text") or item.context.get("text") or "")
+            content = await self._classify_task_intake_locally(classifier_text, item.prompt)
+            result = await self._handle_task_intake_response(
+                str(item.context.get("chat_id") or ""), content, item.context
+            )
+            if not result.success:
+                queue.release(item.event_id)
+                return False
+            queue.complete(item.event_id)
+            return True
+        except asyncio.CancelledError:
+            queue.release(item.event_id)
+            raise
+        except Exception:
+            queue.release(item.event_id)
+            logger.exception("LINE background task intake failed")
+            return False
+
+    async def _run_task_intake_queue_loop(self) -> None:
+        while True:
+            try:
+                queue = self._task_intake_queue
+                pending = queue.pending(limit=10) if queue is not None else []
+                for item in pending:
+                    await self._process_queued_task_intake(item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("LINE task intake queue loop failed")
+            await asyncio.sleep(1.0)
 
     # ------------------------------------------------------------------
     # Webhook handlers
@@ -1503,12 +1643,21 @@ class LineAdapter(BasePlatformAdapter):
         if task_prompt is not None:
             context = self._task_contexts.pop(chat_id)
             try:
-                classifier_text = str(context.get("classifier_text") or text)
-                decision_json = await self._classify_task_intake_locally(classifier_text, task_prompt)
+                queue = self._task_intake_queue
+                if queue is None:
+                    raise RuntimeError("LINE task intake queue is unavailable")
+                queue.enqueue(
+                    event_id=str(context.get("webhook_event_id") or ""),
+                    prompt=task_prompt,
+                    context={**context, "chat_id": chat_id},
+                )
             except Exception as exc:
-                logger.warning("LINE local task classifier unavailable: %s", type(exc).__name__)
-                decision_json = ""
-            await self._handle_task_intake_response(chat_id, decision_json, context)
+                logger.warning("LINE background task intake enqueue failed: %s", type(exc).__name__)
+                await self._send_text_chunks(
+                    chat_id,
+                    "⚠️ タスク登録に失敗しました。Sinriaの設定または接続を確認してください。",
+                    force_push=False,
+                )
             return
 
         # Best-effort typing indicator (DM only).
@@ -1791,9 +1940,9 @@ class LineAdapter(BasePlatformAdapter):
             result = await self._write_company_os_task(payload)
             if not isinstance(result, dict) or result.get("ok") is not True or not result.get("taskId"):
                 raise RuntimeError("Company OS did not confirm task creation")
-            return await self._send_text_chunks(
-                chat_id, f"✅ タスク登録: {decision.summary}", force_push=False
-            )
+            # The background path is intentionally silent until the worker
+            # publishes a terminal result through the durable completion outbox.
+            return SendResult(success=True, message_id=None)
         except Exception as exc:
             logger.warning("LINE task intake failed safely: %s", type(exc).__name__)
             return await self._send_text_chunks(

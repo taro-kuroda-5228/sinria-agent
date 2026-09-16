@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import socket
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from sinria_local_execution_adapters import (  # noqa: E402
     invoke_local_execution_adapter,
     select_execution_engine,
 )
+from agent.line_task_completion import enqueue_line_task_completion  # noqa: E402
 
 
 def _env_present(name: str) -> bool:
@@ -320,6 +322,23 @@ def _run_once_supabase(
         external_egress=bool(result.get("externalEgress", False)),
         human_approval_required=human_approval_required,
     )
+    # A LINE-origin task is acknowledged silently at intake. After Company OS
+    # accepts the terminal result, stage only its sanitized summary in the local
+    # durable outbox. The connected LINE adapter owns the actual reply and
+    # idempotent delivery state; raw source text never enters the outbox.
+    try:
+        enqueue_line_task_completion(
+            task,
+            task_id=str(task_id),
+            status=status,
+            sanitized_summary=sanitized_summary,
+        )
+    except (OSError, sqlite3.Error, ValueError):
+        _record_safe_failure(
+            mode=mode,
+            failure_stage="line_completion_outbox",
+            error_kind="local_outbox_unavailable",
+        )
     _record_sales_learning_loop(
         store=store,
         task=task,

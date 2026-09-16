@@ -345,8 +345,9 @@ SINRIA_COMPANY_CONTEXT_WORKSPACE_ID=YOUR_WORKSPACE_ID
 
 Safety and behavior:
 
-* Raw LINE text is written only under `~/.sinria/private/line/task-intake/`
-  for messages that became tasks; directory mode is `0700` and files are `0600`.
+* Raw LINE text is written only under `~/.sinria/private/line/` while local
+  classification or an accepted task requires it; directory mode is `0700` and
+  files are `0600`. Completed queue rows erase their raw prompt/context.
 * Raw LINE text is classified through loopback HTTP only. Non-loopback model
   URLs are rejected, and the task group never enters Sinria's normal chat
   session or cloud-model path.
@@ -363,8 +364,17 @@ Safety and behavior:
 * Created tasks disallow external actions and external egress. Later execution
   still follows the normal Sinria approval policy.
 * Typing, streaming, tool-progress, and slow-response bubbles are suppressed
-  in task-intake groups by the adapter itself; only a task receipt or a
-  recoverable configuration/connection failure is sent.
+  in task-intake groups by the adapter itself. Explicitly invoked work is
+  accepted silently and its sanitized terminal result is pushed to the same
+  LINE group from a durable local outbox. Configuration/connection failures
+  remain visible because they require human action.
+* The webhook acknowledges before local classification and Company OS latency;
+  a durable local queue resumes pending intake after a Gateway restart.
+* Ordinary non-invoked group messages can contribute only sanitized local
+  conversation-memory summaries. They cannot create tasks or Company Knowledge.
+* LINE Push API has no idempotency key. If the completion send has an unknown
+  effect, the outbox parks it as `indeterminate` instead of blindly retrying and
+  risking a duplicate.
 
 ---
 

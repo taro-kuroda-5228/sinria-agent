@@ -241,7 +241,7 @@ async def test_no_task_model_output_is_suppressed(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_clear_task_posts_metadata_then_sends_short_receipt(tmp_path):
+async def test_clear_task_posts_metadata_silently_until_terminal_result(tmp_path):
     captured = []
     async def writer(payload):
         captured.append(payload)
@@ -278,8 +278,8 @@ async def test_clear_task_posts_metadata_then_sends_short_receipt(tmp_path):
     assert "菊地さん" not in serialized
     assert "sourceRef" in serialized
     assert captured[0]["targetMemberId"] == "member-kikuchi"
-    sent = adapter._client.reply.await_args.args[1][0]["text"]
-    assert sent == "✅ タスク登録: 提案資料を金曜日までに更新する"
+    adapter._client.reply.assert_not_awaited()
+    adapter._client.push.assert_not_awaited()
 
 
 def test_prepare_inbound_task_context_only_for_configured_text_group(tmp_path):
@@ -383,6 +383,7 @@ async def test_configured_group_bypasses_agent_and_uses_local_classifier(tmp_pat
         "task_invocation_prefixes": [],
         "task_intake_local_model": "qwen3.5:9b",
         "task_evidence_root": str(tmp_path),
+        "task_intake_queue_db": str(tmp_path / "intake-queue.sqlite3"),
     }})()
     adapter = _line.LineAdapter(cfg)
     adapter._client = AsyncMock()
@@ -403,6 +404,10 @@ async def test_configured_group_bypasses_agent_and_uses_local_classifier(tmp_pat
     await adapter._handle_message_event(event)
 
     adapter.handle_message.assert_not_awaited()
+    adapter._classify_task_intake_locally.assert_not_awaited()
+    queued = adapter._task_intake_queue.pending()
+    assert len(queued) == 1
+    assert await adapter._process_queued_task_intake(queued[0]) is True
     adapter._classify_task_intake_locally.assert_awaited_once()
     adapter._handle_task_intake_response.assert_awaited_once()
     assert "Cgroup" not in adapter._task_contexts
