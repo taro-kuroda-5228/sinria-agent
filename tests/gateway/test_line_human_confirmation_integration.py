@@ -8,6 +8,7 @@ from plugins.platforms.line import adapter as line
 def test_quote_relationship_is_role_only_and_contains_no_platform_ids(tmp_path):
     cfg = type("Cfg", (), {"extra": {
         "task_intake_groups": ["Cgroup"],
+        "task_invocation_prefixes": [],
         "task_evidence_root": str(tmp_path),
     }})()
     adapter = line.LineAdapter(cfg)
