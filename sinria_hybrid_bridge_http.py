@@ -1,8 +1,9 @@
 """HTTP cloud-event adapters for Sinria Hybrid Agent Bridge.
 
-The adapter targets Supabase/PostgREST-compatible APIs used by Vercel/Supabase
-ChatOps apps. It is small and explicit so credentials stay in headers/env and
-never in cloud task payloads or object reprs.
+Production Agent OS execution uses the canonical Company OS HTTP API.  The
+Supabase/PostgREST adapter remains for explicit legacy compatibility only.
+Both adapters keep credentials in headers/env and never in cloud task payloads
+or object reprs.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 import requests
 
@@ -19,6 +21,237 @@ from sinria_hybrid_bridge_transports import bridge_task_from_postgrest_row
 
 def _normalize_base_url(url: str) -> str:
     return url.rstrip("/")
+
+
+@dataclass(repr=False)
+class CompanyOsApiCloudEventStore:
+    """Canonical Company OS API adapter for the local Agent OS worker.
+
+    The API owns task, claim, result, and review state.  This adapter deliberately
+    does not address Supabase tables directly; only sanitized metadata crosses the
+    boundary.  GET state is cached for the duration of one worker tick so durable
+    approval and attempt calculations use the same snapshot as task selection.
+    """
+
+    base_url: str
+    auth_value: Any = None
+    transport_subject: str | None = None
+    workspace_id: str | None = None
+    member_id: str | None = None
+    instance_id: str | None = None
+    session: Any = requests
+    timeout: float = 20.0
+
+    def __post_init__(self) -> None:
+        self.base_url = _normalize_base_url(self.base_url)
+        self._state: dict[str, list[dict[str, Any]]] = {"tasks": [], "claims": [], "results": []}
+        self._claim_ids_by_task: dict[tuple[str, str], str] = {}
+
+    def __repr__(self) -> str:
+        return f"CompanyOsApiCloudEventStore(base_url={self.base_url!r})"
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.auth_value:
+            headers["Authorization"] = f"Bearer {self.auth_value}"
+        if self.transport_subject:
+            headers["x-sinria-transport-subject"] = self.transport_subject
+        if self.workspace_id:
+            headers["x-sinria-workspace-id"] = self.workspace_id
+        if self.member_id:
+            headers["x-sinria-member-id"] = self.member_id
+        if self.instance_id:
+            headers["x-sinria-instance-id"] = self.instance_id
+        return headers
+
+
+    @staticmethod
+    def _check(response: Any) -> dict[str, Any]:
+        response.raise_for_status()
+        payload = response.json() or {}
+        if payload.get("ok") is False:
+            raise RuntimeError(str(payload.get("error") or payload.get("reason") or "company-os error"))
+        return payload
+
+    def fetch_pending_agent_os_tasks(
+        self, *, workspace_id: str, member_id: str, instance_id: str | None = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        query = {"targetMemberId": member_id}
+        if instance_id:
+            query["targetInstanceId"] = instance_id
+        payload = self._check(
+            self.session.get(
+                f"{self.base_url}/api/agent-os/tasks",
+                headers=self._headers(),
+                params=query,
+                timeout=self.timeout,
+            )
+        )
+        self._state = {
+            "tasks": list(payload.get("tasks") or []),
+            "claims": list(payload.get("claims") or []),
+            "results": list(payload.get("results") or []),
+        }
+        eligible = {"queued", "failed_recoverable", "approved_for_execution"}
+        return [
+            task
+            for task in self._state["tasks"]
+            if str(task.get("workspaceId") or "") == workspace_id
+            and str(task.get("targetMemberId") or "") == member_id
+            and str(task.get("status") or "") in eligible
+        ][:limit]
+
+    def has_approved_agent_os_review(self, *, workspace_id: str, task_id: str) -> bool:
+        if any(
+            str(task.get("id") or task.get("taskId") or "") == task_id
+            and str(task.get("workspaceId") or "") == workspace_id
+            and str(task.get("status") or "") == "approved_for_execution"
+            for task in self._state["tasks"]
+        ):
+            return True
+        return any(
+            str(result.get("taskId") or "") == task_id
+            and str(result.get("workspaceId") or "") == workspace_id
+            and isinstance(result.get("safety"), Mapping)
+            and result["safety"].get("humanApprovalRequired") is False
+            for result in self._state["results"]
+        )
+
+    def next_agent_os_task_attempt(self, *, workspace_id: str, task_id: str) -> int:
+        attempts = [
+            int(claim.get("attempt") or 0)
+            for claim in self._state["claims"]
+            if str(claim.get("taskId") or "") == task_id
+            and str(claim.get("workspaceId") or "") == workspace_id
+        ]
+        return max(attempts, default=0) + 1
+
+    def claim_agent_os_task(self, **kwargs: Any) -> dict[str, Any] | None:
+        body = {
+            "workspaceId": kwargs["workspace_id"],
+            "taskId": kwargs["task_id"],
+            "memberId": kwargs["member_id"],
+            "instanceId": kwargs["instance_id"],
+            "selectedExecutionEngine": kwargs.get("selected_execution_engine"),
+        }
+        payload = self._check(
+            self.session.post(
+                f"{self.base_url}/api/agent-os/tasks/claim",
+                headers=self._headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        )
+        claim = payload.get("claim")
+        if isinstance(claim, Mapping):
+            if (
+                str(claim.get("workspaceId") or "") != str(kwargs["workspace_id"])
+                or str(claim.get("taskId") or "") != str(kwargs["task_id"])
+            ):
+                raise RuntimeError("company-os claim scope mismatch")
+            claim_id = str(claim.get("claimId") or claim.get("id") or "").strip()
+            if claim_id:
+                key = (str(kwargs["workspace_id"]), str(kwargs["task_id"]))
+                self._claim_ids_by_task[key] = claim_id
+            return dict(claim)
+        return None
+
+    def renew_agent_os_task_claim_lease(self, **kwargs: Any) -> dict[str, Any] | None:
+        workspace_id = str(kwargs["workspace_id"])
+        task_id = str(kwargs["task_id"])
+        claim_id = str(kwargs.get("claim_id") or "").strip()
+        if not claim_id:
+            claim_id = self._claim_ids_by_task.get((workspace_id, task_id))
+        if not claim_id:
+            claim_id = next(
+                (
+                    str(claim.get("claimId") or claim.get("id") or "").strip()
+                    for claim in self._state["claims"]
+                    if str(claim.get("taskId") or "") == task_id
+                    and str(claim.get("workspaceId") or "") == workspace_id
+                    and int(claim.get("attempt") or 0) == int(kwargs.get("attempt") or 0)
+                ),
+                "",
+            )
+        if not claim_id:
+            return None
+        body = {
+            "workspaceId": kwargs["workspace_id"],
+            "claimId": claim_id,
+            "memberId": kwargs["member_id"],
+            "instanceId": kwargs["instance_id"],
+            "leaseSeconds": int(kwargs.get("lease_seconds") or 300),
+        }
+        payload = self._check(
+            self.session.post(
+                f"{self.base_url}/api/agent-os/tasks/claim/renew",
+                headers=self._headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        )
+        claim = payload.get("claim")
+        if isinstance(claim, Mapping):
+            if (
+                str(claim.get("workspaceId") or "") != workspace_id
+                or str(claim.get("taskId") or "") != task_id
+            ):
+                raise RuntimeError("company-os renewed claim scope mismatch")
+            return dict(claim)
+        return None
+
+    def post_agent_os_task_result(self, **kwargs: Any) -> dict[str, Any]:
+        body = {
+            "workspaceId": kwargs["workspace_id"],
+            "taskId": kwargs["task_id"],
+            "agentOsId": kwargs["agent_os_id"],
+            "taskKind": kwargs["task_kind"],
+            "producedByMemberId": kwargs["member_id"],
+            "producedByInstanceId": kwargs["instance_id"],
+            "status": kwargs["status"],
+            "sanitizedSummary": kwargs["sanitized_summary"],
+            "resultRefs": kwargs.get("result_refs") or [],
+            "externalEgress": bool(kwargs.get("external_egress", False)),
+            "humanApprovalRequired": bool(kwargs.get("human_approval_required", True)),
+        }
+        return self._check(
+            self.session.post(
+                f"{self.base_url}/api/agent-os/tasks/result",
+                headers=self._headers(),
+                json=body,
+                timeout=self.timeout,
+            )
+        )
+
+    def record_bridge_status(
+        self,
+        *,
+        status: str = "online",
+        capabilities: list[str] | None = None,
+        sanitized_summary: str = "Sinria worker heartbeat",
+    ) -> dict[str, Any]:
+        if not self.workspace_id or not self.member_id or not self.instance_id:
+            raise RuntimeError("worker identity is required for bridge heartbeat")
+        return self._check(
+            self.session.post(
+                f"{self.base_url}/api/bridge/status",
+                headers=self._headers(),
+                json={
+                    "workspaceId": self.workspace_id,
+                    "memberId": self.member_id,
+                    "instanceId": self.instance_id,
+                    "status": status,
+                    "capabilities": capabilities or ["agent-os-worker"],
+                    "sanitizedSummary": sanitized_summary,
+                },
+                timeout=self.timeout,
+            )
+        )
+
+    def ensure_agent_os_review_request(self, **kwargs: Any) -> None:
+        # /api/agent-os/tasks/result atomically creates the linked review for a
+        # waiting_review result, so a second request would duplicate it.
+        del kwargs
 
 
 @dataclass(frozen=True, repr=False)
@@ -133,19 +366,46 @@ class SupabaseRestCloudEventStore:
     # ------------------------------------------------------------------
 
     def fetch_pending_agent_os_tasks(
-        self, *, workspace_id: str, member_id: str, limit: int = 1
+        self, *, workspace_id: str, member_id: str, instance_id: str | None = None, limit: int = 1
     ) -> list[dict[str, Any]]:
-        """Tasks targeted at this member that are still claimable."""
+        """Tasks targeted at this member/instance that are still claimable."""
         url = (
             f"{self.rest_base}/agent_os_tasks"
             f"?workspace_id=eq.{workspace_id}"
             f"&target_member_id=eq.{member_id}"
-            f"&status=in.(queued,failed_recoverable)"
+            f"&status=in.(queued,failed_recoverable,approved_for_execution)"
             f"&order=created_at.asc&limit={int(limit)}"
         )
+        if instance_id:
+            url += f"&target_instance_id=eq.{instance_id}"
         response = self.session.get(url, headers=self._headers())
         response.raise_for_status()
         return response.json() or []
+
+    def next_agent_os_task_attempt(self, *, workspace_id: str, task_id: str) -> int:
+        """Return the next monotonic claim attempt for one task.
+
+        Historical expired/failed claims are immutable evidence. A retry must
+        use a new idempotency key instead of merging into attempt 1.
+        """
+        query = urlencode(
+            {
+                "workspace_id": f"eq.{workspace_id}",
+                "task_id": f"eq.{task_id}",
+                "select": "attempt",
+                "order": "attempt.desc",
+                "limit": "1",
+            }
+        )
+        response = self.session.get(
+            f"{self.rest_base}/agent_os_task_claims?{query}",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        rows = response.json() or []
+        if not rows:
+            return 1
+        return max(1, int(rows[0].get("attempt") or 0) + 1)
 
     def claim_agent_os_task(
         self,
@@ -233,37 +493,134 @@ class SupabaseRestCloudEventStore:
         result_refs: list[dict[str, Any]] | None = None,
         external_egress: bool = False,
         human_approval_required: bool = True,
+        attempt: int | None = None,
     ) -> None:
-        """Post a SANITIZED result back to cloud. Raw bodies/diffs stay local."""
-        result_row = {
-            "result_id": f"aor_{task_id}_{instance_id}",
-            "workspace_id": workspace_id,
-            "task_id": task_id,
-            "agent_os_id": agent_os_id,
-            "task_kind": task_kind,
-            "produced_by_member_id": member_id,
-            "produced_by_instance_id": instance_id,
+        """Post a SANITIZED result back to cloud. Raw bodies/diffs stay local.
+
+        ``attempt`` scopes the row id per claim attempt; without it, retries
+        upsert-merge into the first attempt's row and later outcomes become
+        invisible (created_at stays at attempt 1).
+        """
+        # Never fall back to a direct table write: it bypasses task/claim
+        # validation and would be unable to distinguish legacy duplicate rows.
+        result_input = {
+            "workspaceId": workspace_id,
+            "taskId": task_id,
+            "agentOsId": agent_os_id,
+            "taskKind": task_kind,
+            "producedByMemberId": member_id,
+            "producedByInstanceId": instance_id,
             "status": status,
-            "sanitized_summary": sanitized_summary,
-            "result_refs": result_refs or [],
-            "external_egress": bool(external_egress),
-            "human_approval_required": bool(human_approval_required),
-            "raw_result_body_stored": False,
-            "credential_stored_in_cloud": False,
+            "sanitizedSummary": sanitized_summary,
+            "resultRefs": result_refs or [],
+            "externalEgress": bool(external_egress),
+            "humanApprovalRequired": bool(human_approval_required),
+        }
+        response = self.session.post(
+            f"{self.rest_base}/rpc/record_agent_os_task_result_v1",
+            headers=self._headers(prefer="return=representation"),
+            json={"p_input": result_input},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload[0] if isinstance(payload, list) and payload else payload
+
+    def renew_agent_os_task_claim_lease(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        member_id: str,
+        instance_id: str,
+        lease_seconds: int = 600,
+    ) -> None:
+        """Extend this member+instance's active lease while a run is in flight."""
+        expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(lease_seconds))).isoformat()
+        self.session.patch(
+            f"{self.rest_base}/agent_os_task_claims"
+            f"?workspace_id=eq.{workspace_id}"
+            f"&task_id=eq.{task_id}"
+            f"&claimed_by_member_id=eq.{member_id}"
+            f"&claimed_by_instance_id=eq.{instance_id}"
+            f"&claim_status=eq.active",
+            headers=self._headers(),
+            json={"claim_expires_at": expires_at},
+        ).raise_for_status()
+
+    def has_approved_agent_os_review(
+        self, *, workspace_id: str, task_id: str
+    ) -> bool:
+        """Read durable proof that this task already entered an approved execution."""
+        response = self.session.get(
+            f"{self.rest_base}/agent_os_task_results"
+            f"?workspace_id=eq.{workspace_id}"
+            f"&task_id=eq.{task_id}"
+            f"&human_approval_required=eq.false"
+            f"&select=result_id"
+            f"&limit=1",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return bool(response.json())
+
+    def ensure_agent_os_review_request(
+        self,
+        *,
+        workspace_id: str,
+        task_id: str,
+        agent_os_id: str,
+        task_kind: str,
+        member_id: str,
+        instance_id: str,
+        required_authority: str = "self",
+        sanitized_summary: str = "",
+    ) -> None:
+        """Guarantee exactly one open ReviewRequest linked to a paused task.
+
+        The direct-PostgREST worker path bypasses the company-os repository, so
+        the waiting_review → linked-review invariant must also be enforced here
+        (approval in the Sheets 承認待ち tab resumes the task via the API).
+        """
+        existing = self.session.get(
+            f"{self.rest_base}/review_requests"
+            f"?workspace_id=eq.{workspace_id}"
+            f"&task_id=eq.{task_id}"
+            f"&select=review_id,status"
+            f"&limit=1",
+            headers=self._headers(),
+        )
+        existing.raise_for_status()
+        if existing.json():
+            return
+        # Map the task authority onto the review Role vocabulary (same mapping
+        # as company-os-types.reviewAuthorityForTask): physician has no Role
+        # equivalent yet and escalates to owner rather than silently widening.
+        authority = {
+            "admin": "admin",
+            "owner": "owner",
+            "physician": "owner",
+        }.get(str(required_authority), "reviewer")
+        row = {
+            "review_id": f"review_{task_id}",
+            "workspace_id": workspace_id,
+            "requested_by_member_id": member_id,
+            "requested_by_instance_id": instance_id,
+            "required_authority": authority,
+            "operation_type": f"agent_os_task:{agent_os_id}:{task_kind}",
+            "sanitized_summary": sanitized_summary or "human approval required",
+            "status": "waiting",
+            "task_id": task_id,
+            "raw_payload_stored": False,
             "external_action_performed": False,
         }
         response = self.session.post(
-            f"{self.rest_base}/agent_os_task_results",
-            headers=self._headers(prefer="resolution=merge-duplicates,return=representation"),
-            json=result_row,
+            f"{self.rest_base}/review_requests",
+            headers=self._headers(
+                prefer="resolution=ignore-duplicates,return=representation"
+            ),
+            json=row,
         )
         response.raise_for_status()
-        task_status = status if status in {"completed", "waiting_review", "failed_recoverable"} else "waiting_review"
-        self.session.patch(
-            f"{self.rest_base}/agent_os_tasks?task_id=eq.{task_id}",
-            headers=self._headers(),
-            json={"status": task_status},
-        ).raise_for_status()
 
     def record_knowledge_asset_observation(self, **kwargs: Any) -> dict[str, Any]:
         row = {
