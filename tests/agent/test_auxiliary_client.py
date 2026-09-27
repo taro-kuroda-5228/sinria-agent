@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -2317,7 +2318,7 @@ class TestAuxiliaryClientPoisonedCacheEviction:
             def get_final_response(self):  # pragma: no cover — timeout fires first
                 return SimpleNamespace(output=[], usage=None)
 
-        closed = {"flag": False}
+        closed = {"flag": False, "cached_at_close": False}
 
         class FakeClient:
             def __init__(self):
@@ -2327,6 +2328,8 @@ class TestAuxiliaryClientPoisonedCacheEviction:
 
             def close(self):
                 closed["flag"] = True
+                with _client_cache_lock:
+                    closed["cached_at_close"] |= cache_key in _client_cache
 
         fake_real = FakeClient()
         wrapper = CodexAuxiliaryClient(fake_real, "gpt-5.5")
@@ -2342,9 +2345,72 @@ class TestAuxiliaryClientPoisonedCacheEviction:
                     timeout=0.05,
                 )
             assert closed["flag"] is True, "timeout closer must close inner client"
+            assert not closed["cached_at_close"], "evict before closing the transport"
             assert cache_key not in _client_cache, (
                 "timeout closer must evict cache entry that wraps the closed client"
             )
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+
+    def test_codex_timeout_publishes_only_after_cache_eviction(self, monkeypatch):
+        """A timeout observer must never see a still-cached closing client."""
+        from agent.auxiliary_client import (
+            _client_cache, _client_cache_lock,
+            _CodexCompletionsAdapter, CodexAuxiliaryClient,
+        )
+
+        class SlowAliveStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                for _ in range(20):
+                    time.sleep(0.01)
+                    yield SimpleNamespace(type="response.in_progress")
+
+            def get_final_response(self):  # pragma: no cover — timeout fires first
+                return SimpleNamespace(output=[], usage=None)
+
+        cache_key = ("openai-codex", False, None, None, None)
+        real_event = threading.Event
+
+        class ObservingEvent(real_event):
+            def set(self):
+                with _client_cache_lock:
+                    assert cache_key not in _client_cache
+                super().set()
+
+        class FakeClient:
+            def __init__(self):
+                self.responses = SimpleNamespace(stream=lambda **k: SlowAliveStream())
+                self.api_key = "k"
+                self.base_url = "https://chatgpt.com/backend-api/codex"
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        fake_real = FakeClient()
+        wrapper = CodexAuxiliaryClient(fake_real, "gpt-5.5")
+        with _client_cache_lock:
+            _client_cache.clear()
+            _client_cache[cache_key] = (wrapper, "gpt-5.5", None)
+        monkeypatch.setattr(
+            "agent.auxiliary_client.threading",
+            SimpleNamespace(Event=ObservingEvent, Timer=threading.Timer),
+        )
+        try:
+            adapter = _CodexCompletionsAdapter(fake_real, "gpt-5.5")
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "x"}],
+                    timeout=0.05,
+                )
+            assert fake_real.closed is True
         finally:
             with _client_cache_lock:
                 _client_cache.clear()

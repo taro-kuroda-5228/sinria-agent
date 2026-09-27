@@ -1897,7 +1897,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -1912,6 +1912,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        results: List[SendResult] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -1945,8 +1946,11 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                results.append(img_result)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                results.append(SendResult(success=False, error=str(img_err)))
+        return results
 
     async def send_image(
         self,
@@ -3083,9 +3087,15 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        # Track delivery outcomes for the processing-complete hook
+        # Track delivery outcomes for the processing-complete hook.
         delivery_attempted = False
         delivery_succeeded = False
+        processing_ok = False
+        # Completion callbacks are authoritative only after every required
+        # root-response component succeeds. Optional auto-TTS never converts a
+        # failed text or attachment delivery into a successful completion.
+        required_delivery_expected = False
+        required_delivery_succeeded = True
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -3094,6 +3104,24 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+
+        def _record_required_delivery(result):
+            """Fail closed unless every required result explicitly succeeds."""
+            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal required_delivery_expected, required_delivery_succeeded
+            required_delivery_expected = True
+            if isinstance(result, (list, tuple)):
+                if not result:
+                    required_delivery_succeeded = False
+                    return
+                for item in result:
+                    _record_required_delivery(item)
+                return
+            delivery_attempted = True
+            if result is None or not getattr(result, "success", False):
+                required_delivery_succeeded = False
+                return
+            delivery_succeeded = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -3229,6 +3257,7 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion
                 if text_content:
+                    required_delivery_expected = True
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
                     # Mark final response messages for notification delivery.
@@ -3249,7 +3278,7 @@ class BasePlatformAdapter(ABC):
                         reply_to=_reply_anchor,
                         metadata=_thread_metadata,
                     )
-                    _record_delivery(result)
+                    _record_required_delivery(result)
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors
@@ -3273,13 +3302,15 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_results = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_required_delivery(image_results)
                     except Exception as batch_err:
+                        _record_required_delivery(None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -3315,13 +3346,15 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_results = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_required_delivery(image_results)
                     except Exception as batch_err:
+                        _record_required_delivery(None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -3348,9 +3381,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_thread_metadata,
                             )
 
+                        _record_required_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_required_delivery(None)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -3360,22 +3395,28 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        _record_required_delivery(file_result)
                     except Exception as file_err:
+                        _record_required_delivery(None)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                required_delivery_succeeded
+                if required_delivery_expected
+                else (delivery_succeeded if delivery_attempted else not bool(response))
+            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
@@ -3425,11 +3466,13 @@ class BasePlatformAdapter(ABC):
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
+            processing_ok = False
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            processing_ok = False
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -3472,7 +3515,7 @@ class BasePlatformAdapter(ABC):
                 )
             else:
                 _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
-            if callable(_post_cb):
+            if callable(_post_cb) and processing_ok:
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):

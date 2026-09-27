@@ -197,6 +197,55 @@ async def test_goal_verdict_skipped_when_no_active_goal(hermes_home):
 
 
 @pytest.mark.asyncio
+async def test_post_delivery_callback_is_suppressed_after_failed_primary_send():
+    """A completion notice cannot outrun a failed required task response."""
+    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+
+    class FailingAdapter(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+            self.attempts = []
+
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            self._mark_disconnected()
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id, "type": "dm"}
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.attempts.append(content)
+            return SendResult(success=False, error="synthetic delivery failure")
+
+    adapter = FailingAdapter()
+    source = _make_source()
+    session_key = build_session_key(source)
+    callback_called = []
+    adapter.register_post_delivery_callback(session_key, lambda: callback_called.append(True))
+
+    async def handle(_event):
+        return "required local artifact result"
+
+    adapter.set_message_handler(handle)
+    event = MessageEvent(
+        text="deliver artifact",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="failed-primary",
+    )
+    try:
+        await adapter.handle_message(event)
+        await asyncio.wait_for(asyncio.gather(*list(adapter._background_tasks)), timeout=5)
+    finally:
+        await adapter.cancel_background_tasks()
+
+    assert adapter.attempts
+    assert callback_called == []
+
+
+@pytest.mark.asyncio
 async def test_goal_verdict_survives_adapter_without_send(hermes_home):
     """Bad adapter (no ``send`` attribute) must not crash the judge hook."""
     runner, _adapter, session_entry, src = _make_runner_with_adapter()

@@ -1046,7 +1046,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1056,7 +1056,7 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return
+            return []
 
         scheduler = get_scheduler()
         logger.info(
@@ -1103,7 +1103,7 @@ class SignalAdapter(BasePlatformAdapter):
                 "(download=%d missing=%d oversize=%d)",
                 len(images), skipped_download, skipped_missing, skipped_oversize,
             )
-            return
+            return [SendResult(success=False, error="No images available")]
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1123,6 +1123,9 @@ class SignalAdapter(BasePlatformAdapter):
             attachments[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
             for i in range(0, len(attachments), SIGNAL_MAX_ATTACHMENTS_PER_MSG)
         ]
+        results: List[SendResult] = []
+        if len(attachments) != len(images):
+            results.append(SendResult(success=False, error="Some images unavailable"))
 
         for idx, att_batch in enumerate(att_batches):
             n = len(att_batch)
@@ -1138,6 +1141,7 @@ class SignalAdapter(BasePlatformAdapter):
 
             params = dict(base_params, attachments=att_batch)
             send_timeout = _signal_send_timeout(n)
+            batch_succeeded = False
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)
@@ -1148,6 +1152,7 @@ class SignalAdapter(BasePlatformAdapter):
                     )
                     _rpc_duration = time.monotonic() - _rpc_t0
                     if result is not None:
+                        batch_succeeded = True
                         self._track_sent_timestamp(result)
                         await scheduler.report_rpc_duration(_rpc_duration, n)
                         logger.info(
@@ -1193,6 +1198,8 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+            results.append(SendResult(success=batch_succeeded))
+        return results
 
     async def _notify_batch_pacing(
         self,
