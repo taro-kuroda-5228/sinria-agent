@@ -745,6 +745,13 @@ class _CodexCompletionsAdapter:
             return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
 
         def _close_client_on_timeout() -> None:
+            # Evict before publishing timeout. Consumers may observe timed_out
+            # immediately and rebuild a client; they must never race with a
+            # cache entry that this watchdog is about to close.
+            try:
+                _evict_cached_client_instance(self._client)
+            except Exception:
+                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
             timed_out.set()
             close = getattr(self._client, "close", None)
             if callable(close):
@@ -752,16 +759,6 @@ class _CodexCompletionsAdapter:
                     close()
                 except Exception:
                     logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:

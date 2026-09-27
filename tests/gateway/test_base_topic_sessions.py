@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, ProcessingOutcome, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import SessionSource, build_session_key
 
 
@@ -170,6 +170,88 @@ class TestBasePlatformTopicSessions:
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
         ]
+
+    @pytest.mark.asyncio
+    async def test_required_text_failure_is_not_masked_by_successful_media(self):
+        """Every required root-response component must succeed before callback release."""
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="response"))
+        adapter.extract_media = lambda content: ([("/tmp/report.pdf", False)], "response")
+        adapter.extract_images = lambda content: ([], content)
+        adapter.extract_local_files = lambda content: ([], content)
+
+        async def hold_typing(chat_id, interval=2.0, metadata=None, stop_event=None):
+            await asyncio.Event().wait()
+
+        adapter._keep_typing = hold_typing
+        attempts = []
+
+        async def fail_text(chat_id, content, reply_to=None, metadata=None):
+            attempts.append(content)
+            return SendResult(success=False, error="permission denied")
+
+        async def send_document(chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
+            return SendResult(success=True, message_id="media")
+
+        adapter.send = fail_text
+        adapter.send_document = send_document
+        source = _make_event("-1001", "17585").source
+        session_key = build_session_key(source)
+        released = []
+        adapter.register_post_delivery_callback(session_key, lambda: released.append(True))
+        event = _make_event("-1001", "17585")
+
+        await adapter._process_message_background(event, session_key)
+
+        assert attempts, "required text delivery should be attempted"
+        assert adapter.processing_hooks[-1] == ("complete", "1", ProcessingOutcome.FAILURE)
+        assert released == []
+
+    @pytest.mark.asyncio
+    async def test_required_text_failure_is_not_masked_by_optional_tts(self, monkeypatch, tmp_path):
+        """Successful auto-TTS is optional and cannot release a failed text callback."""
+        import tools.tts_tool as tts_tool
+
+        audio_path = tmp_path / "reply.mp3"
+        audio_path.write_bytes(b"audio")
+        monkeypatch.setattr(tts_tool, "check_tts_requirements", lambda: True)
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **_kwargs: '{"file_path": "' + str(audio_path) + '"}',
+        )
+
+        adapter = DummyTelegramAdapter()
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="response"))
+        adapter._should_auto_tts_for_chat = lambda chat_id: True
+
+        async def hold_typing(chat_id, interval=2.0, metadata=None, stop_event=None):
+            await asyncio.Event().wait()
+
+        adapter._keep_typing = hold_typing
+        played = []
+
+        async def play_tts(chat_id, audio_path, **kwargs):
+            played.append(audio_path)
+            return SendResult(success=True, message_id="audio")
+
+        async def fail_text(*_args, **_kwargs):
+            return SendResult(success=False, error="permission denied")
+
+        adapter.play_tts = play_tts
+        adapter.send = fail_text
+        source = _make_event("-1001", "17585").source
+        session_key = build_session_key(source)
+        released = []
+        adapter.register_post_delivery_callback(session_key, lambda: released.append(True))
+        event = _make_event("-1001", "17585")
+        event.message_type = MessageType.VOICE
+
+        await adapter._process_message_background(event, session_key)
+
+        assert played == [str(audio_path)]
+        assert adapter.processing_hooks[-1] == ("complete", "1", ProcessingOutcome.FAILURE)
+        assert released == []
 
     @pytest.mark.asyncio
     async def test_process_message_background_marks_exception_unsuccessful(self):

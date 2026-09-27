@@ -3074,7 +3074,7 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images natively via Telegram's media group API.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
@@ -3086,10 +3086,10 @@ class TelegramAdapter(BasePlatformAdapter):
         opened as byte streams. On failure the whole batch falls back to
         the base adapter's per-image loop.
         """
-        if not self._bot:
-            return
         if not images:
-            return
+            return []
+        if not self._bot:
+            return [SendResult(success=False, error="Telegram client unavailable")]
 
         try:
             from telegram import InputMediaPhoto
@@ -3098,8 +3098,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -3111,13 +3110,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 photos.append((image_url, alt_text))
 
         # Animations: route through the base default (per-image send_animation)
+        results: List[SendResult] = []
         if animations:
-            await super().send_multiple_images(
+            results.extend(await super().send_multiple_images(
                 chat_id, animations, metadata, human_delay=human_delay,
-            )
+            ))
 
         if not photos:
-            return
+            return results
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -3150,6 +3150,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         media.append(InputMediaPhoto(media=image_url, caption=caption))
 
                 if not media:
+                    results.append(SendResult(success=False, error="No images available"))
                     continue
 
                 logger.info(
@@ -3171,7 +3172,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": int(chat_id),
@@ -3185,6 +3186,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                results.append(SendResult(success=bool(messages) and len(messages) == len(chunk)))
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -3192,15 +3194,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                await super().send_multiple_images(
+                results.extend(await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay,
-                )
+                ))
             finally:
                 for fh in opened_files:
                     try:
                         fh.close()
                     except Exception:
                         pass
+        return results
 
     async def send_image_file(
         self,

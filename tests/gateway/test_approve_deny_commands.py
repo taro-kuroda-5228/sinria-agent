@@ -77,6 +77,18 @@ def _clear_approval_state():
     mod._pending.clear()
 
 
+def _queue_active_approval(session_key: str, data: dict):
+    """Publish the authoritative record before exposing a queued approval."""
+    from tools import approval as mod
+
+    entry = mod._ApprovalEntry(data)
+    assert mod.approval_store.record_pending(
+        entry.approval_id, session_key, data
+    ) == entry.approval_id
+    mod._gateway_queues.setdefault(session_key, []).append(entry)
+    return entry
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------
@@ -99,8 +111,7 @@ class TestBlockingGatewayApproval:
         register_gateway_notify(session_key, lambda d: None)
 
         # Simulate what check_all_command_guards does
-        entry = _ApprovalEntry({"command": "rm -rf /"})
-        _gateway_queues.setdefault(session_key, []).append(entry)
+        entry = _queue_active_approval(session_key, {"command": "rm -rf /"})
 
         assert has_blocking_approval(session_key) is True
 
@@ -128,10 +139,9 @@ class TestBlockingGatewayApproval:
             resolve_gateway_approval, _ApprovalEntry, _gateway_queues,
         )
         session_key = "test-all"
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        e3 = _ApprovalEntry({"command": "cmd3"})
-        _gateway_queues[session_key] = [e1, e2, e3]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
+        e3 = _queue_active_approval(session_key, {"command": "cmd3"})
 
         count = resolve_gateway_approval(session_key, "session", resolve_all=True)
         assert count == 3
@@ -145,9 +155,8 @@ class TestBlockingGatewayApproval:
             _ApprovalEntry, _gateway_queues,
         )
         session_key = "test-fifo"
-        e1 = _ApprovalEntry({"command": "first"})
-        e2 = _ApprovalEntry({"command": "second"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "first"})
+        e2 = _queue_active_approval(session_key, {"command": "second"})
 
         count = resolve_gateway_approval(session_key, "once")
         assert count == 1
@@ -165,9 +174,8 @@ class TestBlockingGatewayApproval:
         session_key = "test-cleanup"
         register_gateway_notify(session_key, lambda d: None)
 
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
 
         unregister_gateway_notify(session_key)
         assert e1.event.is_set()
@@ -178,9 +186,8 @@ class TestBlockingGatewayApproval:
         from tools.approval import clear_session, _ApprovalEntry, _gateway_queues
 
         session_key = "test-boundary-cleanup"
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
 
         clear_session(session_key)
 
@@ -210,8 +217,7 @@ class TestApproveCommand:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        entry = _ApprovalEntry({"command": "test"})
-        _gateway_queues[session_key] = [entry]
+        entry = _queue_active_approval(session_key, {"command": "test"})
 
         result = await runner._handle_approve_command(_make_event("/approve"))
         assert "approved" in result.lower()
@@ -227,9 +233,8 @@ class TestApproveCommand:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
 
         result = await runner._handle_approve_command(_make_event("/approve all"))
         assert "2 commands" in result
@@ -245,9 +250,8 @@ class TestApproveCommand:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
 
         result = await runner._handle_approve_command(_make_event("/approve all session"))
         assert "session" in result.lower()
@@ -293,8 +297,7 @@ class TestDenyCommand:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        entry = _ApprovalEntry({"command": "test"})
-        _gateway_queues[session_key] = [entry]
+        entry = _queue_active_approval(session_key, {"command": "test"})
 
         result = await runner._handle_deny_command(_make_event("/deny"))
         assert "denied" in result.lower()
@@ -310,9 +313,8 @@ class TestDenyCommand:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
+        e1 = _queue_active_approval(session_key, {"command": "cmd1"})
+        e2 = _queue_active_approval(session_key, {"command": "cmd2"})
 
         result = await runner._handle_deny_command(_make_event("/deny all"))
         assert "2 commands" in result
@@ -345,8 +347,7 @@ class TestBareTextNoLongerApproves:
         source = _make_source()
         session_key = runner._session_key_for_source(source)
 
-        entry = _ApprovalEntry({"command": "test"})
-        _gateway_queues[session_key] = [entry]
+        entry = _queue_active_approval(session_key, {"command": "test"})
 
         # "yes" is not /approve — entry should still be pending
         assert not entry.event.is_set()

@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 
 
@@ -125,7 +125,9 @@ class TestTelegramMultiImage:
         config = PlatformConfig(enabled=True, token="fake-token")
         a = TelegramAdapter(config)
         a._bot = MagicMock()
-        a._bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=1)])
+        a._bot.send_media_group = AsyncMock(
+            side_effect=lambda **kwargs: [MagicMock(message_id=i) for i, _ in enumerate(kwargs["media"])]
+        )
         return a
 
     def test_single_batch_under_10_calls_send_media_group_once(self, adapter):
@@ -135,7 +137,8 @@ class TestTelegramMultiImage:
         # Make InputMediaPhoto a concrete class that records its args
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media, "caption": caption})
 
-        _run(adapter.send_multiple_images("12345", images))
+        results = _run(adapter.send_multiple_images("12345", images))
+        assert results and all(result.success for result in results)
 
         adapter._bot.send_media_group.assert_awaited_once()
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
@@ -236,7 +239,8 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        results = _run(adapter.send_multiple_images("67890", images))
+        assert results and all(result.success for result in results)
 
         mock_channel.send.assert_awaited_once()
         assert len(mock_channel.send.call_args.kwargs["files"]) == 3
@@ -311,7 +315,8 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("C12345", images))
+        results = _run(adapter.send_multiple_images("C12345", images))
+        assert results and all(result.success for result in results)
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
@@ -370,7 +375,8 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("channel123", images))
+        results = _run(adapter.send_multiple_images("channel123", images))
+        assert results and all(result.success for result in results)
 
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
@@ -430,7 +436,8 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            results = _run(adapter.send_multiple_images("user@example.com", images))
+            assert results and all(result.success for result in results)
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
@@ -461,3 +468,45 @@ class TestEmailMultiImage:
         ) as mock_send:
             _run(adapter.send_multiple_images("user@example.com", []))
         mock_send.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "adapter_cls,client_attribute",
+    [(DiscordAdapter, "_client"), (TelegramAdapter, "_bot"), (SlackAdapter, "_app")],
+)
+def test_unavailable_native_client_reports_failed_delivery(adapter_cls, client_attribute):
+    adapter = object.__new__(adapter_cls)
+    setattr(adapter, client_attribute, None)
+    assert _run(adapter.send_multiple_images("123", [])) == []
+    results = _run(adapter.send_multiple_images("123", [("https://example.com/image.png", "")]))
+    assert results and not all(result.success for result in results)
+
+
+@pytest.mark.parametrize("adapter_cls", [DiscordAdapter, SlackAdapter, MattermostAdapter, EmailAdapter])
+def test_partial_native_batch_reports_failure(adapter_cls, tmp_path):
+    adapter = object.__new__(adapter_cls)
+    image = tmp_path / "present.png"
+    image.write_bytes(b"\x89PNG" + b"\x00" * 20)
+    images = [(image.as_uri(), ""), ((tmp_path / "missing.png").as_uri(), "")]
+    if adapter_cls is DiscordAdapter:
+        adapter.platform = Platform.DISCORD
+        channel = MagicMock(send=AsyncMock(return_value=MagicMock(id=1)))
+        adapter._client = MagicMock()
+        adapter._client.get_channel.return_value = channel
+        adapter._is_forum_parent = MagicMock(return_value=False)
+        sent = channel.send
+    elif adapter_cls is SlackAdapter:
+        adapter._app = MagicMock()
+        adapter._resolve_thread_ts = MagicMock(return_value=None)
+        adapter._record_uploaded_file_thread = MagicMock()
+        sent = AsyncMock(return_value={"ok": True})
+        adapter._get_client = MagicMock(return_value=MagicMock(files_upload_v2=sent))
+    elif adapter_cls is MattermostAdapter:
+        adapter._reply_mode = "thread"
+        adapter._upload_file = AsyncMock(return_value="file-id")
+        sent = adapter._api_post = AsyncMock(return_value={"id": "post-id"})
+    else:
+        sent = adapter._send_email_with_attachments = MagicMock(return_value="message-id")
+    results = _run(adapter.send_multiple_images("123", images))
+    sent.assert_called_once()
+    assert results and not all(result.success for result in results)

@@ -48,6 +48,14 @@ _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
 
 
+@pytest.fixture(autouse=True)
+def _isolate_line_environment(monkeypatch):
+    """LINE settings are process environment, so tests must opt in explicitly."""
+    for key in tuple(os.environ):
+        if key.startswith("LINE_"):
+            monkeypatch.delenv(key, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # 1. Signature verification
 # ---------------------------------------------------------------------------
